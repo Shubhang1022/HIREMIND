@@ -1394,19 +1394,9 @@ async def run_analysis(
 
     # Initialize telemetry variables
     t_start_all = time.time()
+    current_stage = "Analysis Started"
     peak_memory = get_memory_mb()
     
-    def check_overall_timeout():
-        if time.time() - t_start_all > 600.0:
-            raise asyncio.TimeoutError("Overall analysis timeout of 10 minutes exceeded.")
-
-    def update_peak():
-        nonlocal peak_memory
-        peak_memory = max(peak_memory, get_memory_mb())
-
-    # STARTUP_MEMORY log
-    log_memory("STARTUP_MEMORY")
-
     # Define variables for cleanup
     candidates_pool = []
     passed_role = []
@@ -1434,12 +1424,75 @@ async def run_analysis(
     FAISS_INPUT_COUNT = 0
     AFTER_FAISS = 0
 
+    def log_checkpoint(num: int, name: str, details: str = ""):
+        elapsed = time.time() - t_start_all
+        mem = get_memory_mb()
+        log_line = f"[CHECKPOINT {num}] {name} ✓ | Elapsed: {elapsed:.3f}s | RAM: {mem:.2f}MB | {details}"
+        logger.info(log_line)
+        print(log_line, flush=True)
+
+    def log_error_diagnostics(exc: Exception, is_oom: bool = False):
+        import traceback
+        tb_str = traceback.format_exc()
+        elapsed = time.time() - t_start_all
+        mem = get_memory_mb()
+        cand_count = total_candidates_in_dataset
+        emb_status = "unknown"
+        if "p" in locals() and isinstance(locals()["p"], dict):
+            emb_status = locals()["p"].get("embedding_status", "unknown")
+            
+        error_report = f"""
+==================================================
+[ANALYSIS_FAILURE_DIAGNOSTICS]
+Project ID: {project_id}
+Exception Type: {type(exc).__name__}
+Error Message: {str(exc)}
+Pipeline Stage: {current_stage}
+Elapsed Time: {elapsed:.3f}s
+Memory Usage: {mem:.2f}MB
+Candidate Count: {cand_count}
+Embedding Status: {emb_status}
+Is OOM: {is_oom}
+--------------------------------------------------
+Python Traceback:
+{tb_str}
+==================================================
+"""
+        logger.error(error_report)
+        print(error_report, flush=True)
+        
+        try:
+            err_path = "C:\\Users\\HP\\.gemini\\antigravity-ide\\brain\\b099a49a-5f3b-44e9-8f48-c198d6c4ebba\\ProductionErrorAudit.md"
+            with open(err_path, "a", encoding="utf-8") as f:
+                import datetime
+                f.write(f"\n## Analysis Failure: {datetime.datetime.now().isoformat()}\n")
+                f.write(f"```\n{error_report}\n```\n")
+        except Exception:
+            pass
+
+    def check_overall_timeout():
+        if time.time() - t_start_all > 600.0:
+            raise asyncio.TimeoutError("Overall analysis timeout of 10 minutes exceeded.")
+
+    def update_peak():
+        nonlocal peak_memory
+        peak_memory = max(peak_memory, get_memory_mb())
+
+    # STARTUP_MEMORY log
+    print("[ANALYSIS_START]", flush=True)
+    log_memory("STARTUP_MEMORY")
+    
+    current_stage = "Project Loaded"
+    log_checkpoint(1, "Project Loaded", f"Project: {p.get('name')}")
+
     try:
         # Get Job Description details
         job_res = supabase_client.table("jobs").select("*").eq("id", body.job_id).execute()
         if not job_res.data:
             raise HTTPException(status_code=400, detail="Job description not found.")
         job = job_res.data[0]
+        current_stage = "Job Description Loaded"
+        log_checkpoint(2, "Job Description Loaded", f"Job: {job.get('title')}")
 
         current_path = p.get("current_candidate_path")
         if not current_path:
@@ -1449,6 +1502,9 @@ async def run_analysis(
             )
 
         bucket, path = current_path.split("/", 1)
+        current_stage = "Candidate File Located"
+        log_checkpoint(3, "Candidate File Located", f"Path: {current_path}")
+        
         total_candidates_in_dataset = p.get("candidate_count") or 0
         if total_candidates_in_dataset == 0:
             total_candidates_in_dataset = sum(1 for _ in StorageService.stream_jsonl(bucket, path))
@@ -1507,10 +1563,9 @@ async def run_analysis(
         allowed_categories = COMPATIBLE_CATEGORIES.get(jd_category.upper(), {jd_category.upper()})
         jd_skills = [s.lower().strip() for s in job.get("required_skills", []) if s]
 
-        print("[ANALYSIS_START]")
-        print(f"[TOTAL_CANDIDATES] {total_candidates_in_dataset}")
+        current_stage = "Candidate Streaming Started"
+        log_checkpoint(4, "Candidate Streaming Started", f"Dataset Candidates: {total_candidates_in_dataset}")
 
-        print("[ROLE_FILTER_START]")
         t_filter_start = time.time()
 
         # Check if role indexes are available
@@ -1574,18 +1629,22 @@ async def run_analysis(
                     heapq.heappushpop(faiss_input_heap, (score, counter, c))
 
         faiss_input_candidates = [item[2] for item in sorted(faiss_input_heap, key=lambda x: -x[0])]
-        AFTER_SKILL_FILTER = len(faiss_input_candidates)
+        # In this workflow, the streaming candidates are processed in a single pass.
+        # Let's count them:
         AFTER_ROLE_FILTER = len(faiss_input_candidates)
         AFTER_EXPERIENCE_FILTER = len(faiss_input_candidates)
+        AFTER_SKILL_FILTER = len(faiss_input_candidates)
         FAISS_INPUT_COUNT = len(faiss_input_candidates)
 
         del faiss_input_heap
         update_peak()
         filter_time = time.time() - t_filter_start
-        print("[ROLE_FILTER_END]")
-        print("[EXPERIENCE_FILTER_END]")
-        print("[SKILL_FILTER_END]")
-        log_memory("FILTER_MEMORY")
+        
+        current_stage = "POST_FILTER_MEMORY"
+        log_checkpoint(5, "Role Filtering Completed", f"Passed: {AFTER_ROLE_FILTER}")
+        log_checkpoint(6, "Experience Filtering Completed", f"Passed: {AFTER_EXPERIENCE_FILTER}")
+        log_checkpoint(7, "Skill Filtering Completed", f"Passed: {AFTER_SKILL_FILTER}")
+        log_memory("POST_FILTER_MEMORY")
 
         # Load FAISS index & IDs
         embedding_status = p.get("embedding_status", "pending")
@@ -1639,10 +1698,13 @@ async def run_analysis(
 
         # Embedding & FAISS Search
         if metadata_only_fallback:
-            print("[EMBEDDING_START] (skipped: metadata-only fallback)")
-            print("[EMBEDDING_END]")
-            print("[FAISS_START] (skipped: metadata-only fallback)")
-            print("[FAISS_END]")
+            current_stage = "POST_EMBEDDING_MEMORY"
+            log_checkpoint(8, "Embeddings Ready", f"Skipped (Metadata-only fallback. Reason: {fallback_reason})")
+            log_memory("POST_EMBEDDING_MEMORY")
+
+            current_stage = "POST_FAISS_MEMORY"
+            log_checkpoint(9, "FAISS Retrieval Completed", f"Skipped (Metadata-only fallback)")
+            log_memory("POST_FAISS_MEMORY")
             
             retrieved_candidates = faiss_input_candidates[:]
             retrieved_candidates.sort(key=lambda x: x.get("candidate_quality_score") or 0.0, reverse=True)
@@ -1650,7 +1712,6 @@ async def run_analysis(
             AFTER_FAISS = len(retrieved_candidates)
             similarities_map = {c.get("candidate_id"): 0.5 for c in retrieved_candidates}
         else:
-            print("[EMBEDDING_START]")
             t_emb_start = time.time()
             
             jd_text = (
@@ -1680,13 +1741,17 @@ async def run_analysis(
                 metadata_only_fallback = True
                 fallback_reason = f"embedding_error: {e}"
                 
-            print("[EMBEDDING_END]")
+            current_stage = "POST_EMBEDDING_MEMORY"
+            log_checkpoint(8, "Embeddings Ready", f"Model: {settings.embedding_model}")
+            log_memory("POST_EMBEDDING_MEMORY")
             
-            print("[FAISS_START]")
             t_faiss_start = time.time()
             
             if metadata_only_fallback:
-                print("[FAISS_END] (aborted due to embedding failure)")
+                current_stage = "POST_FAISS_MEMORY"
+                log_checkpoint(9, "FAISS Retrieval Completed", f"Aborted (Embedding failure)")
+                log_memory("POST_FAISS_MEMORY")
+                
                 retrieved_candidates = faiss_input_candidates[:]
                 retrieved_candidates.sort(key=lambda x: x.get("candidate_quality_score") or 0.0, reverse=True)
                 retrieved_candidates = retrieved_candidates[:MAX_FAISS_RESULTS]
@@ -1751,11 +1816,11 @@ async def run_analysis(
                     similarities_map = {c.get("candidate_id"): 0.5 for c in retrieved_candidates}
                     
                 AFTER_FAISS = len(retrieved_candidates)
-                print("[FAISS_END]")
-                log_memory("FAISS_MEMORY")
+                current_stage = "POST_FAISS_MEMORY"
+                log_checkpoint(9, "FAISS Retrieval Completed", f"Retrieved: {AFTER_FAISS}")
+                log_memory("POST_FAISS_MEMORY")
                 update_peak()
 
-        print("[SCORING_START]")
         t_stage3_start = time.time()
         scored_pool = []
         for c in retrieved_candidates:
@@ -1782,7 +1847,9 @@ async def run_analysis(
         top_100_candidates = [item["candidate"] for item in top_scored]
         
         scoring_time = time.time() - t_stage3_start
-        print("[SCORING_END]")
+        current_stage = "POST_SCORING_MEMORY"
+        log_checkpoint(10, "Hybrid Scoring Completed", f"Top scored pool size: {len(top_100_candidates)}")
+        log_memory("POST_SCORING_MEMORY")
 
         top_100_embs = None
         if not metadata_only_fallback and top_100_candidates:
@@ -1805,13 +1872,15 @@ async def run_analysis(
             except Exception:
                 pass
 
-        print("[LLM_START]")
-        
+        current_stage = "POST_LLM_MEMORY"
         # Enforce memory safety limit check before calling LLM
         call_llm_flag = True
         if get_memory_mb() > 450.0 or memory_safety_mode:
             logger.warning("[MEMORY_WARNING] Process RAM exceeds 450MB before LLM stage. Disabling LLM enhancement.")
             call_llm_flag = False
+
+        log_checkpoint(11, "LLM Evaluation Started", f"Enhancement active: {call_llm_flag}")
+        log_memory("POST_LLM_MEMORY")
 
         from src.ranking.engine import UnifiedRankingEngine
         engine = UnifiedRankingEngine(
@@ -1972,6 +2041,10 @@ async def run_analysis(
         for i in range(0, len(results_rows), 50):
             supabase_client.table("ranking_results").insert(results_rows[i:i+50]).execute()
 
+        current_stage = "FINAL_MEMORY"
+        log_checkpoint(12, "Results Stored Successfully", f"Ranking ID: {ranking_id}")
+        log_memory("FINAL_MEMORY")
+
         avg_score = sum(r.get("ai_score") or r.get("score") or 0.0 for r in results) / len(results) if results else 0.0
         supabase_client.table("analysis_metrics").insert({
             "ranking_id": ranking_id,
@@ -1990,10 +2063,14 @@ async def run_analysis(
         }).eq("id", project_id).execute()
         
         _set_cached_ranking(project_id, body.job_id, ranking)
+        
+        # Print final completed state (Phase 7)
+        elapsed_total = time.time() - t_start_all
+        print(f"[ANALYSIS_COMPLETED] | Total time: {elapsed_total:.3f}s | Peak RAM: {peak_memory:.2f}MB", flush=True)
         return ranking
 
     except MemoryError as exc:
-        logger.error("[OOM_RECOVERY] Out of Memory detected in run_analysis: %s", exc)
+        log_error_diagnostics(exc, is_oom=True)
         try:
             from app.services.cache_service import CacheService
             CacheService.clear()
@@ -2025,15 +2102,21 @@ async def run_analysis(
         )
 
     except Exception as exc:
-        supabase_client.table("projects").update({
-            "status": "failed",
-            "upload_statistics": {"failure_reason": str(exc)},
-            "updated_at": _now()
-        }).eq("id", project_id).execute()
-        logger.error("Analysis failed for project %s: %s", project_id, exc)
-        import traceback
-        traceback.print_exc()
-        raise exc
+        log_error_diagnostics(exc, is_oom=False)
+        try:
+            supabase_client.table("projects").update({
+                "status": "failed",
+                "upload_statistics": {"failure_reason": str(exc)},
+                "updated_at": _now()
+            }).eq("id", project_id).execute()
+        except Exception:
+            pass
+        if isinstance(exc, HTTPException):
+            raise exc
+        raise HTTPException(
+            status_code=500,
+            detail=f"Analysis failed: {str(exc)}"
+        )
     finally:
         # 1. Release active project cache references from CacheService
         try:

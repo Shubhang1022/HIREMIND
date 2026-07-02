@@ -37,10 +37,51 @@ class EmbeddingEncoder:
         import gc
         gc.collect()
 
+        import os
+        # Set HF cache directories (Phase 4)
+        if not os.environ.get("HF_HOME"):
+            os.environ["HF_HOME"] = "/app/.cache/huggingface"
+        if not os.environ.get("TRANSFORMERS_CACHE"):
+            os.environ["TRANSFORMERS_CACHE"] = "/app/.cache/huggingface"
+        if not os.environ.get("SENTENCE_TRANSFORMERS_HOME"):
+            os.environ["SENTENCE_TRANSFORMERS_HOME"] = "/app/.cache/sentence-transformers"
+        
+        # Suppress HF warnings if HF_TOKEN is absent (Phase 4)
+        try:
+            from app.core.config import settings
+            token = settings.hf_token or os.environ.get("HF_TOKEN")
+        except ImportError:
+            token = os.environ.get("HF_TOKEN")
+
+        if not token:
+            import logging
+            if not getattr(EmbeddingEncoder, "_warning_logged", False):
+                logging.getLogger("huggingface_hub").setLevel(logging.ERROR)
+                logging.getLogger("transformers").setLevel(logging.ERROR)
+                os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
+                os.environ["HF_HUB_DISABLE_TELEMETRY"] = "1"
+                print("[HuggingFace Info] running in unauthenticated mode (optional HF_TOKEN is absent). Warnings suppressed.", flush=True)
+                EmbeddingEncoder._warning_logged = True
+
         # Lazy import so this module is importable without sentence_transformers.
         from sentence_transformers import SentenceTransformer  # noqa: PLC0415
 
-        model = SentenceTransformer(self.model_name, device="cpu")
+        kwargs = {"device": "cpu"}
+        if token:
+            kwargs["use_auth_token"] = token
+            kwargs["token"] = token
+
+        try:
+            model = SentenceTransformer(self.model_name, **kwargs)
+        except TypeError:
+            try:
+                model = SentenceTransformer(self.model_name, device="cpu", use_auth_token=token)
+            except TypeError:
+                try:
+                    model = SentenceTransformer(self.model_name, device="cpu", token=token)
+                except TypeError:
+                    model = SentenceTransformer(self.model_name, device="cpu")
+
         _MODEL_CACHE[self.model_name] = model
         self._model = model
 

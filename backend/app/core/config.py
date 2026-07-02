@@ -1,6 +1,8 @@
+from __future__ import annotations
+
 """Application configuration via pydantic-settings."""
 
-from __future__ import annotations
+from typing import Optional
 
 from typing import List
 
@@ -36,6 +38,9 @@ class Settings(BaseSettings):
     supabase_url: str = ""
     supabase_service_key: str = ""
     supabase_jwt_secret: str = ""
+    
+    # Hugging Face
+    hf_token: str | None = None
 
     # Feature Flags
     use_supabase_storage: bool = False
