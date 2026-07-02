@@ -20,10 +20,9 @@ _store = RateLimitStore()
 
 
 async def rate_limit_middleware(request: Request, call_next):
-    """Rate limit by IP address. Always pass OPTIONS (CORS preflight) through."""
-    # Always let CORS preflight and health checks through
-    if request.method == "OPTIONS" or request.url.path in (
-        "/health", "/api/v1/health", "/docs", "/redoc", "/openapi.json"
+    """Rate limit by IP address. Always pass OPTIONS (CORS preflight) and health checks through."""
+    if request.method in ("OPTIONS", "HEAD") or request.url.path in (
+        "/", "/health", "/api/v1/health", "/health/cors", "/api/v1/health/cors", "/docs", "/redoc", "/openapi.json"
     ):
         return await call_next(request)
 

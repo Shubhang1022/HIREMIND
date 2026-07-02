@@ -52,7 +52,16 @@ class Settings(BaseSettings):
 
     @property
     def cors_origins_list(self) -> List[str]:
-        return [o.strip() for o in self.cors_origins.split(",") if o.strip()]
+        origins = []
+        raw_list = [o.strip().lower().rstrip("/") for o in self.cors_origins.split(",") if o.strip()]
+        for o in raw_list:
+            if not o.startswith(("http://", "https://")):
+                import logging
+                logging.getLogger(__name__).warning("Rejecting invalid CORS origin format: %s", o)
+                continue
+            if o not in origins:
+                origins.append(o)
+        return origins
 
     # App
     app_env: str = "development"

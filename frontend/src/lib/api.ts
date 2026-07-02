@@ -2,8 +2,11 @@
  * Typed API client — thin fetch wrapper pointing to the FastAPI backend.
  */
 
-const BASE_URL =
-  process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000/api/v1";
+const getApiBase = () => {
+  const rawUrl = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000';
+  return rawUrl.endsWith('/api/v1') ? rawUrl : `${rawUrl.replace(/\/$/, '')}/api/v1`;
+};
+const BASE_URL = getApiBase();
 
 export class ApiError extends Error {
   constructor(
