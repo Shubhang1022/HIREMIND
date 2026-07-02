@@ -229,9 +229,7 @@ export function LandingPage() {
       <nav className={`fixed top-0 inset-x-0 z-50 ${glassDark} border-b border-white/8`}>
         <div className="max-w-7xl mx-auto px-6 h-16 flex items-center justify-between">
           <Link href="/" className="flex items-center gap-2.5">
-            <div className="w-8 h-8 rounded-lg bg-gradient-to-br from-indigo-500 to-purple-600 flex items-center justify-center shadow-lg shadow-indigo-500/30">
-              <Sparkles className="w-4 h-4 text-white" />
-            </div>
+            <img src="/logo.png" alt="HireMind AI Logo" className="w-8 h-8 object-contain rounded-lg shadow-lg shadow-indigo-500/30" />
             <span className="font-bold text-lg text-white">HireMind AI</span>
           </Link>
           <div className="hidden md:flex items-center gap-8 text-sm text-white/60">

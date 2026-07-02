@@ -61,9 +61,7 @@ export function AppSidebar() {
     <div className="flex flex-col h-full bg-sidebar border-r border-sidebar-border">
       <div className="p-6 border-b border-sidebar-border">
         <Link href="/dashboard" className="flex items-center gap-3">
-          <div className="w-10 h-10 rounded-lg bg-gradient-to-br from-indigo-500 to-purple-600 flex items-center justify-center">
-            <Sparkles className="w-5 h-5 text-white" />
-          </div>
+          <img src="/logo.png" alt="HireMind AI Logo" className="w-10 h-10 object-contain rounded-lg" />
           <div>
             <h1 className="text-lg font-bold text-sidebar-foreground">HireMind AI</h1>
             <p className="text-xs text-sidebar-foreground/60">AI Recruiter Copilot</p>

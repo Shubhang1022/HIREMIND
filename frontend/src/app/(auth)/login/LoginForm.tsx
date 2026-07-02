@@ -66,9 +66,7 @@ export default function LoginForm() {
 
         <div className="relative z-10 flex flex-col justify-between h-full">
           <div className="flex items-center gap-3">
-            <div className="w-10 h-10 rounded-xl bg-white/20 backdrop-blur flex items-center justify-center border border-white/30 shadow-lg">
-              <Sparkles className="w-5 h-5 text-white" />
-            </div>
+            <img src="/logo.png" alt="HireMind AI Logo" className="w-10 h-10 object-contain rounded-lg shadow-lg" />
             <span className="text-xl font-bold text-white tracking-wide">HireMind AI</span>
           </div>
 
@@ -100,9 +98,7 @@ export default function LoginForm() {
       <div className="flex-1 flex items-center justify-center p-8">
         <div className="w-full max-w-md">
           <div className="lg:hidden flex items-center gap-2 mb-8">
-            <div className="w-8 h-8 rounded-lg bg-gradient-to-br from-indigo-500 to-purple-600 flex items-center justify-center">
-              <Sparkles className="w-4 h-4 text-white" />
-            </div>
+            <img src="/logo.png" alt="HireMind AI Logo" className="w-8 h-8 object-contain rounded-lg shadow-md" />
             <span className="font-bold text-white">HireMind AI</span>
           </div>
 
