@@ -1,0 +1,215 @@
+# config/ranking_config.yaml
+# Authoritative configuration for the AI Recruiter Copilot ranking pipeline.
+# All tunable parameters live here — no magic numbers in source code.
+
+# ─── Model Configuration ─────────────────────────────────────────────────────
+model:
+  embedding_model: "BAAI/bge-large-en-v1.5"                  # primary model (retrieval-focused)
+  fallback_model: "BAAI/bge-small-en-v1.5"                   # fallback if primary fails
+  batch_size: 512
+  max_text_chars: 4096       # Truncate candidate text before embedding
+  normalize_embeddings: true
+
+# ─── Dimension Weights ────────────────────────────────────────────────────────
+# Must sum to 1.0
+weights:
+  specialization_match: 0.30
+  required_skills_match: 0.25
+  relevant_experience: 0.15
+  semantic_similarity: 0.10
+  career_growth: 0.05
+  behavioral_fit: 0.05
+  integrity: 0.05
+  education: 0.05
+
+# ─── Sub-dimension Weights ───────────────────────────────────────────────────
+semantic_weights:
+  semantic_similarity: 0.40   # Cosine similarity between candidate text and JD embedding
+  skill_depth: 0.35            # Weighted depth score across JD must-have skill clusters
+  core_coverage: 0.15          # Fraction of JD must-have clusters covered
+  assessment_boost: 0.10       # Platform skill assessment score contribution
+
+experience_weights:
+  years_exp: 0.30              # YoE score against JD target range
+  product_company: 0.35        # Fraction of career at non-consulting companies
+  production_evidence: 0.25    # Production deployment signals in descriptions
+  tenure_stability: 0.10       # Average tenure across past roles
+
+progression_weights:
+  seniority_trajectory: 0.35   # Level-gain score from start to current title
+  company_growth: 0.25         # Growth from smaller to larger companies
+  leadership_evidence: 0.25    # Team size, ownership scope signals
+  scope_ownership: 0.15        # Ownership language in descriptions
+
+behavioral_weights:
+  hiring_readiness: 0.30       # open_to_work + last_active_date + notice_period
+  recruiter_engagement: 0.25   # response rate + avg response time
+  platform_trust: 0.20         # verified_email + verified_phone + linkedin_connected
+  github_activity: 0.15        # github_activity_score (0–100) or neutral 0.5 if -1
+  market_validation: 0.10      # saved_by_recruiters_30d (log-scaled)
+
+logistics_weights:
+  location_fit: 0.50           # Preferred / acceptable / other India / outside India
+  notice_period: 0.30          # 0–30d / 31–60d / 61–90d / 91–180d tiers
+  salary_alignment: 0.20       # Overlap between expected and target salary ranges
+
+integrity_weights:
+  completeness: 0.50           # profile_completeness_score / 100
+  verification: 0.33           # (verified_email + verified_phone + linkedin_connected) / 3
+  consistency: 0.17            # YoE stated vs derived from career_history
+
+# ─── JD Parameters ───────────────────────────────────────────────────────────
+jd:
+  title: "Senior AI Engineer — Founding Team"
+  company: "Redrob AI"
+  location: "Pune/Noida, India (Hybrid)"
+
+  # Years of experience target
+  target_yoe_min: 5
+  target_yoe_max: 9
+  sweet_spot_yoe_min: 6
+  sweet_spot_yoe_max: 8
+
+  # Salary range (Indian Rupees LPA)
+  salary_target_min_lpa: 25.0
+  salary_target_max_lpa: 55.0
+
+  # Location preferences
+  preferred_locations:
+    - "Pune"
+    - "Noida"
+  acceptable_locations:
+    - "Hyderabad"
+    - "Mumbai"
+    - "Delhi"
+    - "Gurgaon"
+    - "Gurugram"
+    - "Bangalore"
+    - "Bengaluru"
+    - "Chennai"
+    - "Kolkata"
+    - "Ahmedabad"
+
+# ─── Notice Period Scoring Tiers ─────────────────────────────────────────────
+notice_period_tiers:
+  - {max_days: 30,  score: 1.0}
+  - {max_days: 60,  score: 0.7}
+  - {max_days: 90,  score: 0.5}
+  - {max_days: 180, score: 0.3}
+  # Anything > 180 days → score: 0.1
+
+# ─── Hard Disqualifier Configuration ─────────────────────────────────────────
+disqualifiers:
+  # All role companies must be in this list for consulting_only disqualification
+  consulting_firms:
+    - "tcs"
+    - "tata consultancy services"
+    - "wipro"
+    - "infosys"
+    - "accenture"
+    - "cognizant"
+    - "capgemini"
+    - "hcl technologies"
+    - "hcl"
+    - "tech mahindra"
+    - "mphasis"
+    - "hexaware"
+    - "niit technologies"
+    - "ltimindtree"
+    - "mindtree"
+    - "l&t infotech"
+    - "igate"
+    - "mastech"
+
+  # Current title in these categories + no AI/ML career history → disqualify
+  non_technical_titles:
+    - "accountant"
+    - "chartered accountant"
+    - "graphic designer"
+    - "ui designer"
+    - "ux designer"
+    - "content writer"
+    - "copywriter"
+    - "civil engineer"
+    - "mechanical engineer"
+    - "structural engineer"
+    - "hr manager"
+    - "human resources"
+    - "recruiter"
+    - "talent acquisition"
+    - "customer support"
+    - "customer service"
+    - "call center"
+    - "sales executive"
+    - "sales manager"
+    - "retail manager"
+    - "marketing manager"
+
+# ─── Honeypot Detection Thresholds ───────────────────────────────────────────
+honeypot:
+  # expert+advanced skills per year of experience
+  skills_ratio_definitive: 2.0    # ratio > this → definitive honeypot
+  skills_ratio_suspicion: 1.5     # ratio > this → suspicion weight added
+
+  # Number of title–description mismatched roles
+  title_desc_mismatch_definitive: 3   # count >= this → definitive honeypot
+  title_desc_mismatch_suspicion: 2    # count >= this → suspicion weight added
+
+  # Suspicion score threshold to trigger honeypot (sum of weights)
+  suspicion_threshold: 1.0
+
+  # Tolerance for impossible tenure check (months)
+  tenure_tolerance_months: 12
+
+# ─── Scoring Penalty Thresholds ──────────────────────────────────────────────
+scoring:
+  # keyword stuffing: ≥ N AI buzzwords with no production evidence
+  keyword_stuffing_buzzword_min: 6
+  keyword_stuffing_penalty: 0.4    # Applied to semantic_skill_fit
+  keyword_stuffing_mild_penalty: 0.7
+
+  # LLM-only recency penalty
+  llm_recency_penalty_threshold_months: 12
+  llm_recency_penalty: 0.7         # Applied to semantic_skill_fit when all AI exp < 12 months
+  llm_mild_recency_penalty: 0.85   # All AI exp < 24 months
+
+  # Stagnation penalty: same title > N consecutive months
+  stagnation_months: 48
+  stagnation_penalty: 0.1          # Applied to career_progression
+
+  # Profile completeness: below N/100 → apply penalty
+  low_completeness_threshold: 40
+  low_completeness_penalty: 0.2    # Applied to profile_integrity
+
+# ─── Location Fit Scores ─────────────────────────────────────────────────────
+location_scores:
+  preferred: 1.0         # Pune / Noida
+  acceptable: 0.85       # Major Tier-1 India cities (see jd.acceptable_locations)
+  other_india_willing: 0.7
+  other_india_not_willing: 0.55
+  outside_india_willing: 0.4
+  outside_india_not_willing: 0.2
+
+# ─── Salary Alignment ────────────────────────────────────────────────────────
+salary_scoring:
+  full_overlap_score: 1.0
+  partial_high_overlap: 0.8      # overlap fraction >= 0.4
+  partial_low_overlap: 0.6
+  candidate_under_target: 0.5   # Candidate expects less — could negotiate
+  no_overlap_over_target: 0.3   # Candidate expects more than our ceiling
+
+# ─── Path Configuration ──────────────────────────────────────────────────────
+paths:
+  feature_cache_dir: "./feature_cache"
+  submission_output: "./submission.csv"
+  audit_log: "./ranking_audit.json"
+  jd_text_module: "config.jd_text"
+  jd_json: "./config/job_description.json"
+
+# ─── Performance Configuration ───────────────────────────────────────────────
+performance:
+  max_runtime_seconds: 270       # Target; 30s buffer under the 300s contest limit
+  target_candidates: 100         # Number of output candidates
+  reference_date: "2025-06-01"   # Dataset reference date for recency calculations
+  omp_num_threads: 4             # OMP_NUM_THREADS env var for PyTorch CPU parallelism
+  max_validation_error_rate: 0.05  # Exit code 4 if > 5% candidates invalid

@@ -1,0 +1,85 @@
+# ── Feature Cache & Large Datasets ───────────────────────────────────────────
+feature_cache/
+India_runs_data_and_ai_challenge/
+data/
+
+# ── Python ────────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+*.prof
+
+# ── JavaScript / Node / Next.js ───────────────────────────────────────────────
+node_modules/
+.next/
+.nuxt/
+out/
+.vercel/
+*.tsbuildinfo
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+.pnpm-store/
+
+# ── Secrets & Environment Files ───────────────────────────────────────────────
+.env
+.env.*
+!.env.example
+*.env
+*.env.*
+**/.*env
+**/.*env.*
+
+# ── Databases & Local State ───────────────────────────────────────────────────
+*.db
+*.sqlite
+*.sqlite3
+local_database.db
+
+# ── IDEs, OS & Version Control ────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ── Docker ────────────────────────────────────────────────────────────────────
+docker-compose.override.yml
+
+# ── Outputs & Temporary Files ─────────────────────────────────────────────────
+submission.csv
+submission_5k.csv
+ranking_audit.json
+ranking_metrics.json
+candidate_snapshot.json
+metadata_audit.json
+**/candidate_snapshot.json
+**/metadata_audit.json
+**/ranking_audit.json
+**/ranking_metrics.json
+
+# ── Local Test Scripts & Architecture Docs ────────────────────────────────────
+test_analyze.py
+verify_benchmarks.py
+DemoScript.md
+JDFirstArchitectureImplementation.md
+PPT_Content.md
+WorkflowRefactorImplementation.md
+WorkflowVerificationReport.md

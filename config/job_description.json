@@ -1,0 +1,35 @@
+{
+  "title": "Senior AI Engineer \u2014 Founding Team",
+  "company": "Redrob AI",
+  "location": "Pune/Noida, India (Hybrid)",
+  "experience_years": {
+    "min": 5,
+    "max": 9
+  },
+  "must_have_skills": [
+    "embedding-based retrieval",
+    "vector database",
+    "Python",
+    "evaluation frameworks (NDCG, MRR, MAP)"
+  ],
+  "nice_to_have_skills": [
+    "LLM fine-tuning",
+    "learning-to-rank",
+    "distributed systems"
+  ],
+  "hard_disqualifiers": [
+    "consulting-only career",
+    "LLM-only experience <12 months",
+    "no production deployment",
+    "entire career in pure research"
+  ],
+  "preferred_locations": [
+    "Pune",
+    "Noida"
+  ],
+  "salary_range_lpa": {
+    "min": 25.0,
+    "max": 55.0
+  },
+  "full_text": "Senior AI Engineer founding team role requiring production experience with embedding-based retrieval, vector database, Python, and evaluation frameworks (NDCG, MRR, MAP)."
+}

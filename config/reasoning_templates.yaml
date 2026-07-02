@@ -1,0 +1,37 @@
+# config/reasoning_templates.yaml
+#
+# Template strings for generating reasoning for the top-100 ranked candidates.
+# Templates are selected deterministically based on hash(candidate_id) % len(templates)
+# to ensure variety while remaining reproducible.
+#
+# Placeholders (all must be present in extract_facts() output):
+#   {yoe}          — years of experience (float, 1 d.p.)
+#   {title}        — current or most recent relevant title
+#   {top_skills}   — 2–3 top relevant skills, comma-separated
+#   {location}     — candidate location city
+#   {notice_days}  — notice period in days (integer)
+#   {main_strength} — one-phrase primary strength
+#   {main_gap}      — one-phrase primary concern or gap (used in mid/lower tiers)
+#
+# All templates are capped at 300 chars including placeholders when filled.
+
+top_10:
+  - "{yoe}y exp; {title}; {top_skills} in production; {location}; {notice_days}d notice. {main_strength}."
+  - "{title}, {yoe}y — {top_skills}; strong production deployment evidence; {location}; {notice_days}d notice. {main_strength}."
+  - "{yoe}y prod AI exp; {title}; {top_skills}; {main_strength}; {location}; {notice_days}d notice."
+  - "Top candidate: {yoe}y as {title}; {top_skills}; {main_strength}; {location}-based; {notice_days}d notice."
+  - "{title} with {yoe}y; {top_skills} prod experience; {main_strength}; {location}; {notice_days}d."
+
+mid_11_50:
+  - "{yoe}y; {title}; {top_skills}; {location}; {notice_days}d notice. {main_strength}. Note: {main_gap}."
+  - "{title}, {yoe}y exp — {top_skills}; {location}; {notice_days}d notice. {main_strength}; caveat: {main_gap}."
+  - "{yoe}y as {title}; {top_skills}; good production signals; {location}; {notice_days}d. {main_gap} is a consideration."
+  - "{title} with {yoe}y; {top_skills}; {location}; {notice_days}d notice; {main_strength}; watch: {main_gap}."
+  - "{yoe}y exp; {title}; {top_skills}; {main_strength}; {location}; {notice_days}d notice. Gap: {main_gap}."
+
+lower_51_100:
+  - "{yoe}y; {title}; {top_skills}; {location}; {notice_days}d notice. Strengths: {main_strength}. Concerns: {main_gap}."
+  - "{title}, {yoe}y — {top_skills}; partial JD fit. {main_strength}; however {main_gap}. {location}; {notice_days}d."
+  - "{yoe}y as {title}; {top_skills} present; {main_strength} noted; {main_gap} limits rank; {location}; {notice_days}d."
+  - "{title} with {yoe}y; {top_skills}; {location}; {notice_days}d. {main_strength} but {main_gap}."
+  - "{yoe}y exp; {title}; {main_strength}; significant gap: {main_gap}; {location}; {notice_days}d notice."

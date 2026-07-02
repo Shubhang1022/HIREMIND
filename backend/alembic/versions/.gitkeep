@@ -1,0 +1,3 @@
+# Alembic migration versions directory.
+# Auto-generated migration scripts will be placed here.
+# Do NOT commit database-state-specific migrations — generate them locally.
