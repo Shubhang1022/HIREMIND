@@ -474,13 +474,29 @@ class UnifiedRankingEngine:
         stage3_limit = 100
         stage4_limit = top_n
         
-        # Dynamic LLM limit (PART 8)
-        openings = jd_dict.get("openings") if jd_dict else None
-        if openings is not None and (isinstance(openings, (int, float)) or (isinstance(openings, str) and openings.isdigit())):
-            n_open = int(openings)
-            stage5_limit = max(10, n_open * 3)
+        # Dynamic LLM limit (Requirement 7)
+        openings = None
+        if jd_dict:
+            openings = jd_dict.get("openings") or jd_dict.get("open_positions")
+            
+        if openings is not None:
+            try:
+                n_open = int(openings)
+            except (ValueError, TypeError):
+                n_open = 1
         else:
+            n_open = 1
+            
+        if n_open <= 1:
+            stage5_limit = 5
+        elif n_open <= 3:
+            stage5_limit = 10
+        elif n_open <= 5:
+            stage5_limit = 15
+        elif n_open <= 10:
             stage5_limit = 30
+        else:
+            stage5_limit = max(30, n_open * 3)
             
         # Soft boost/penalty
         scored_pool = []

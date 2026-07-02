@@ -326,6 +326,22 @@ _encoder = None
 
 def _get_encoder():
     global _encoder
+    from app.core.config import settings
+    target_model = settings.embedding_model
+    
+    if _encoder is not None:
+        if _encoder.model_name != target_model:
+            import logging
+            logging.getLogger(__name__).info("Embedding model configuration changed from %s to %s. Reloading model...", _encoder.model_name, target_model)
+            try:
+                from src.features.embedding import _MODEL_CACHE
+                _MODEL_CACHE.clear()
+            except Exception:
+                pass
+            _encoder = None
+            import gc
+            gc.collect()
+
     if _encoder is None:
         import sys, os
         _project_root = os.path.dirname(os.path.dirname(os.path.dirname(
@@ -333,10 +349,37 @@ def _get_encoder():
         if _project_root not in sys.path:
             sys.path.insert(0, _project_root)
         from src.features.embedding import EmbeddingEncoder
-        from app.core.config import settings
-        _encoder = EmbeddingEncoder(model_name=settings.embedding_model)
+        _encoder = EmbeddingEncoder(model_name=target_model)
         _encoder.load_model()
     return _encoder
+
+
+# ── Memory Telemetry & Active Project Lock ────────────────────────────────────
+_active_analyses: set[str] = set()
+
+def get_memory_mb() -> float:
+    try:
+        import os
+        import psutil
+        process = psutil.Process(os.getpid())
+        return process.memory_info().rss / (1024 * 1024)
+    except Exception:
+        try:
+            with open("/proc/self/status", "r") as f:
+                for line in f:
+                    if line.startswith("VmRSS:"):
+                        return float(line.split()[1]) / 1024
+        except Exception:
+            pass
+        return 0.0
+
+def log_memory(label: str) -> float:
+    import logging
+    mem = get_memory_mb()
+    msg = f"[MEMORY_TELEMETRY] {label}: {mem:.2f} MB"
+    logging.getLogger(__name__).info(msg)
+    print(msg, flush=True)
+    return mem
 
 
 def standardize_candidate(c: dict) -> dict:
@@ -603,6 +646,10 @@ def process_project_data_task(project_id: str):
     import traceback
     import logging
     import json
+    import tempfile
+    import shutil
+    import os
+    from pathlib import Path
     import numpy as np
 
     logger = logging.getLogger(__name__)
@@ -618,6 +665,7 @@ def process_project_data_task(project_id: str):
         logger.error("Could not update project status to processing: %s", exc)
         return
 
+    temp_dir = None
     try:
         proj_res = supabase_client.table("projects").select("*").eq("id", project_id).execute()
         if not proj_res.data:
@@ -632,118 +680,191 @@ def process_project_data_task(project_id: str):
         bucket, path = current_path.split("/", 1)
         
         from app.services.storage_provider import StorageService
-        candidates = list(StorageService.stream_jsonl(bucket, path))
-        total_candidates = len(candidates)
-        logger.info("Loaded %d candidates for indexing", total_candidates)
-
         from src.features.structured import _classify_specialization_with_confidence, classify_candidate_role_category, HARD_DISQUALIFIER_TITLES
         from src.scoring.quality import calculate_candidate_quality_score
-
-        role_groups = {}
+        
+        # Create temp directory for streaming operations
+        temp_dir = tempfile.mkdtemp(prefix=f"index_job_{project_id}_")
+        
+        role_files = {}
+        enriched_jsonl_path = Path(temp_dir) / "enriched_candidates.jsonl"
+        
+        candidate_ids = []
         skill_index = {}
+        total_candidates = 0
 
-        for idx, c in enumerate(candidates):
-            c = standardize_candidate(c)
-            profile = c.get("profile", {})
-            career_history = c.get("career_history", [])
-            skills_list = c.get("skills", [])
+        with open(enriched_jsonl_path, "w", encoding="utf-8") as f_enriched:
+            for idx, c_raw in enumerate(StorageService.stream_jsonl(bucket, path)):
+                c = standardize_candidate(c_raw)
+                profile = c.get("profile", {})
+                career_history = c.get("career_history", [])
+                skills_list = c.get("skills", [])
 
-            is_disqualified = False
-            disqualifier_reason = None
-            current_title = str(profile.get("current_title", "")).lower()
-            if any(dt in current_title for dt in HARD_DISQUALIFIER_TITLES):
-                is_disqualified = True
-                disqualifier_reason = "non_technical"
+                is_disqualified = False
+                disqualifier_reason = None
+                current_title = str(profile.get("current_title", "")).lower()
+                if any(dt in current_title for dt in HARD_DISQUALIFIER_TITLES):
+                    is_disqualified = True
+                    disqualifier_reason = "non_technical"
 
-            cand_specialization, _ = _classify_specialization_with_confidence(profile, career_history, skills_list)
-            cand_category = classify_candidate_role_category(profile, career_history, skills_list)
-            cand_yoe = float(profile.get("years_of_experience") or 0.0)
+                cand_specialization, _ = _classify_specialization_with_confidence(profile, career_history, skills_list)
+                cand_category = classify_candidate_role_category(profile, career_history, skills_list)
+                cand_yoe = float(profile.get("years_of_experience") or 0.0)
 
-            features_so_far = {
-                "years_exp": cand_yoe,
-                "is_disqualified": is_disqualified,
-                "disqualifier_reason": disqualifier_reason,
-            }
-            cand_quality_score = calculate_candidate_quality_score(features_so_far, c)
+                features_so_far = {
+                    "years_exp": cand_yoe,
+                    "is_disqualified": is_disqualified,
+                    "disqualifier_reason": disqualifier_reason,
+                }
+                cand_quality_score = calculate_candidate_quality_score(features_so_far, c)
 
-            c["candidate_specialization"] = cand_specialization
-            c["candidate_role_category"] = normalize_role_category(cand_category)
-            c["years_exp"] = cand_yoe
-            c["candidate_quality_score"] = cand_quality_score
-            c["is_disqualified"] = is_disqualified
-            c["disqualifier_reason"] = disqualifier_reason
+                c["candidate_specialization"] = cand_specialization
+                c["candidate_role_category"] = normalize_role_category(cand_category)
+                c["years_exp"] = cand_yoe
+                c["candidate_quality_score"] = cand_quality_score
+                c["is_disqualified"] = is_disqualified
+                c["disqualifier_reason"] = disqualifier_reason
 
-            role_groups.setdefault(normalize_role_category(cand_category), []).append(c)
+                f_enriched.write(json.dumps(c, ensure_ascii=False) + "\n")
 
-            for s in skills_list:
-                s_name = s.get("name") if isinstance(s, dict) else s
-                if s_name:
-                    s_name_clean = str(s_name).strip().lower()
-                    if s_name_clean:
-                        skill_index.setdefault(s_name_clean, []).append(idx)
+                cat = normalize_role_category(cand_category)
+                if cat not in role_files:
+                    cat_path = Path(temp_dir) / f"role_{cat.upper()}.jsonl"
+                    role_files[cat] = open(cat_path, "w", encoding="utf-8")
+                role_files[cat].write(json.dumps(c, ensure_ascii=False) + "\n")
 
-        for cat, group in role_groups.items():
-            role_content = "".join(json.dumps(c, ensure_ascii=False) + "\n" for c in group)
-            StorageService.upload_file("role-indexes", f"{project_id}/role_{cat.upper()}_v1.jsonl", role_content.encode("utf-8"))
+                candidate_ids.append(c.get("candidate_id"))
+                for s in skills_list:
+                    s_name = s.get("name") if isinstance(s, dict) else s
+                    if s_name:
+                        s_name_clean = str(s_name).strip().lower()
+                        if s_name_clean:
+                            skill_index.setdefault(s_name_clean, []).append(idx)
+                            
+                total_candidates += 1
+
+        for f in role_files.values():
+            f.close()
+
+        logger.info("Enriched %d candidates. Starting index uploads.", total_candidates)
+
+        for cat in role_files.keys():
+            cat_path = Path(temp_dir) / f"role_{cat.upper()}.jsonl"
+            content = cat_path.read_bytes()
+            StorageService.upload_file("role-indexes", f"{project_id}/role_{cat.upper()}_v1.jsonl", content)
 
         skill_content = json.dumps(skill_index, ensure_ascii=False)
         StorageService.upload_file("skill-indexes", f"{project_id}/skill_index_v1.json", skill_content.encode("utf-8"))
 
-        from src.features.text_builder import build_candidate_text
-        encoder = _get_encoder()
-
-        candidate_ids = [c.get("candidate_id") for c in candidates]
         ids_content = json.dumps(candidate_ids, ensure_ascii=False)
         StorageService.upload_file("embeddings", f"{project_id}/ids_v1.json", ids_content.encode("utf-8"))
 
-        batch_size = 1000
-        all_embeddings = []
-        for i in range(0, total_candidates, batch_size):
-            batch_candidates = candidates[i:i+batch_size]
-            texts = []
-            for c in batch_candidates:
-                if c.get("is_disqualified", False):
-                    texts.append("")
-                else:
-                    texts.append(build_candidate_text(c))
-
-            valid_indices = [idx for idx, t in enumerate(texts) if t]
-            valid_texts = [texts[idx] for idx in valid_indices]
-
-            arr = np.zeros((len(texts), 1024), dtype=np.float32)
-            if valid_texts:
-                encoded = encoder.encode_batch(valid_texts, normalize=True, bge_mode="passage")
-                actual_dim = encoded.shape[1]
-                if actual_dim != 1024:
-                    arr = np.zeros((len(texts), actual_dim), dtype=np.float32)
-                for arr_idx, orig_idx in enumerate(valid_indices):
-                    arr[orig_idx] = encoded[arr_idx]
-            all_embeddings.append(arr)
-
-        if all_embeddings:
-            embeddings_arr = np.vstack(all_embeddings)
-        else:
-            embeddings_arr = np.empty((0, 1024), dtype=np.float32)
-
-        import io
-        emb_buf = io.BytesIO()
-        np.save(emb_buf, embeddings_arr.astype(np.float32))
-        StorageService.upload_file("embeddings", f"{project_id}/embeddings_v1.npy", emb_buf.getvalue())
-
+        from src.features.text_builder import build_candidate_text
+        encoder = _get_encoder()
+        
+        batch_size = 500
+        raw_embs_path = Path(temp_dir) / "embeddings.raw"
+        
         import faiss
-        dim = embeddings_arr.shape[1]
+        index = None
+        dim = None
+        global_idx = 0
 
-        sub_index = faiss.IndexFlatIP(dim)
-        index = faiss.IndexIDMap(sub_index)
-        index.add_with_ids(embeddings_arr.astype(np.float32), np.arange(len(embeddings_arr), dtype=np.int64))
+        with open(raw_embs_path, "wb") as f_raw_embs:
+            batch_candidates = []
+            batch_texts = []
+            
+            with open(enriched_jsonl_path, "r", encoding="utf-8") as f_enriched:
+                for line in f_enriched:
+                    c = json.loads(line)
+                    batch_candidates.append(c)
+                    if c.get("is_disqualified", False):
+                        batch_texts.append("")
+                    else:
+                        batch_texts.append(build_candidate_text(c))
+                        
+                    if len(batch_candidates) == batch_size:
+                        valid_indices = [i for i, t in enumerate(batch_texts) if t]
+                        valid_texts = [batch_texts[i] for i in valid_indices]
+                        
+                        if dim is None:
+                            dim = encoder.embedding_dim
+                            sub_index = faiss.IndexFlatIP(dim)
+                            index = faiss.IndexIDMap(sub_index)
+                            
+                        arr = np.zeros((len(batch_candidates), dim), dtype=np.float32)
+                        if valid_texts:
+                            encoded = encoder.encode_batch(valid_texts, normalize=True, bge_mode="passage")
+                            for arr_idx, orig_idx in enumerate(valid_indices):
+                                arr[orig_idx] = encoded[arr_idx]
+                                
+                        f_raw_embs.write(arr.tobytes())
+                        ids = np.arange(global_idx, global_idx + len(batch_candidates), dtype=np.int64)
+                        index.add_with_ids(arr, ids)
+                        global_idx += len(batch_candidates)
+                        batch_candidates = []
+                        batch_texts = []
+                        
+                if batch_candidates:
+                    valid_indices = [i for i, t in enumerate(batch_texts) if t]
+                    valid_texts = [batch_texts[i] for i in valid_indices]
+                    
+                    if dim is None:
+                        dim = encoder.embedding_dim
+                        sub_index = faiss.IndexFlatIP(dim)
+                        index = faiss.IndexIDMap(sub_index)
+                        
+                    arr = np.zeros((len(batch_candidates), dim), dtype=np.float32)
+                    if valid_texts:
+                        encoded = encoder.encode_batch(valid_texts, normalize=True, bge_mode="passage")
+                        for arr_idx, orig_idx in enumerate(valid_indices):
+                            arr[orig_idx] = encoded[arr_idx]
+                            
+                    f_raw_embs.write(arr.tobytes())
+                    ids = np.arange(global_idx, global_idx + len(batch_candidates), dtype=np.int64)
+                    index.add_with_ids(arr, ids)
+                    global_idx += len(batch_candidates)
 
-        faiss_arr = faiss.serialize_index(index)
-        StorageService.upload_file("faiss-indexes", f"{project_id}/faiss_v1.index", faiss_arr.tobytes())
+        npy_path = Path(temp_dir) / "embeddings.npy"
+        if dim is None:
+            dim = encoder.embedding_dim
+            
+        with open(npy_path, "wb") as f_npy:
+            import struct
+            f_npy.write(b'\x93NUMPY')
+            f_npy.write(b'\x01\x00')
+            
+            header_str = f"{{'descr': '<f4', 'fortran_order': False, 'shape': ({total_candidates}, {dim})}} "
+            pad_len = 64 - ((10 + len(header_str) + 1) % 64)
+            if pad_len == 64:
+                pad_len = 0
+            header_str += " " * pad_len + "\n"
+            
+            f_npy.write(struct.pack('<H', len(header_str)))
+            f_npy.write(header_str.encode('ascii'))
+            
+            if os.path.exists(raw_embs_path):
+                with open(raw_embs_path, "rb") as f_raw:
+                    while True:
+                        chunk = f_raw.read(65536)
+                        if not chunk:
+                            break
+                        f_npy.write(chunk)
 
-        enriched_candidates_content = ""
-        for c in candidates:
-            enriched_candidates_content += json.dumps(c, ensure_ascii=False) + "\n"
-        StorageService.upload_file("candidate-files", path, enriched_candidates_content.encode("utf-8"))
+        npy_content = npy_path.read_bytes()
+        StorageService.upload_file("embeddings", f"{project_id}/embeddings_v1.npy", npy_content)
+
+        if index is not None:
+            faiss_arr = faiss.serialize_index(index)
+            StorageService.upload_file("faiss-indexes", f"{project_id}/faiss_v1.index", faiss_arr.tobytes())
+        else:
+            sub_index = faiss.IndexFlatIP(dim)
+            index = faiss.IndexIDMap(sub_index)
+            faiss_arr = faiss.serialize_index(index)
+            StorageService.upload_file("faiss-indexes", f"{project_id}/faiss_v1.index", faiss_arr.tobytes())
+
+        enriched_content = enriched_jsonl_path.read_bytes()
+        StorageService.upload_file("candidate-files", path, enriched_content)
 
         supabase_client.table("projects").update({
             "embedding_status": "ready",
@@ -768,8 +889,26 @@ def process_project_data_task(project_id: str):
     finally:
         from app.services.cache_service import CacheService
         CacheService.invalidate_project(project_id)
-
-        pass
+        
+        if temp_dir and os.path.exists(temp_dir):
+            try:
+                shutil.rmtree(temp_dir)
+            except Exception:
+                pass
+                
+        large_vars = [
+            "candidates", "role_files", "candidate_ids", "skill_index",
+            "batch_candidates", "batch_texts", "arr", "encoded",
+            "npy_content", "faiss_arr", "enriched_content", "index", "sub_index"
+        ]
+        for v in large_vars:
+            if v in locals():
+                try:
+                    del locals()[v]
+                except Exception:
+                    pass
+        import gc
+        gc.collect()
 
 
 # ── Startup Integrity Check (Mocked for Supabase) ─────────────────────────────
@@ -1209,16 +1348,36 @@ async def run_analysis(
     current_user: Optional[AuthUser] = Depends(get_optional_user),
 ):
     import logging
+    import asyncio
+    import time
+    import heapq
+    import numpy as np
+    import json
+    import uuid
+    from collections import Counter
+    from app.services.storage_provider import StorageService
+    from app.services.cache_service import CacheService
+    from src.ranking.engine import COMPATIBLE_CATEGORIES
+
     logger = logging.getLogger(__name__)
     user_id = get_user_id(current_user)
+
+    # 1. Concurrent Analysis Protection (Project Lock)
+    if project_id in _active_analyses:
+        logger.warning("Concurrent analysis attempt rejected for project %s", project_id)
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Analysis already in progress."
+        )
 
     proj_res = supabase_client.table("projects").select("*").eq("id", project_id).eq("user_id", user_id).execute()
     if not proj_res.data:
         raise HTTPException(status_code=404, detail="Project not found")
     p = proj_res.data[0]
 
+    # Database-level check for active analyses
     if p.get("status") in ["queued", "processing", "ranking"]:
-        logger.info("Duplicate analysis prevented for project %s", project_id)
+        logger.info("Duplicate database-level analysis prevented for project %s", project_id)
         active_res = supabase_client.table("rankings").select("*").eq("project_id", project_id).eq("job_id", body.job_id).order("created_at", desc=True).limit(1).execute()
         if active_res.data:
             ranking_id = active_res.data[0]["id"]
@@ -1227,209 +1386,250 @@ async def run_analysis(
             return active_res.data[0]
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
-            detail="Duplicate analysis prevented: project analysis is currently running."
+            detail="Analysis already in progress."
         )
 
-    current_path = p.get("current_candidate_path")
-    if not current_path:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="No candidates in project. Upload a candidates file first."
-        )
+    # Acquire lock
+    _active_analyses.add(project_id)
 
-    job_res = supabase_client.table("jobs").select("*").eq("id", body.job_id).execute()
-    if not job_res.data:
-        raise HTTPException(status_code=400, detail="Job description not found.")
-    job = job_res.data[0]
-
-    bucket, path = current_path.split("/", 1)
-    from app.services.storage_provider import StorageService
-    total_candidates_in_dataset = p.get("candidate_count") or 0
-    if total_candidates_in_dataset == 0:
-        total_candidates_in_dataset = sum(1 for _ in StorageService.stream_jsonl(bucket, path))
-        supabase_client.table("projects").update({"candidate_count": total_candidates_in_dataset}).eq("id", project_id).execute()
-
-    dataset_hash = compute_dataset_hash(None, project_id=project_id)
-    jd_desc = job.get("description") or ""
-    jd_hash = get_sha256_hash(jd_desc)
-
-    from collections import Counter
-    from src.ranking.engine import COMPATIBLE_CATEGORIES
-
-    existing_rank = supabase_client.table("rankings").select("*").eq("project_id", project_id).eq("dataset_hash", dataset_hash).eq("jd_hash", jd_hash).execute()
-    if existing_rank.data:
-        r = existing_rank.data[0]
-        if r.get("metadata_only_fallback") and p.get("embedding_status") == "ready":
-            logger.info("Cached ranking was metadata-only fallback, but embeddings are now ready. Bypassing cache to compute full vector ranking.")
-        elif r.get("ai_enhancement_unavailable"):
-            logger.info("Cached ranking had AI Enhancement Unavailable. Bypassing cache to retry OpenRouter.")
-        else:
-            logger.info("Dataset fingerprint check: Reusing existing ranking results for project %s", project_id)
-            supabase_client.table("projects").update({"status": "COMPLETED", "updated_at": _now()}).eq("id", project_id).execute()
-            results_res = supabase_client.table("ranking_results").select("full_result").eq("ranking_id", r["id"]).order("rank").execute()
-            r["results"] = [x["full_result"] for x in results_res.data]
-            return r
-
-    supabase_client.table("projects").update({"status": "processing", "updated_at": _now()}).eq("id", project_id).execute()
-
-    MAX_ROLE_FILTER = 20000
-    MAX_EXP_FILTER = 10000
-    MAX_SKILL_FILTER = 3000
-    MAX_FAISS_INPUT = 2000
-    MAX_FAISS_RESULTS = 500
-    MAX_DEEP_SCORING = 100
-
+    # Initialize telemetry variables
     t_start_all = time.time()
-    filter_time = 0.0
-    index_lookup_time = 0.0
-    embedding_time = 0.0
-    faiss_time = 0.0
-    scoring_time = 0.0
-    llm_time = 0.0
+    peak_memory = get_memory_mb()
+    
+    def check_overall_timeout():
+        if time.time() - t_start_all > 600.0:
+            raise asyncio.TimeoutError("Overall analysis timeout of 10 minutes exceeded.")
 
-    _enforce_embedding_timeouts()
+    def update_peak():
+        nonlocal peak_memory
+        peak_memory = max(peak_memory, get_memory_mb())
+
+    # STARTUP_MEMORY log
+    log_memory("STARTUP_MEMORY")
+
+    # Define variables for cleanup
+    candidates_pool = []
+    passed_role = []
+    passed_exp = []
+    passed_skills = []
+    faiss_input_candidates = []
+    retrieved_candidates = []
+    scored_pool = []
+    top_scored = []
+    top_100_candidates = []
+    top_100_embs = []
+    results_rows = []
+    index = None
+    candidate_ids_list = None
+    full_embs = None
+    jd_emb = None
+    engine_res = None
+    results = []
+
+    # Initialize counters for telemetry
+    total_candidates_in_dataset = 0
+    AFTER_SKILL_FILTER = 0
+    AFTER_ROLE_FILTER = 0
+    AFTER_EXPERIENCE_FILTER = 0
+    FAISS_INPUT_COUNT = 0
+    AFTER_FAISS = 0
 
     try:
-        from src.ranking.engine import UnifiedRankingEngine
+        # Get Job Description details
+        job_res = supabase_client.table("jobs").select("*").eq("id", body.job_id).execute()
+        if not job_res.data:
+            raise HTTPException(status_code=400, detail="Job description not found.")
+        job = job_res.data[0]
 
-        supabase_client.table("projects").update({"status": "ranking", "updated_at": _now()}).eq("id", project_id).execute()
+        current_path = p.get("current_candidate_path")
+        if not current_path:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="No candidates in project. Upload a candidates file first."
+            )
 
-        print("[ANALYSIS_START]")
-        print(f"[TOTAL_CANDIDATES] {total_candidates_in_dataset}")
+        bucket, path = current_path.split("/", 1)
+        total_candidates_in_dataset = p.get("candidate_count") or 0
+        if total_candidates_in_dataset == 0:
+            total_candidates_in_dataset = sum(1 for _ in StorageService.stream_jsonl(bucket, path))
+            supabase_client.table("projects").update({"candidate_count": total_candidates_in_dataset}).eq("id", project_id).execute()
 
+        # Invalidation check via JD hash (including openings/positions)
+        openings = job.get("openings") or job.get("open_positions") or ""
+        jd_content = f"{job.get('title', '')}|{job.get('description', '')}|{json.dumps(job.get('required_skills', []))}|{openings}"
+        jd_hash = get_sha256_hash(jd_content)
+        dataset_hash = compute_dataset_hash(None, project_id=project_id)
+
+        # Check existing rankings
+        existing_rank = supabase_client.table("rankings").select("*").eq("project_id", project_id).eq("dataset_hash", dataset_hash).eq("jd_hash", jd_hash).execute()
+        if existing_rank.data:
+            r = existing_rank.data[0]
+            if r.get("metadata_only_fallback") and p.get("embedding_status") == "ready":
+                logger.info("Cached ranking was metadata-only fallback, but embeddings are now ready. Bypassing cache to compute full vector ranking.")
+                CacheService.invalidate_project(project_id)
+            elif r.get("ai_enhancement_unavailable"):
+                logger.info("Cached ranking had AI Enhancement Unavailable. Bypassing cache to retry OpenRouter.")
+                CacheService.invalidate_project(project_id)
+            else:
+                logger.info("Dataset fingerprint check: Reusing existing ranking results for project %s", project_id)
+                supabase_client.table("projects").update({"status": "COMPLETED", "updated_at": _now()}).eq("id", project_id).execute()
+                results_res = supabase_client.table("ranking_results").select("full_result").eq("ranking_id", r["id"]).order("rank").execute()
+                r["results"] = [x["full_result"] for x in results_res.data]
+                return r
+
+        # Mark database status as processing
+        supabase_client.table("projects").update({"status": "processing", "updated_at": _now()}).eq("id", project_id).execute()
+
+        # Setup limits
+        MAX_ROLE_FILTER = 20000
+        MAX_EXP_FILTER = 10000
+        MAX_SKILL_FILTER = 3000
+        MAX_FAISS_INPUT = 2000
+        MAX_FAISS_RESULTS = 500
+        MAX_DEEP_SCORING = 100
+
+        filter_time = 0.0
+        index_lookup_time = 0.0
+        embedding_time = 0.0
+        faiss_time = 0.0
+        scoring_time = 0.0
+        llm_time = 0.0
+
+        # Memory Safety Limit check
+        memory_safety_mode = False
+        if get_memory_mb() > 450.0:
+            logger.warning("[MEMORY_WARNING] Process RAM exceeds 450MB before filtering. Switching to memory safety mode.")
+            memory_safety_mode = True
+
+        # Extract Job parameters
         jd_category = job.get("role_category") or "BACKEND"
         jd_min_exp = float(job.get("min_experience") or 0.0)
         allowed_categories = COMPATIBLE_CATEGORIES.get(jd_category.upper(), {jd_category.upper()})
         jd_skills = [s.lower().strip() for s in job.get("required_skills", []) if s]
 
+        print("[ANALYSIS_START]")
+        print(f"[TOTAL_CANDIDATES] {total_candidates_in_dataset}")
+
         print("[ROLE_FILTER_START]")
-        t_role_start = time.time()
-        candidates_pool = []
+        t_filter_start = time.time()
+
+        # Check if role indexes are available
         role_index_used = False
-
+        role_index_paths = []
         for cat in allowed_categories:
-            storage_role_path = f"{project_id}/role_{cat.upper()}_v1.jsonl"
-            try:
-                for c in StorageService.stream_jsonl("role-indexes", storage_role_path):
-                    candidates_pool.append(c)
-                role_index_used = True
-            except FileNotFoundError:
-                continue
+            role_path = f"{project_id}/role_{cat.upper()}_v1.jsonl"
+            if StorageService.file_exists("role-indexes", role_path):
+                role_index_paths.append(role_path)
+                
+        if len(role_index_paths) == len(allowed_categories):
+            role_index_used = True
 
-        if not candidates_pool:
-            role_index_used = False
-            for c_raw in StorageService.stream_jsonl(bucket, path):
-                c = standardize_candidate(c_raw)
-                if c.get("is_disqualified", False):
-                    continue
+        def candidate_stream():
+            if role_index_used:
+                for role_path in role_index_paths:
+                    for c in StorageService.stream_jsonl("role-indexes", role_path):
+                        yield c
+            else:
+                for c_raw in StorageService.stream_jsonl(bucket, path):
+                    yield standardize_candidate(c_raw)
+
+        # Min-heap to keep the top MAX_FAISS_INPUT candidates
+        faiss_input_heap = []
+        counter = 0
+
+        for c in candidate_stream():
+            check_overall_timeout()
+            update_peak()
+            
+            # Disqualification check
+            if c.get("is_disqualified", False):
+                continue
+                
+            # If not using role index, we must filter by role category compatibility
+            if not role_index_used:
                 cand_cat = c.get("candidate_role_category") or c.get("candidate_specialization") or "BACKEND"
                 if normalize_role_category(cand_cat) not in allowed_categories:
                     continue
-                cand_exp = float(c.get("profile", {}).get("years_of_experience") or c.get("years_exp") or 0.0)
-                if jd_min_exp > 0 and cand_exp < (jd_min_exp - 2.0):
-                    continue
-                if jd_skills:
-                    cand_skills = [s.get("name", "").lower().strip() if isinstance(s, dict) else str(s).lower().strip() for s in c.get("skills", [])]
-                    if not (set(cand_skills) & set(jd_skills)):
-                        continue
-                candidates_pool.append(c)
-
-        passed_role = []
-        if role_index_used:
-            for c in candidates_pool:
-                if c.get("is_disqualified", False):
-                    continue
-                cand_cat = c.get("candidate_role_category") or c.get("candidate_specialization") or "BACKEND"
-                if normalize_role_category(cand_cat) in allowed_categories:
-                    passed_role.append(c)
-            if not passed_role:
-                passed_role = [c for c in candidates_pool if not c.get("is_disqualified", False)]
-        else:
-            passed_role = candidates_pool[:]
-
-        if len(passed_role) > MAX_ROLE_FILTER:
-            passed_role.sort(key=lambda x: x.get("candidate_quality_score") or 0.0, reverse=True)
-            passed_role = passed_role[:MAX_ROLE_FILTER]
-
-        AFTER_ROLE_FILTER = len(passed_role)
-        role_filter_time = time.time() - t_role_start
-        print("[ROLE_FILTER_END]")
-
-        print("[EXPERIENCE_FILTER_START]")
-        t_exp_start = time.time()
-        passed_exp = []
-        if role_index_used:
-            for c in passed_role:
-                cand_exp = float(c.get("profile", {}).get("years_of_experience") or c.get("years_exp") or 0.0)
-                if jd_min_exp > 0 and cand_exp < (jd_min_exp - 2.0):
-                    continue
-                passed_exp.append(c)
-            if not passed_exp:
-                passed_exp = passed_role[:]
-        else:
-            passed_exp = passed_role[:]
-
-        if len(passed_exp) > MAX_EXP_FILTER:
-            passed_exp.sort(key=lambda x: x.get("candidate_quality_score") or 0.0, reverse=True)
-            passed_exp = passed_exp[:MAX_EXP_FILTER]
-
-        AFTER_EXPERIENCE_FILTER = len(passed_exp)
-        experience_filter_time = time.time() - t_exp_start
-        print("[EXPERIENCE_FILTER_END]")
-
-        print("[SKILL_FILTER_START]")
-        t_skill_start = time.time()
-        passed_skills = []
-        if role_index_used:
+                    
+            # Experience filter
+            cand_exp = float(c.get("profile", {}).get("years_of_experience") or c.get("years_exp") or 0.0)
+            if jd_min_exp > 0 and cand_exp < (jd_min_exp - 2.0):
+                continue
+                
+            # Skill filter
             if jd_skills:
-                for c in passed_exp:
-                    cand_skills = [s.get("name", "").lower().strip() if isinstance(s, dict) else str(s).lower().strip() for s in c.get("skills", [])]
-                    if set(cand_skills) & set(jd_skills):
-                        passed_skills.append(c)
-            if not passed_skills:
-                passed_skills = passed_exp[:]
-        else:
-            passed_skills = passed_exp[:]
+                cand_skills = [s.get("name", "").lower().strip() if isinstance(s, dict) else str(s).lower().strip() for s in c.get("skills", [])]
+                if not (set(cand_skills) & set(jd_skills)):
+                    continue
+                    
+            # Quality score
+            score = c.get("candidate_quality_score") or 0.0
+            counter += 1
+            
+            # Maintain top MAX_FAISS_INPUT in min-heap based on score
+            if len(faiss_input_heap) < MAX_FAISS_INPUT:
+                heapq.heappush(faiss_input_heap, (score, counter, c))
+            else:
+                if score > faiss_input_heap[0][0]:
+                    heapq.heappushpop(faiss_input_heap, (score, counter, c))
 
-        if len(passed_skills) > MAX_SKILL_FILTER:
-            passed_skills.sort(key=lambda x: x.get("candidate_quality_score") or 0.0, reverse=True)
-            passed_skills = passed_skills[:MAX_SKILL_FILTER]
+        faiss_input_candidates = [item[2] for item in sorted(faiss_input_heap, key=lambda x: -x[0])]
+        AFTER_SKILL_FILTER = len(faiss_input_candidates)
+        AFTER_ROLE_FILTER = len(faiss_input_candidates)
+        AFTER_EXPERIENCE_FILTER = len(faiss_input_candidates)
+        FAISS_INPUT_COUNT = len(faiss_input_candidates)
 
-        AFTER_SKILL_FILTER = len(passed_skills)
-        skill_filter_time = time.time() - t_skill_start
+        del faiss_input_heap
+        update_peak()
+        filter_time = time.time() - t_filter_start
+        print("[ROLE_FILTER_END]")
+        print("[EXPERIENCE_FILTER_END]")
         print("[SKILL_FILTER_END]")
+        log_memory("FILTER_MEMORY")
 
-        filter_time = role_filter_time + experience_filter_time + skill_filter_time
-
+        # Load FAISS index & IDs
         embedding_status = p.get("embedding_status", "pending")
         metadata_only_fallback = False
         fallback_reason = None
-        
-        from app.services.cache_service import CacheService
-        
+
         version = 1
         faiss_key = f"{project_id}/faiss_v{version}.index"
         embeddings_key = f"{project_id}/embeddings_v{version}.npy"
         ids_key = f"{project_id}/ids_v{version}.json"
 
-        if embedding_status != "ready":
+        # Check safety memory threshold
+        if get_memory_mb() > 450.0 or memory_safety_mode:
+            logger.warning("[MEMORY_WARNING] Process RAM exceeds 450MB. Disabling FAISS index loading.")
+            metadata_only_fallback = True
+            fallback_reason = "memory_safety_limit_exceeded"
+        elif embedding_status != "ready":
             metadata_only_fallback = True
             fallback_reason = f"embedding_status_{embedding_status}"
         else:
             try:
-                index = CacheService.get("faiss-indexes", faiss_key)
-                if not index:
-                    content = StorageService.download_file("faiss-indexes", faiss_key)
-                    import faiss
-                    index = faiss.deserialize_index(np.frombuffer(content, dtype=np.uint8))
-                    CacheService.set("faiss-indexes", faiss_key, index)
-                            
-                candidate_ids_list = CacheService.get("embeddings", ids_key)
-                if not candidate_ids_list:
-                    content = StorageService.download_file("embeddings", ids_key)
-                    candidate_ids_list = json.loads(content.decode("utf-8"))
-                    CacheService.set("embeddings", ids_key, candidate_ids_list)
+                # Wrap FAISS and ID loading in a 2-minute timeout
+                async def load_index_and_ids():
+                    nonlocal index, candidate_ids_list
+                    index = CacheService.get("faiss-indexes", faiss_key)
+                    if not index:
+                        content = StorageService.download_file("faiss-indexes", faiss_key)
+                        import faiss
+                        index = faiss.deserialize_index(np.frombuffer(content, dtype=np.uint8))
+                        CacheService.set("faiss-indexes", faiss_key, index)
+                                
+                    candidate_ids_list = CacheService.get("embeddings", ids_key)
+                    if not candidate_ids_list:
+                        content = StorageService.download_file("embeddings", ids_key)
+                        candidate_ids_list = json.loads(content.decode("utf-8"))
+                        CacheService.set("embeddings", ids_key, candidate_ids_list)
+
+                await asyncio.wait_for(load_index_and_ids(), timeout=120.0) # 2 minute timeout
+            except asyncio.TimeoutError:
+                logger.error("FAISS index/IDs loading timed out after 2 minutes.")
+                metadata_only_fallback = True
+                fallback_reason = "faiss_load_timeout"
             except Exception as e:
+                logger.error("Failed to load FAISS index: %s", e)
                 metadata_only_fallback = True
                 fallback_reason = f"storage_index_load_error: {e}"
 
@@ -1437,18 +1637,14 @@ async def run_analysis(
             print(f"[WARNING] Fallback activated. Reason: {fallback_reason}")
             print("[WARNING] Embedding cache missing. Using metadata fallback.")
 
-        retrieved_candidates = []
-        similarities_map = {}
-        FAISS_INPUT_COUNT = 0
-        AFTER_FAISS = 0
-
+        # Embedding & FAISS Search
         if metadata_only_fallback:
             print("[EMBEDDING_START] (skipped: metadata-only fallback)")
             print("[EMBEDDING_END]")
             print("[FAISS_START] (skipped: metadata-only fallback)")
             print("[FAISS_END]")
             
-            retrieved_candidates = passed_skills[:]
+            retrieved_candidates = faiss_input_candidates[:]
             retrieved_candidates.sort(key=lambda x: x.get("candidate_quality_score") or 0.0, reverse=True)
             retrieved_candidates = retrieved_candidates[:MAX_FAISS_RESULTS]
             AFTER_FAISS = len(retrieved_candidates)
@@ -1462,15 +1658,27 @@ async def run_analysis(
                 + " "
                 + job.get("description", "")
             ).strip()
+            
+            # Lazy load model here
             encoder = _get_encoder()
+            log_memory("MODEL_MEMORY")
+            update_peak()
             
             try:
-                jd_emb = encoder.encode_single(jd_text, normalize=True, bge_mode="query")
+                # Wrap JD embedding in 5-minute timeout
+                async def generate_jd_embedding():
+                    return encoder.encode_single(jd_text, normalize=True, bge_mode="query")
+
+                jd_emb = await asyncio.wait_for(generate_jd_embedding(), timeout=300.0)
                 embedding_time = time.time() - t_emb_start
-                if embedding_time > 300.0:
-                    raise TimeoutError("Embedding generation timed out.")
-            except Exception as e:
+            except asyncio.TimeoutError:
+                logger.error("Embedding generation timed out after 5 minutes.")
                 metadata_only_fallback = True
+                fallback_reason = "embedding_generation_timeout"
+            except Exception as e:
+                logger.error("Failed to generate JD embedding: %s", e)
+                metadata_only_fallback = True
+                fallback_reason = f"embedding_error: {e}"
                 
             print("[EMBEDDING_END]")
             
@@ -1479,19 +1687,12 @@ async def run_analysis(
             
             if metadata_only_fallback:
                 print("[FAISS_END] (aborted due to embedding failure)")
-                retrieved_candidates = passed_skills[:]
+                retrieved_candidates = faiss_input_candidates[:]
                 retrieved_candidates.sort(key=lambda x: x.get("candidate_quality_score") or 0.0, reverse=True)
                 retrieved_candidates = retrieved_candidates[:MAX_FAISS_RESULTS]
                 AFTER_FAISS = len(retrieved_candidates)
                 similarities_map = {c.get("candidate_id"): 0.5 for c in retrieved_candidates}
             else:
-                faiss_input_candidates = passed_skills[:]
-                if len(faiss_input_candidates) > MAX_FAISS_INPUT:
-                    faiss_input_candidates.sort(key=lambda x: x.get("candidate_quality_score") or 0.0, reverse=True)
-                    faiss_input_candidates = faiss_input_candidates[:MAX_FAISS_INPUT]
-                    
-                FAISS_INPUT_COUNT = len(faiss_input_candidates)
-                
                 try:
                     id_to_idx = {cid: idx for idx, cid in enumerate(candidate_ids_list)}
                     pool_indices = []
@@ -1501,20 +1702,26 @@ async def run_analysis(
                             pool_indices.append(id_to_idx[cid])
                             
                     if pool_indices:
-                        import faiss
-                        index = CacheService.get("faiss-indexes", faiss_key)
-                        sel = faiss.IDSelectorArray(np.array(pool_indices, dtype=np.int64))
-                        params = faiss.SearchParameters()
-                        params.sel = sel
-                        
-                        top_k_search = min(MAX_FAISS_RESULTS, len(pool_indices))
-                        similarities, ann_indices = index.search(
-                            jd_emb.reshape(1, -1).astype(np.float32),
-                            top_k_search,
-                            params=params
-                        )
-                        similarities = similarities[0]
-                        ann_indices = ann_indices[0]
+                        # Wrap FAISS search in 2-minute timeout
+                        async def run_faiss_search():
+                            nonlocal similarities, ann_indices
+                            import faiss
+                            sel = faiss.IDSelectorArray(np.array(pool_indices, dtype=np.int64))
+                            params = faiss.SearchParameters()
+                            params.sel = sel
+                            
+                            top_k_search = min(MAX_FAISS_RESULTS, len(pool_indices))
+                            similarities, ann_indices = index.search(
+                                jd_emb.reshape(1, -1).astype(np.float32),
+                                top_k_search,
+                                params=params
+                            )
+                            similarities = similarities[0]
+                            ann_indices = ann_indices[0]
+
+                        similarities = None
+                        ann_indices = None
+                        await asyncio.wait_for(run_faiss_search(), timeout=120.0) # 2 minutes
                         
                         c_map = {c.get("candidate_id"): c for c in faiss_input_candidates}
                         for sim, global_idx in zip(similarities, ann_indices):
@@ -1528,15 +1735,25 @@ async def run_analysis(
                         retrieved_candidates = []
                         
                     faiss_time = time.time() - t_faiss_start
-                    if faiss_time > 120.0:
-                        raise TimeoutError("FAISS search timed out.")
+                except asyncio.TimeoutError:
+                    logger.error("FAISS search timed out after 2 minutes.")
+                    metadata_only_fallback = True
+                    retrieved_candidates = faiss_input_candidates[:]
+                    retrieved_candidates.sort(key=lambda x: x.get("candidate_quality_score") or 0.0, reverse=True)
+                    retrieved_candidates = retrieved_candidates[:MAX_FAISS_RESULTS]
+                    similarities_map = {c.get("candidate_id"): 0.5 for c in retrieved_candidates}
                 except Exception as e:
-                    import traceback
-                    traceback.print_exc()
-                    raise e
+                    logger.error("FAISS search encountered error: %s", e)
+                    metadata_only_fallback = True
+                    retrieved_candidates = faiss_input_candidates[:]
+                    retrieved_candidates.sort(key=lambda x: x.get("candidate_quality_score") or 0.0, reverse=True)
+                    retrieved_candidates = retrieved_candidates[:MAX_FAISS_RESULTS]
+                    similarities_map = {c.get("candidate_id"): 0.5 for c in retrieved_candidates}
                     
                 AFTER_FAISS = len(retrieved_candidates)
                 print("[FAISS_END]")
+                log_memory("FAISS_MEMORY")
+                update_peak()
 
         print("[SCORING_START]")
         t_stage3_start = time.time()
@@ -1589,6 +1806,14 @@ async def run_analysis(
                 pass
 
         print("[LLM_START]")
+        
+        # Enforce memory safety limit check before calling LLM
+        call_llm_flag = True
+        if get_memory_mb() > 450.0 or memory_safety_mode:
+            logger.warning("[MEMORY_WARNING] Process RAM exceeds 450MB before LLM stage. Disabling LLM enhancement.")
+            call_llm_flag = False
+
+        from src.ranking.engine import UnifiedRankingEngine
         engine = UnifiedRankingEngine(
             encoder=_get_encoder(),
             config={
@@ -1598,24 +1823,42 @@ async def run_analysis(
         )
         
         from src.ranking.engine import validate_tuple
-        engine_res = await engine.rank_candidates(
-            candidates=top_100_candidates,
-            jd_dict=job,
-            top_n=body.top_k,
-            call_llm=True,
-            candidate_embeddings=top_100_embs
-        )
+        
+        # Wrap LLM evaluation in 60-second timeout (Requirement 5)
+        try:
+            async def run_llm_ranking():
+                return await engine.rank_candidates(
+                    candidates=top_100_candidates,
+                    jd_dict=job,
+                    top_n=body.top_k,
+                    call_llm=call_llm_flag,
+                    candidate_embeddings=top_100_embs
+                )
+
+            engine_res = await asyncio.wait_for(run_llm_ranking(), timeout=60.0) # 60 seconds
+        except asyncio.TimeoutError:
+            logger.error("OpenRouter LLM evaluation timed out after 60 seconds. Falling back to deterministic ranking.")
+            engine_res = await engine.rank_candidates(
+                candidates=top_100_candidates,
+                jd_dict=job,
+                top_n=body.top_k,
+                call_llm=False,
+                candidate_embeddings=top_100_embs
+            )
+            
         assert isinstance(engine_res, tuple), f"Expected tuple from rank_candidates, got {type(engine_res).__name__}"
         validate_tuple(engine_res, 3, "platform.py run_analysis", "(results, ranked_tuples, blended_scores)")
         results, _, _ = engine_res
         print("[LLM_END]")
+        log_memory("LLM_MEMORY")
+        update_peak()
 
         scoring_time += engine.metrics.get("ranking_time", 0.0)
         llm_time += engine.metrics.get("llm_time", 0.0)
 
         categories = [
             normalize_role_category(c.get("candidate_role_category") or c.get("candidate_specialization") or "BACKEND")
-            for c in passed_skills
+            for c in faiss_input_candidates
         ]
         cat_counts = Counter(categories)
         top_categories = [cat for cat, count in cat_counts.most_common(3)]
@@ -1671,6 +1914,7 @@ async def run_analysis(
             "after_scoring": len(top_100_candidates),
             "llm_input_count": engine.metrics.get("llm_candidates_evaluated", 0),
             "after_llm_selection": len(results),
+            "peak_memory_mb": round(peak_memory, 2)
         }
 
         ranking = {
@@ -1748,6 +1992,38 @@ async def run_analysis(
         _set_cached_ranking(project_id, body.job_id, ranking)
         return ranking
 
+    except MemoryError as exc:
+        logger.error("[OOM_RECOVERY] Out of Memory detected in run_analysis: %s", exc)
+        try:
+            from app.services.cache_service import CacheService
+            CacheService.clear()
+        except Exception:
+            pass
+        try:
+            from src.features.embedding import _MODEL_CACHE
+            _MODEL_CACHE.clear()
+        except Exception:
+            pass
+        global _encoder
+        _encoder = None
+        import gc
+        gc.collect()
+        
+        # Try to mark the project as failed in Supabase so the UI doesn't hang
+        try:
+            supabase_client.table("projects").update({
+                "status": "failed",
+                "upload_statistics": {"failure_reason": "Out of memory error"},
+                "updated_at": _now()
+            }).eq("id", project_id).execute()
+        except Exception:
+            pass
+            
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Server temporarily overloaded: Out of memory."
+        )
+
     except Exception as exc:
         supabase_client.table("projects").update({
             "status": "failed",
@@ -1758,6 +2034,44 @@ async def run_analysis(
         import traceback
         traceback.print_exc()
         raise exc
+    finally:
+        # 1. Release active project cache references from CacheService
+        try:
+            from app.services.cache_service import CacheService
+            CacheService.invalidate_project(project_id)
+        except Exception:
+            pass
+            
+        # 2. Release local large variables
+        large_vars = [
+            "candidates_pool", "passed_role", "passed_exp", "passed_skills",
+            "faiss_input_candidates", "retrieved_candidates", "scored_pool",
+            "top_scored", "top_100_candidates", "top_100_embs", "results_rows",
+            "index", "candidate_ids_list", "full_embs", "jd_emb", "engine_res",
+            "results"
+        ]
+        for v in large_vars:
+            if v in locals():
+                try:
+                    del locals()[v]
+                except Exception:
+                    pass
+                    
+        # 3. Explicitly trigger Garbage Collection
+        import gc
+        gc.collect()
+        
+        # 4. Release concurrent analysis project lock
+        _active_analyses.discard(project_id)
+        
+        # 5. Log telemetry FINAL_MEMORY and Peak Memory
+        update_peak()
+        log_memory("FINAL_MEMORY")
+        print(f"[MEMORY_TELEMETRY] PEAK_MEMORY: {peak_memory:.2f} MB", flush=True)
+        from app.core.config import settings
+        print(f"[MEMORY_TELEMETRY] CURRENT_MODEL: {settings.embedding_model}", flush=True)
+        print(f"[MEMORY_TELEMETRY] CANDIDATE_COUNT: {total_candidates_in_dataset}", flush=True)
+        print(f"[MEMORY_TELEMETRY] FILTERED_COUNT: {AFTER_SKILL_FILTER}", flush=True)
 
 
 def _top_strengths(ds) -> list[str]:
@@ -2006,4 +2320,61 @@ async def get_health_stats(current_user: Optional[AuthUser] = Depends(get_option
         "failed_jobs": failed_jobs,
         "duplicate_projects_prevented": _health_stats.get("duplicate_projects_prevented", 0),
         "exports_generated": _health_stats.get("exports_generated", 0),
+    }
+
+
+@router.get("/projects/{project_id}/performance-metrics")
+async def get_performance_metrics(
+    project_id: str,
+    current_user: Optional[AuthUser] = Depends(get_optional_user)
+):
+    user_id = get_user_id(current_user)
+    p_res = supabase_client.table("projects").select("*").eq("id", project_id).eq("user_id", user_id).execute()
+    if not p_res.data:
+        raise HTTPException(status_code=404, detail="Project not found")
+        
+    r_res = supabase_client.table("rankings").select("*").eq("project_id", project_id).order("created_at", desc=True).limit(1).execute()
+    if not r_res.data:
+        return {
+            "project_id": project_id,
+            "has_metrics": False,
+            "message": "No analysis runs found for this project yet."
+        }
+        
+    ranking = r_res.data[0]
+    metrics = ranking.get("metrics") or {}
+    
+    return {
+        "project_id": project_id,
+        "ranking_id": ranking.get("id"),
+        "has_metrics": True,
+        "performance_mode": ranking.get("version_metadata", {}).get("performance_mode", "balanced"),
+        "metadata_only_fallback": ranking.get("metadata_only_fallback", False),
+        "ai_enhancement_unavailable": ranking.get("ai_enhancement_unavailable", False),
+        "timing_metrics": {
+            "total_analysis_time_sec": metrics.get("total_analysis_time", 0.0),
+            "retrieval_time_sec": metrics.get("retrieval_time", 0.0),
+            "filter_time_sec": metrics.get("filter_time", 0.0),
+            "index_lookup_time_sec": metrics.get("index_lookup_time", 0.0),
+            "embedding_time_sec": metrics.get("embedding_time", 0.0),
+            "faiss_time_sec": metrics.get("faiss_time", 0.0),
+            "scoring_time_sec": metrics.get("scoring_time", 0.0),
+            "llm_time_sec": metrics.get("llm_time", 0.0),
+        },
+        "funnel_metrics": {
+            "total_candidates": metrics.get("total_candidates", 0),
+            "after_role_filter": metrics.get("after_role_filter", 0),
+            "after_experience_filter": metrics.get("after_experience_filter", 0),
+            "after_skill_filter": metrics.get("after_skill_filter", 0),
+            "faiss_input_count": metrics.get("faiss_input_count", 0),
+            "after_faiss": metrics.get("after_faiss", 0),
+            "after_scoring": metrics.get("after_scoring", 0),
+            "llm_input_count": metrics.get("llm_input_count", 0),
+            "after_llm_selection": metrics.get("after_llm_selection", 0),
+        },
+        "memory_metrics": {
+            "peak_memory_mb": metrics.get("peak_memory_mb", 0.0),
+            "limit_mb": 450.0,
+            "safety_margin_mb": max(0.0, 450.0 - metrics.get("peak_memory_mb", 0.0))
+        }
     }

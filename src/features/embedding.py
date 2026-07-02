@@ -32,6 +32,11 @@ class EmbeddingEncoder:
             self._model = _MODEL_CACHE[self.model_name]
             return
 
+        # Keep ONLY one model in cache at any time to prevent OOM
+        _MODEL_CACHE.clear()
+        import gc
+        gc.collect()
+
         # Lazy import so this module is importable without sentence_transformers.
         from sentence_transformers import SentenceTransformer  # noqa: PLC0415
 

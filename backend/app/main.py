@@ -48,18 +48,7 @@ async def lifespan(app: FastAPI):
 
     print(f"OpenRouter Key Loaded: {key_preview}... (Source: {source})", file=sys.stderr, flush=True)
     logger.warning("OpenRouter Key Loaded: %s... (Source: %s)", key_preview, source)
-    loop = asyncio.get_event_loop()
 
-    def _load_model():
-        try:
-            from app.api.v1.endpoints.platform import _get_encoder
-            _get_encoder()
-            logger.info("Embedding model pre-loaded successfully.")
-        except Exception as exc:
-            logger.warning("Could not pre-load embedding model: %s", exc)
-
-    # Load in background so startup doesn't block
-    loop.run_in_executor(None, _load_model)
 
     try:
         from app.api.v1.endpoints.platform import run_startup_initialization
@@ -91,6 +80,76 @@ app.middleware("http")(rate_limit_middleware)
 app.include_router(api_router, prefix="/api/v1")
 
 
+@app.get("/")
+@app.head("/")
+async def root_status():
+    return {"status": "healthy", "service": "hiremind-ai", "version": "2.5.0"}
+
+
 @app.get("/health", tags=["health"])
-async def root_health() -> dict:
-    return {"status": "ok", "service": "hiremind-ai", "version": "2.0.0"}
+async def detailed_health():
+    import time
+    from app.core.config import settings
+    
+    # 1. Check Supabase database connectivity
+    db_status = "healthy"
+    db_error = None
+    try:
+        from app.api.v1.endpoints.platform import supabase_client
+        supabase_client.table("projects").select("id").limit(1).execute()
+    except Exception as e:
+        db_status = "unhealthy"
+        db_error = str(e)
+        
+    # 2. Check Storage Service
+    storage_status = "healthy"
+    storage_error = None
+    try:
+        from app.services.storage_provider import StorageService
+        StorageService.file_exists("candidate-files", "test-connectivity-probe")
+    except Exception as e:
+        storage_status = "unhealthy"
+        storage_error = str(e)
+        
+    # 3. Model Status (lazy loaded or cached)
+    model_cached = False
+    model_name = settings.embedding_model
+    try:
+        from app.api.v1.endpoints.platform import _encoder
+        if _encoder is not None and _encoder._model is not None:
+            model_cached = True
+    except Exception:
+        pass
+        
+    # 4. Memory Telemetry
+    try:
+        from app.api.v1.endpoints.platform import get_memory_mb
+        ram_mb = get_memory_mb()
+    except Exception:
+        ram_mb = 0.0
+        
+    overall_status = "healthy"
+    if db_status == "unhealthy" or storage_status == "unhealthy":
+        overall_status = "degraded"
+        
+    return {
+        "status": overall_status,
+        "timestamp": time.time(),
+        "database": {
+            "status": db_status,
+            "error": db_error
+        },
+        "storage": {
+            "status": storage_status,
+            "error": storage_error
+        },
+        "model": {
+            "configured_model": model_name,
+            "is_cached_in_ram": model_cached
+        },
+        "memory": {
+            "rss_ram_mb": round(ram_mb, 2),
+            "safety_limit_mb": 450.0,
+            "is_under_safety_threshold": ram_mb < 450.0
+        }
+    }
