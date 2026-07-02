@@ -65,7 +65,7 @@ def test_candidate_metadata_mapping() -> None:
         "must_have_skills": ["React", "TypeScript"]
     }
 
-    from backend.app.api.v1.endpoints.platform import enrich_candidate_with_intelligence
+    from app.api.v1.endpoints.platform import enrich_candidate_with_intelligence
     candidate = enrich_candidate_with_intelligence(candidate)
 
     encoder = MockEncoder()
@@ -141,7 +141,7 @@ def test_integrity_regression_protection() -> None:
         "description": "General software engineering role"
     }
 
-    from backend.app.api.v1.endpoints.platform import enrich_candidate_with_intelligence
+    from app.api.v1.endpoints.platform import enrich_candidate_with_intelligence
     healthy_candidate = enrich_candidate_with_intelligence(healthy_candidate)
     incomplete_candidate = enrich_candidate_with_intelligence(incomplete_candidate)
 

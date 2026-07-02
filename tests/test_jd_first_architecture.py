@@ -15,7 +15,7 @@ if str(_PROJECT_ROOT) not in sys.path:
 if str(_BACKEND_ROOT) not in sys.path:
     sys.path.insert(0, str(_BACKEND_ROOT))
 
-from backend.app.api.v1.endpoints.platform import (
+from app.api.v1.endpoints.platform import (
     stream_candidates,
     enrich_candidate_with_intelligence,
     standardize_candidate,

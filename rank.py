@@ -171,10 +171,7 @@ def run_rank(args: argparse.Namespace) -> int:
         print("[rank] Running unified ranking pipeline...")
 
     from src.features.embedding import EmbeddingEncoder
-    try:
-        from app.core.config import settings  # type: ignore
-    except ImportError:
-        from backend.app.core.config import settings
+    from app.core.config import settings
     from src.ranking.engine import UnifiedRankingEngine
     import asyncio
 

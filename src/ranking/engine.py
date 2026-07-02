@@ -20,7 +20,7 @@ from src.scoring.dimensions import DimensionScorer, DimScores
 from src.scoring.dim_semantic import calculate_critical_skill_coverage
 from src.scoring.dim_specialization import score_specialization_match
 from src.ranking.selector import select_top_n
-from backend.app.core.openrouter import recruiter_evaluate_batch
+from app.core.openrouter import recruiter_evaluate_batch
 
 logger = logging.getLogger(__name__)
 
