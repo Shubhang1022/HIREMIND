@@ -1870,7 +1870,7 @@ async def run_analysis(
             "top_categories": top_categories
         }
 
-        status = "no_qualified_candidates" if getattr(engine, "status", "") == "no_qualified_candidates" else "completed"
+        analysis_status = "no_qualified_candidates" if getattr(engine, "status", "") == "no_qualified_candidates" else "completed"
         ranking_id = str(uuid.uuid4())
         now = _now()
 
@@ -1921,7 +1921,7 @@ async def run_analysis(
             "id": ranking_id,
             "project_id": project_id,
             "job_id": body.job_id,
-            "status": status,
+            "status": analysis_status,
             "total_candidates": total_candidates_in_dataset,
             "ranked_count": len(results),
             "results": results,
@@ -1934,7 +1934,7 @@ async def run_analysis(
             "ai_enhancement_unavailable": ai_enhancement_unavailable,
             "created_at": now,
         }
-        if status == "no_qualified_candidates":
+        if analysis_status == "no_qualified_candidates":
             ranking["message"] = "No strong candidates found for this role."
             ranking["alternative_candidates"] = getattr(engine, "alternative_candidates", [])
 
@@ -1943,7 +1943,7 @@ async def run_analysis(
             "project_id": project_id,
             "job_id": body.job_id,
             "version": 1,
-            "status": status,
+            "status": analysis_status,
             "total_candidates": total_candidates_in_dataset,
             "ranked_count": len(results),
             "dataset_hash": dataset_hash,
