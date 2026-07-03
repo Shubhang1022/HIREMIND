@@ -275,5 +275,28 @@ CREATE POLICY "Users can manage files in their own projects"
             SELECT 1 FROM public.projects
             WHERE public.projects.id::text = split_part(storage.objects.name, '/', 1)
               AND public.projects.user_id = auth.uid()
-        )
     );
+
+-- 10. Background Jobs Table (Production Hardening)
+CREATE TABLE IF NOT EXISTS public.background_jobs (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    project_id UUID NOT NULL REFERENCES public.projects(id) ON DELETE CASCADE,
+    user_id UUID,
+    job_type VARCHAR(50) NOT NULL,
+    current_stage VARCHAR(100),
+    progress_percentage INTEGER DEFAULT 0,
+    started_at TIMESTAMPTZ DEFAULT now(),
+    updated_at TIMESTAMPTZ DEFAULT now(),
+    last_heartbeat TIMESTAMPTZ DEFAULT now(),
+    retry_count INTEGER DEFAULT 0,
+    status VARCHAR(50) DEFAULT 'queued',
+    failure_reason TEXT
+);
+
+-- Enable RLS for background_jobs
+ALTER TABLE public.background_jobs ENABLE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS "Users can manage background_jobs for their own projects" ON public.background_jobs;
+CREATE POLICY "Users can manage background_jobs for their own projects"
+    ON public.background_jobs FOR ALL TO authenticated
+    USING (auth.uid() = user_id)
+    WITH CHECK (auth.uid() = user_id);

@@ -91,7 +91,8 @@ async def chat(
     max_tokens: int = 512,
     temperature: float = 0.3,
 ) -> str:
-    """Send a single-turn chat prompt and return the text response."""
+    """Send a single-turn chat prompt and return the text response with backoff retries."""
+    import asyncio
     if not settings.openrouter_api_key:
         return ""
 
@@ -107,37 +108,57 @@ async def chat(
         "temperature": temperature,
     }
 
-    try:
-        client = _get_client()
-        resp = await client.post("/chat/completions", json=payload, timeout=60.0)
-        if resp.status_code == 402:
-            logger.error("OpenRouter insufficient credits (402): %s", resp.text)
-            raise InsufficientCreditsError(f"OpenRouter credit failure: {resp.text}")
-        if resp.status_code != 200:
-            print(f"OpenRouter Error: status_code={resp.status_code}")
-            print(f"OpenRouter Error Response: {resp.text}")
-            logger.error("OpenRouter response error: status_code=%d, response_body=%s", resp.status_code, resp.text)
-        resp.raise_for_status()
-        data = resp.json()
-        return data["choices"][0]["message"]["content"].strip()
-    except InsufficientCreditsError:
-        raise
-    except Exception as exc:
-        if hasattr(exc, "response") and exc.response is not None:
-            status_code = exc.response.status_code
-            response_text = exc.response.text
-            print(f"OpenRouter Call Failed: status_code={status_code}")
-            print(f"OpenRouter Call Failed Response: {response_text}")
-            logger.warning(
-                "OpenRouter call failed (%s): status_code=%d, response_body=%s",
-                chosen_model,
-                status_code,
-                response_text,
-            )
-        else:
-            print(f"OpenRouter Call Unexpected Error: {exc}")
-            logger.warning("OpenRouter call failed (%s): %s", chosen_model, exc)
-        raise exc
+    retries = 3
+    backoff = 2.0
+    for attempt in range(retries):
+        try:
+            client = _get_client()
+            resp = await client.post("/chat/completions", json=payload, timeout=60.0)
+            
+            if resp.status_code == 402:
+                logger.error("OpenRouter insufficient credits (402): %s", resp.text)
+                raise InsufficientCreditsError(f"OpenRouter credit failure: {resp.text}")
+                
+            if resp.status_code == 429:
+                if attempt == retries - 1:
+                    resp.raise_for_status()
+                logger.warning("OpenRouter rate limit (429) hit. Retrying in %.1fs...", backoff)
+                await asyncio.sleep(backoff)
+                backoff *= 2.0
+                continue
+                
+            if resp.status_code in (500, 503):
+                if attempt == retries - 1:
+                    resp.raise_for_status()
+                logger.warning("OpenRouter server error (%d) hit. Retrying in %.1fs...", resp.status_code, backoff)
+                await asyncio.sleep(backoff)
+                backoff *= 2.0
+                continue
+                
+            if resp.status_code != 200:
+                logger.error("OpenRouter response error: status_code=%d, response_body=%s", resp.status_code, resp.text)
+                
+            resp.raise_for_status()
+            data = resp.json()
+            return data["choices"][0]["message"]["content"].strip()
+            
+        except InsufficientCreditsError:
+            raise
+        except (httpx.TimeoutException, httpx.NetworkError) as timeout_exc:
+            if attempt == retries - 1:
+                logger.error("OpenRouter connection/timeout error on final attempt: %s", timeout_exc)
+                raise timeout_exc
+            logger.warning("OpenRouter connection/timeout error. Retrying in %.1fs...", backoff)
+            await asyncio.sleep(backoff)
+            backoff *= 2.0
+        except httpx.HTTPStatusError as http_exc:
+            status_code = http_exc.response.status_code
+            if status_code not in (429, 500, 503) or attempt == retries - 1:
+                logger.error("OpenRouter HTTP error: status_code=%d, message=%s", status_code, http_exc.response.text)
+                raise http_exc
+            logger.warning("OpenRouter HTTP error %d. Retrying in %.1fs...", status_code, backoff)
+            await asyncio.sleep(backoff)
+            backoff *= 2.0
 
 
 async def parse_jd_with_llm(jd_text: str) -> dict:
@@ -387,7 +408,24 @@ RULES:
             logger.error("Failed to run recruiter evaluation even with reduced subset: %s", retry_err)
             raise retry_err
     except Exception as e:
-        logger.error("Recruiter batch evaluation failed: %s", e)
+        logger.warning("Recruiter batch evaluation failed on full batch: %s. Retrying with split subsets of size %d and max_tokens=2000.", e, len(candidates_data) // 2 or 1)
+        # Split candidates_data in half and run evaluate_subset on each half
+        half = len(candidates_data) // 2
+        if half > 0:
+            try:
+                first_half = await evaluate_subset(candidates_data[:half], max_toks=2000)
+                second_half = await evaluate_subset(candidates_data[half:], max_toks=2000)
+                return first_half + second_half
+            except Exception as split_err:
+                logger.error("Split subset evaluation failed: %s", split_err)
+                
+        # If split fails or list size is 1, check fallback
+        if len(candidates_data) > 3:
+            try:
+                logger.warning("Retrying with top 3 candidates only and max_tokens=1500.")
+                return await evaluate_subset(candidates_data[:3], max_toks=1500)
+            except Exception as last_err:
+                logger.error("Top 3 evaluations failed: %s", last_err)
         raise e
 
 

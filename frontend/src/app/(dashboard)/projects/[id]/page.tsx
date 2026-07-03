@@ -105,6 +105,8 @@ export default function ProjectDetailPage() {
 
   // Candidate detail sheet
   const [selectedCandidate, setSelectedCandidate] = useState<{ id: string; name?: string; rankInfo?: any } | null>(null);
+  const [workerStatus, setWorkerStatus] = useState<any>(null);
+  const [cancelling, setCancelling] = useState(false);
 
   // Load cache from localStorage on mount
   useEffect(() => { loadCacheFromStorage(); }, []);
@@ -142,9 +144,45 @@ export default function ProjectDetailPage() {
 
   useEffect(() => { load(); }, [load]);
 
+  // SSE progress listener (Phase 11)
+  useEffect(() => {
+    if (!project || (project.embedding_status !== 'queued' && project.embedding_status !== 'processing')) {
+      setWorkerStatus(null);
+      return;
+    }
+    
+    const baseUrl = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000';
+    const streamUrl = `${baseUrl.replace(/\/$/, '')}/api/v1/platform/projects/${projectId}/progress-stream`;
+    
+    const eventSource = new EventSource(streamUrl);
+    
+    eventSource.onmessage = (event) => {
+      try {
+        const data = JSON.parse(event.data);
+        setWorkerStatus(data);
+        if (data.status === 'completed' || data.status === 'failed' || data.status === 'cancelled') {
+          eventSource.close();
+          load();
+        }
+      } catch (err) {
+        console.error('Error parsing SSE data:', err);
+      }
+    };
+    
+    eventSource.onerror = (err) => {
+      console.error('EventSource error, closing stream:', err);
+      eventSource.close();
+    };
+    
+    return () => {
+      eventSource.close();
+    };
+  }, [project?.embedding_status, projectId, load]);
+
   // Trigger background refresh if project embedding status ready but ranking is fallback (PART 1)
   useEffect(() => {
-    if (ranking && ranking.metadata_only_fallback && project && project.embedding_status === 'ready' && !analyzing) {
+    const isReady = project && (project.embedding_status === 'ready' || project.embedding_status === 'completed');
+    if (ranking && ranking.metadata_only_fallback && isReady && !analyzing) {
       try {
         localStorage.removeItem(`ranking_${projectId}_${selectedJobId}`);
       } catch (e) {}
@@ -280,7 +318,8 @@ export default function ProjectDetailPage() {
     { label: 'Analysis Complete', done: !!ranking, icon: Cpu },
   ];
 
-  const canRunAnalysis = project.candidate_count > 0 && !!selectedJobId;
+  const isEmbeddingReady = project.embedding_status === 'ready' || project.embedding_status === 'completed';
+  const canRunAnalysis = project.candidate_count > 0 && !!selectedJobId && isEmbeddingReady;
   const selectedJob = jobs.find(j => j.id === selectedJobId);
 
   const formatCount = (num: number): string => {
@@ -689,29 +728,68 @@ export default function ProjectDetailPage() {
                   </div>
                 </div>
 
-                {project?.embedding_status && project.embedding_status !== 'ready' && (
+                {project?.embedding_status && project.embedding_status !== 'ready' && project.embedding_status !== 'completed' && (
                   <div className={`p-4 rounded-xl border text-left text-sm ${
                     project.embedding_status === 'failed' 
                       ? 'border-red-500/25 bg-red-950/20 text-red-300'
                       : 'border-amber-500/25 bg-amber-950/20 text-amber-300'
                   }`}>
-                    <div className="flex items-start gap-3">
+                    <div className="flex items-start gap-3 w-full">
                       {project.embedding_status === 'failed' ? (
                         <AlertTriangle className="w-5 h-5 text-red-400 shrink-0 mt-0.5" />
                       ) : (
                         <Loader2 className="w-5 h-5 text-amber-400 animate-spin shrink-0 mt-0.5" />
                       )}
-                      <div>
+                      <div className="w-full">
                         <p className="font-semibold text-xs uppercase tracking-wider">
                           {project.embedding_status === 'failed'
                             ? 'Embedding Generation Failed'
-                            : `Generating Candidate Embeddings (${project.embedding_status})`}
+                            : `Generating Candidate Embeddings (${workerStatus?.current_stage || project.embedding_status})`}
                         </p>
                         <p className="text-xs opacity-80 mt-1">
                           {project.embedding_status === 'failed'
-                            ? 'Indexing failed. Analysis will automatically run in fast metadata-only mode.'
-                            : 'Embeddings are generating in the background. You can run analysis now; it will fall back to fast metadata-only ranking.'}
+                            ? 'Indexing failed. Please re-upload candidate files to retry.'
+                            : 'Embeddings are generating in the background. Please wait until indexing completes to run analysis.'}
                         </p>
+                        
+                        {project.embedding_status !== 'failed' && workerStatus && (
+                          <div className="mt-3 space-y-2 w-full">
+                            <div className="w-full bg-zinc-800 rounded-full h-1.5 overflow-hidden">
+                              <div 
+                                className="bg-indigo-500 h-1.5 rounded-full transition-all duration-500" 
+                                style={{ width: `${workerStatus.progress_percentage || 0}%` }}
+                              />
+                            </div>
+                            <div className="flex flex-wrap justify-between text-[10px] text-muted-foreground gap-2">
+                              <span>Progress: {workerStatus.progress_percentage || 0}% ({workerStatus.processed_candidates || 0}/{workerStatus.total_candidates || 0})</span>
+                              {workerStatus.eta && workerStatus.eta !== '00:00:00' && <span>ETA: {workerStatus.eta}</span>}
+                              {workerStatus.ram_usage > 0 && <span>RAM: {workerStatus.ram_usage.toFixed(1)}MB / Peak: {workerStatus.peak_ram?.toFixed(1)}MB</span>}
+                            </div>
+                          </div>
+                        )}
+
+                        {project.embedding_status !== 'failed' && (
+                          <button
+                            onClick={async () => {
+                              if (confirm('Are you sure you want to cancel indexing?')) {
+                                setCancelling(true);
+                                try {
+                                  await platformApi.cancelIndexing(projectId);
+                                  toast.success('Indexing cancellation requested');
+                                  await load();
+                                } catch (err: any) {
+                                  toast.error(err.message || 'Failed to cancel indexing');
+                                } finally {
+                                  setCancelling(false);
+                                }
+                              }
+                            }}
+                            disabled={cancelling}
+                            className="mt-3 text-xs bg-red-950/40 hover:bg-red-900/40 text-red-300 px-3 py-1.5 rounded-lg border border-red-500/20 transition-all focus:outline-none focus:ring-1 focus:ring-red-500/50"
+                          >
+                            {cancelling ? 'Cancelling...' : 'Cancel Indexing'}
+                          </button>
+                        )}
                       </div>
                     </div>
                   </div>
@@ -749,7 +827,9 @@ export default function ProjectDetailPage() {
                       ? 'Please upload candidates and select a job description to begin.'
                       : !project.candidate_count
                       ? 'Please upload candidates first.'
-                      : 'Please select or upload a job description first.'}
+                      : !selectedJobId
+                      ? 'Please select or upload a job description first.'
+                      : 'Candidate indexing is still in progress. Please wait until indexing completes.'}
                   </p>
                 )}
               </CardContent>

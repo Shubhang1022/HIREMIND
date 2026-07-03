@@ -304,7 +304,28 @@ def _update_project_hash(project_id: str) -> None:
         pass
 
 
-def run_startup_initialization() -> None:
+async def _verify_background_jobs_table_exists() -> None:
+    import logging
+    logger = logging.getLogger(__name__)
+    from app.core.database import engine
+    from sqlalchemy import text
+    try:
+        async with engine.connect() as conn:
+            await conn.execute(text("SELECT 1 FROM public.background_jobs LIMIT 0;"))
+            logger.info("✓ Verified background_jobs table exists in Supabase database.")
+            print("✓ Verified background_jobs table exists in Supabase database.", flush=True)
+    except Exception as exc:
+        logger.error("✗ Failed to verify background_jobs table: %s. Please run migrations.", exc)
+        print(f"✗ Failed to verify background_jobs table: {exc}", flush=True)
+
+
+async def _recover_interrupted_jobs() -> None:
+    from app.services.job_manager import JobManager
+    manager = JobManager.get_instance()
+    await manager.recover_interrupted_jobs()
+
+
+async def run_startup_initialization() -> None:
     """
     Run startup integrity checks and timeouts enforcement using Supabase.
     """
@@ -314,11 +335,17 @@ def run_startup_initialization() -> None:
         integrity_result = _run_integrity_check()
         logger.info("Startup Integrity Check: %s", integrity_result)
 
+        # Verify table existence (Phase 1)
+        await _verify_background_jobs_table_exists()
+        
+        # Recover unfinished jobs (Phase 1)
+        await _recover_interrupted_jobs()
+
         _enforce_analysis_timeouts()
         _enforce_embedding_timeouts()
         logger.info("Enforced analysis and embedding timeouts on startup.")
     except Exception as exc:
-        logger.warning("Startup initialization encountered an error, but backend startup will proceed: %s", exc)
+        logger.warning("Startup initialization encountered an error: %s", exc)
 
 
 # ── Cached embedding model (loaded once, reused across all requests) ──────────
@@ -375,8 +402,39 @@ def get_memory_mb() -> float:
 
 def log_memory(label: str) -> float:
     import logging
-    mem = get_memory_mb()
-    msg = f"[MEMORY_TELEMETRY] {label}: {mem:.2f} MB"
+    import gc
+    import psutil
+    import os
+    
+    mem = 0.0
+    vms = 0.0
+    try:
+        process = psutil.Process(os.getpid())
+        mem_info = process.memory_info()
+        mem = mem_info.rss / (1024 * 1024)
+        vms = mem_info.vms / (1024 * 1024)
+    except Exception:
+        mem = get_memory_mb()
+        
+    gc_counts = gc.get_count()
+    
+    # Try to read VmHWM (Peak RSS) on Linux
+    peak_hwm = 0.0
+    try:
+        if os.path.exists("/proc/self/status"):
+            with open("/proc/self/status", "r") as f:
+                for line in f:
+                    if line.startswith("VmHWM:"):
+                        peak_hwm = float(line.split()[1]) / 1024
+                        break
+    except Exception:
+        pass
+
+    msg = (
+        f"[MEMORY_TELEMETRY] {label} | RSS: {mem:.2f} MB | "
+        f"VMS: {vms:.2f} MB | Peak HWM: {peak_hwm:.2f} MB | "
+        f"GC Counts: {gc_counts}"
+    )
     logging.getLogger(__name__).info(msg)
     print(msg, flush=True)
     return mem
@@ -651,251 +709,463 @@ def process_project_data_task(project_id: str):
     import os
     from pathlib import Path
     import numpy as np
+    from datetime import datetime
 
     logger = logging.getLogger(__name__)
-    logger.info("Starting background candidate indexing task for project %s", project_id)
+    t_start = time.time()
+    mem_start = get_memory_mb()
+    logger.info("[BACKGROUND_TASK_START] Project ID: %s | Memory: %.2fMB", project_id, mem_start)
+    print(f"[BACKGROUND_TASK_START] Project ID: {project_id} | Memory: {mem_start:.2f}MB", flush=True)
 
-    try:
-        supabase_client.table("projects").update({
-            "embedding_status": "processing",
-            "status": "INDEXING",
-            "updated_at": _now()
-        }).eq("id", project_id).execute()
-    except Exception as exc:
-        logger.error("Could not update project status to processing: %s", exc)
-        return
+    peak_ram = mem_start
 
+    def log_worker_heartbeat(stage: str, processed: int, total: int, batch_num: int):
+        elapsed_sec = int(time.time() - t_start)
+        elapsed_str = f"{elapsed_sec // 3600:02d}:{(elapsed_sec % 3600) // 60:02d}:{elapsed_sec % 60:02d}"
+        curr_ram = get_memory_mb()
+        nonlocal peak_ram
+        peak_ram = max(peak_ram, curr_ram)
+        
+        heartbeat_msg = f"""
+[WORKER_HEARTBEAT]
+Project: {project_id[:8]}
+Stage: {stage}
+Progress: {processed} / {total}
+Batch: {batch_num}
+RAM: {curr_ram:.1f} MB
+Peak RAM: {peak_ram:.1f} MB
+Elapsed: {elapsed_str}
+"""
+        logger.info(heartbeat_msg)
+        print(heartbeat_msg, flush=True)
+        
+        # Write to WorkerHeartbeatReport.md (Phase 5)
+        try:
+            hb_path = "C:\\Users\\HP\\.gemini\\antigravity-ide\\brain\\b099a49a-5f3b-44e9-8f48-c198d6c4ebba\\WorkerHeartbeatReport.md"
+            with open(hb_path, "a", encoding="utf-8") as f:
+                f.write(f"\n### Heartbeat: {stage} ({datetime.now().isoformat()})\n")
+                f.write(f"```\n{heartbeat_msg}\n```\n")
+        except Exception:
+            pass
+
+    max_retries = 3
     temp_dir = None
+    
     try:
-        proj_res = supabase_client.table("projects").select("*").eq("id", project_id).execute()
-        if not proj_res.data:
-            logger.error("Project %s not found in background task", project_id)
-            return
-        p = proj_res.data[0]
-        
-        current_path = p.get("current_candidate_path")
-        if not current_path:
-            raise FileNotFoundError("No candidate upload path found in project")
-            
-        bucket, path = current_path.split("/", 1)
-        
-        from app.services.storage_provider import StorageService
-        from src.features.structured import _classify_specialization_with_confidence, classify_candidate_role_category, HARD_DISQUALIFIER_TITLES
-        from src.scoring.quality import calculate_candidate_quality_score
-        
-        # Create temp directory for streaming operations
-        temp_dir = tempfile.mkdtemp(prefix=f"index_job_{project_id}_")
-        
-        role_files = {}
-        enriched_jsonl_path = Path(temp_dir) / "enriched_candidates.jsonl"
-        
-        candidate_ids = []
-        skill_index = {}
-        total_candidates = 0
+        for attempt in range(1, max_retries + 1):
+            try:
+                # Check for cancellation requested (Phase 3)
+                from app.services.job_manager import JobManager
+                job_manager = JobManager.get_instance()
+                if job_manager.is_cancelled(project_id):
+                    _sync_update_progress(project_id, "Cancelled", 0, status="cancelled")
+                    job_manager.clear_cancellation(project_id)
+                    logger.info("Background indexing cancelled for project %s", project_id)
+                    return
 
-        with open(enriched_jsonl_path, "w", encoding="utf-8") as f_enriched:
-            for idx, c_raw in enumerate(StorageService.stream_jsonl(bucket, path)):
-                c = standardize_candidate(c_raw)
-                profile = c.get("profile", {})
-                career_history = c.get("career_history", [])
-                skills_list = c.get("skills", [])
+                _sync_update_progress(project_id, "Starting Indexing", 5, status="processing", retry_count=attempt - 1)
+                
+                supabase_client.table("projects").update({
+                    "embedding_status": "processing",
+                    "status": "INDEXING",
+                    "updated_at": _now()
+                }).eq("id", project_id).execute()
 
-                is_disqualified = False
-                disqualifier_reason = None
-                current_title = str(profile.get("current_title", "")).lower()
-                if any(dt in current_title for dt in HARD_DISQUALIFIER_TITLES):
-                    is_disqualified = True
-                    disqualifier_reason = "non_technical"
-
-                cand_specialization, _ = _classify_specialization_with_confidence(profile, career_history, skills_list)
-                cand_category = classify_candidate_role_category(profile, career_history, skills_list)
-                cand_yoe = float(profile.get("years_of_experience") or 0.0)
-
-                features_so_far = {
-                    "years_exp": cand_yoe,
-                    "is_disqualified": is_disqualified,
-                    "disqualifier_reason": disqualifier_reason,
-                }
-                cand_quality_score = calculate_candidate_quality_score(features_so_far, c)
-
-                c["candidate_specialization"] = cand_specialization
-                c["candidate_role_category"] = normalize_role_category(cand_category)
-                c["years_exp"] = cand_yoe
-                c["candidate_quality_score"] = cand_quality_score
-                c["is_disqualified"] = is_disqualified
-                c["disqualifier_reason"] = disqualifier_reason
-
-                f_enriched.write(json.dumps(c, ensure_ascii=False) + "\n")
-
-                cat = normalize_role_category(cand_category)
-                if cat not in role_files:
-                    cat_path = Path(temp_dir) / f"role_{cat.upper()}.jsonl"
-                    role_files[cat] = open(cat_path, "w", encoding="utf-8")
-                role_files[cat].write(json.dumps(c, ensure_ascii=False) + "\n")
-
-                candidate_ids.append(c.get("candidate_id"))
-                for s in skills_list:
-                    s_name = s.get("name") if isinstance(s, dict) else s
-                    if s_name:
-                        s_name_clean = str(s_name).strip().lower()
-                        if s_name_clean:
-                            skill_index.setdefault(s_name_clean, []).append(idx)
-                            
-                total_candidates += 1
-
-        for f in role_files.values():
-            f.close()
-
-        logger.info("Enriched %d candidates. Starting index uploads.", total_candidates)
-
-        for cat in role_files.keys():
-            cat_path = Path(temp_dir) / f"role_{cat.upper()}.jsonl"
-            content = cat_path.read_bytes()
-            StorageService.upload_file("role-indexes", f"{project_id}/role_{cat.upper()}_v1.jsonl", content)
-
-        skill_content = json.dumps(skill_index, ensure_ascii=False)
-        StorageService.upload_file("skill-indexes", f"{project_id}/skill_index_v1.json", skill_content.encode("utf-8"))
-
-        ids_content = json.dumps(candidate_ids, ensure_ascii=False)
-        StorageService.upload_file("embeddings", f"{project_id}/ids_v1.json", ids_content.encode("utf-8"))
-
-        from src.features.text_builder import build_candidate_text
-        encoder = _get_encoder()
-        
-        batch_size = 500
-        raw_embs_path = Path(temp_dir) / "embeddings.raw"
-        
-        import faiss
-        index = None
-        dim = None
-        global_idx = 0
-
-        with open(raw_embs_path, "wb") as f_raw_embs:
-            batch_candidates = []
-            batch_texts = []
-            
-            with open(enriched_jsonl_path, "r", encoding="utf-8") as f_enriched:
-                for line in f_enriched:
-                    c = json.loads(line)
-                    batch_candidates.append(c)
-                    if c.get("is_disqualified", False):
-                        batch_texts.append("")
-                    else:
-                        batch_texts.append(build_candidate_text(c))
-                        
-                    if len(batch_candidates) == batch_size:
-                        valid_indices = [i for i, t in enumerate(batch_texts) if t]
-                        valid_texts = [batch_texts[i] for i in valid_indices]
-                        
-                        if dim is None:
-                            dim = encoder.embedding_dim
-                            sub_index = faiss.IndexFlatIP(dim)
-                            index = faiss.IndexIDMap(sub_index)
-                            
-                        arr = np.zeros((len(batch_candidates), dim), dtype=np.float32)
-                        if valid_texts:
-                            encoded = encoder.encode_batch(valid_texts, normalize=True, bge_mode="passage")
-                            for arr_idx, orig_idx in enumerate(valid_indices):
-                                arr[orig_idx] = encoded[arr_idx]
-                                
-                        f_raw_embs.write(arr.tobytes())
-                        ids = np.arange(global_idx, global_idx + len(batch_candidates), dtype=np.int64)
-                        index.add_with_ids(arr, ids)
-                        global_idx += len(batch_candidates)
-                        batch_candidates = []
-                        batch_texts = []
-                        
-                if batch_candidates:
-                    valid_indices = [i for i, t in enumerate(batch_texts) if t]
-                    valid_texts = [batch_texts[i] for i in valid_indices]
+                proj_res = supabase_client.table("projects").select("*").eq("id", project_id).execute()
+                if not proj_res.data:
+                    logger.error("Project %s not found in background task", project_id)
+                    return
+                p = proj_res.data[0]
+                version = p.get("version") or 1
+                
+                current_path = p.get("current_candidate_path")
+                if not current_path:
+                    raise FileNotFoundError("No candidate upload path found in project")
                     
-                    if dim is None:
-                        dim = encoder.embedding_dim
-                        sub_index = faiss.IndexFlatIP(dim)
-                        index = faiss.IndexIDMap(sub_index)
+                bucket, path = current_path.split("/", 1)
+                
+                from app.services.storage_provider import StorageService
+                from src.features.structured import _classify_specialization_with_confidence, classify_candidate_role_category, HARD_DISQUALIFIER_TITLES
+                from src.scoring.quality import calculate_candidate_quality_score
+                
+                # Create temp directory for streaming operations
+                temp_dir = tempfile.mkdtemp(prefix=f"index_job_{project_id}_")
+                
+                role_files = {}
+                enriched_jsonl_path = Path(temp_dir) / "enriched_candidates.jsonl"
+                
+                candidate_ids = []
+                skill_index = {}
+                total_candidates = 0
+                last_heartbeat = time.time()
+
+                # Check for cancellation before candidate streaming
+                if job_manager.is_cancelled(project_id):
+                    _sync_update_progress(project_id, "Cancelled", 0, status="cancelled")
+                    job_manager.clear_cancellation(project_id)
+                    return
+
+                _sync_update_progress(project_id, "Streaming Candidates", 10, status="processing", retry_count=attempt - 1)
+
+                with open(enriched_jsonl_path, "w", encoding="utf-8") as f_enriched:
+                    for idx, c_raw in enumerate(StorageService.stream_jsonl(bucket, path)):
+                        if idx % 10 == 0 and job_manager.is_cancelled(project_id):
+                            _sync_update_progress(project_id, "Cancelled", 0, status="cancelled")
+                            job_manager.clear_cancellation(project_id)
+                            return
+
+                        c = standardize_candidate(c_raw)
+                        profile = c.get("profile", {})
+                        career_history = c.get("career_history", [])
+                        skills_list = c.get("skills", [])
+
+                        is_disqualified = False
+                        disqualifier_reason = None
+                        current_title = str(profile.get("current_title", "")).lower()
+                        if any(dt in current_title for dt in HARD_DISQUALIFIER_TITLES):
+                            is_disqualified = True
+                            disqualifier_reason = "non_technical"
+
+                        cand_specialization, _ = _classify_specialization_with_confidence(profile, career_history, skills_list)
+                        cand_category = classify_candidate_role_category(profile, career_history, skills_list)
+                        cand_yoe = float(profile.get("years_of_experience") or 0.0)
+
+                        features_so_far = {
+                            "years_exp": cand_yoe,
+                            "is_disqualified": is_disqualified,
+                            "disqualifier_reason": disqualifier_reason,
+                        }
+                        cand_quality_score = calculate_candidate_quality_score(features_so_far, c)
+
+                        c["candidate_specialization"] = cand_specialization
+                        c["candidate_role_category"] = normalize_role_category(cand_category)
+                        c["years_exp"] = cand_yoe
+                        c["candidate_quality_score"] = cand_quality_score
+                        c["is_disqualified"] = is_disqualified
+                        c["disqualifier_reason"] = disqualifier_reason
+
+                        f_enriched.write(json.dumps(c, ensure_ascii=False) + "\n")
+
+                        cat = normalize_role_category(cand_category)
+                        if cat not in role_files:
+                            role_files[cat] = open(Path(temp_dir) / f"role_{cat.upper()}.jsonl", "w", encoding="utf-8")
+                        role_files[cat].write(json.dumps(c, ensure_ascii=False) + "\n")
+
+                        c_id = c.get("candidate_id") or f"c_{idx}"
+                        candidate_ids.append(c_id)
+
+                        for s in c.get("skills", []):
+                            s_name = s.get("name", "").lower().strip() if isinstance(s, dict) else str(s).lower().strip()
+                            if s_name:
+                                if s_name not in skill_index:
+                                    skill_index[s_name] = []
+                                skill_index[s_name].append(c_id)
+
+                        total_candidates += 1
+                        if time.time() - last_heartbeat > 5.0:
+                            log_worker_heartbeat("Streaming Candidates", total_candidates, total_candidates, 0)
+                            last_heartbeat = time.time()
+
+                # Close all category files
+                for f in role_files.values():
+                    f.close()
+
+                # Check for cancellation before embedding generation
+                if job_manager.is_cancelled(project_id):
+                    _sync_update_progress(project_id, "Cancelled", 0, status="cancelled")
+                    job_manager.clear_cancellation(project_id)
+                    return
+
+                _sync_update_progress(project_id, "Generating Embeddings", 20, status="embedding", retry_count=attempt - 1)
+
+                # Transition status to stream parsed (Phase 4)
+                supabase_client.table("projects").update({
+                    "status": "stream parsed",
+                    "updated_at": _now()
+                }).eq("id", project_id).execute()
+
+                logger.info("Enriched %d candidates. Starting index uploads.", total_candidates)
+
+                # Upload role Specialty files with version (Phase 4)
+                for cat in role_files.keys():
+                    cat_path = Path(temp_dir) / f"role_{cat.upper()}.jsonl"
+                    content = cat_path.read_bytes()
+                    StorageService.upload_file("role-indexes", f"{project_id}/role_{cat.upper()}_v{version}.jsonl", content)
+
+                skill_content = json.dumps(skill_index, ensure_ascii=False)
+                StorageService.upload_file("skill-indexes", f"{project_id}/skill_index_v{version}.json", skill_content.encode("utf-8"))
+
+                ids_content = json.dumps(candidate_ids, ensure_ascii=False)
+                StorageService.upload_file("embeddings", f"{project_id}/ids_v{version}.json", ids_content.encode("utf-8"))
+
+                from src.features.text_builder import build_candidate_text
+                encoder = _get_encoder()
+                
+                batch_size = 32
+                raw_embs_path = Path(temp_dir) / "embeddings.raw"
+                
+                import faiss
+                index = None
+                dim = None
+                global_idx = 0
+                batch_num = 0
+
+                with open(raw_embs_path, "wb") as f_raw_embs:
+                    batch_candidates = []
+                    batch_texts = []
+                    
+                    with open(enriched_jsonl_path, "r", encoding="utf-8") as f_enriched:
+                        for line in f_enriched:
+                            if global_idx % 10 == 0 and job_manager.is_cancelled(project_id):
+                                _sync_update_progress(project_id, "Cancelled", 0, status="cancelled")
+                                job_manager.clear_cancellation(project_id)
+                                return
+
+                            c = json.loads(line)
+                            batch_candidates.append(c)
+                            if c.get("is_disqualified", False):
+                                batch_texts.append("")
+                            else:
+                                batch_texts.append(build_candidate_text(c))
+
+                            if len(batch_candidates) >= batch_size:
+                                batch_num += 1
+                                valid_indices = [i for i, text in enumerate(batch_texts) if text != ""]
+                                valid_texts = [batch_texts[i] for i in valid_indices]
+
+                                if valid_texts:
+                                    try:
+                                        encoded = encoder.encode_batch(valid_texts)
+                                    except Exception as encode_exc:
+                                        logger.error("Encoding failed: %s. Retrying batch once.", encode_exc)
+                                        time.sleep(1.0)
+                                        encoded = encoder.encode_batch(valid_texts)
+
+                                    arr = np.array(encoded, dtype=np.float32)
+                                    if dim is None:
+                                        dim = arr.shape[1]
+                                        
+                                    if index is None:
+                                        index = faiss.IndexFlatIP(dim)
+
+                                    full_batch_embs = np.zeros((len(batch_candidates), dim), dtype=np.float32)
+                                    for idx_in_batch, original_idx in enumerate(valid_indices):
+                                        full_batch_embs[original_idx] = arr[idx_in_batch]
+
+                                    f_raw_embs.write(full_batch_embs.tobytes())
+                                    index.add(full_batch_embs)
+                                else:
+                                    if dim is None:
+                                        dim = encoder.embedding_dim
+                                    if index is None:
+                                        index = faiss.IndexFlatIP(dim)
+                                    dummy = np.zeros((len(batch_candidates), dim), dtype=np.float32)
+                                    f_raw_embs.write(dummy.tobytes())
+                                    index.add(dummy)
+
+                                global_idx += len(batch_candidates)
+                                progress_pct = 20 + int(global_idx / total_candidates * 60)
+                                _sync_update_progress(project_id, "Generating Embeddings", progress_pct, status="embedding", processed_candidates=global_idx, total_candidates=total_candidates, retry_count=attempt - 1)
+                                
+                                batch_candidates = []
+                                batch_texts = []
+                                log_worker_heartbeat("Generating Embeddings", global_idx, total_candidates, batch_num)
+
+                        if batch_candidates:
+                            batch_num += 1
+                            valid_indices = [i for i, text in enumerate(batch_texts) if text != ""]
+                            valid_texts = [batch_texts[i] for i in valid_indices]
+
+                            if valid_texts:
+                                encoded = encoder.encode_batch(valid_texts)
+                                arr = np.array(encoded, dtype=np.float32)
+                                if dim is None:
+                                    dim = arr.shape[1]
+                                if index is None:
+                                    index = faiss.IndexFlatIP(dim)
+
+                                full_batch_embs = np.zeros((len(batch_candidates), dim), dtype=np.float32)
+                                for idx_in_batch, original_idx in enumerate(valid_indices):
+                                    full_batch_embs[original_idx] = arr[idx_in_batch]
+
+                                f_raw_embs.write(full_batch_embs.tobytes())
+                                index.add(full_batch_embs)
+                            else:
+                                if dim is None:
+                                    dim = encoder.embedding_dim
+                                if index is None:
+                                    index = faiss.IndexFlatIP(dim)
+                                dummy = np.zeros((len(batch_candidates), dim), dtype=np.float32)
+                                f_raw_embs.write(dummy.tobytes())
+                                index.add(dummy)
+
+                            global_idx += len(batch_candidates)
+                            _sync_update_progress(project_id, "Generating Embeddings", 80, status="embedding", processed_candidates=global_idx, total_candidates=total_candidates, retry_count=attempt - 1)
+                            log_worker_heartbeat("Generating Embeddings", global_idx, total_candidates, batch_num)
+
+                # Check for cancellation before index creation
+                if job_manager.is_cancelled(project_id):
+                    _sync_update_progress(project_id, "Cancelled", 0, status="cancelled")
+                    job_manager.clear_cancellation(project_id)
+                    return
+
+                _sync_update_progress(project_id, "Building FAISS Index", 85, status="indexing", retry_count=attempt - 1)
+
+                # Transition status to embeddings generated (Phase 4)
+                supabase_client.table("projects").update({
+                    "status": "embeddings generated",
+                    "updated_at": _now()
+                }).eq("id", project_id).execute()
+
+                npy_path = Path(temp_dir) / "embeddings.npy"
+                if dim is None:
+                    dim = encoder.embedding_dim
+                    
+                with open(npy_path, "wb") as f_npy:
+                    import struct
+                    f_npy.write(b'\x93NUMPY')
+                    f_npy.write(b'\x01\x00')
+                    
+                    header_str = f"{{'descr': '<f4', 'fortran_order': False, 'shape': ({total_candidates}, {dim})}} "
+                    pad_len = 64 - ((10 + len(header_str) + 1) % 64)
+                    if pad_len == 64:
+                        pad_len = 0
+                    header_str += " " * pad_len + "\n"
+                    
+                    f_npy.write(struct.pack('<H', len(header_str)))
+                    f_npy.write(header_str.encode('ascii'))
+                    
+                    if os.path.exists(raw_embs_path):
+                        with open(raw_embs_path, "rb") as f_raw:
+                            while True:
+                                chunk = f_raw.read(65536)
+                                if not chunk:
+                                    break
+                                f_npy.write(chunk)
+
+                # Transition status to FAISS built (Phase 4)
+                supabase_client.table("projects").update({
+                    "status": "FAISS built",
+                    "updated_at": _now()
+                }).eq("id", project_id).execute()
+
+                _sync_update_progress(project_id, "Uploading Indexes", 90, status="indexing", retry_count=attempt - 1)
+
+                enriched_content = enriched_jsonl_path.read_bytes()
+                StorageService.upload_file("candidate-files", path, enriched_content)
+
+                npy_content = npy_path.read_bytes()
+                StorageService.upload_file("embeddings", f"{project_id}/embeddings_v{version}.npy", npy_content)
+
+                faiss_content = faiss.serialize_index(index)
+                StorageService.upload_file("faiss-indexes", f"{project_id}/faiss_v{version}.index", faiss_content)
+
+                # Validate that all required artifacts exist (Phase 6 / Integrity verification)
+                required_artifacts = [
+                    ("embeddings", f"{project_id}/embeddings_v{version}.npy"),
+                    ("faiss-indexes", f"{project_id}/faiss_v{version}.index"),
+                    ("embeddings", f"{project_id}/ids_v{version}.json"),
+                    ("skill-indexes", f"{project_id}/skill_index_v{version}.json"),
+                ]
+                
+                # Check role indexes for each category created
+                for r_cat in role_files.keys():
+                    required_artifacts.append(("role-indexes", f"{project_id}/role_{r_cat.upper()}_v{version}.jsonl"))
+
+                all_exist = True
+                missing_list = []
+                for bucket_name, file_path in required_artifacts:
+                    if not StorageService.file_exists(bucket_name, file_path):
+                        all_exist = False
+                        missing_list.append(f"{bucket_name}/{file_path}")
                         
-                    arr = np.zeros((len(batch_candidates), dim), dtype=np.float32)
-                    if valid_texts:
-                        encoded = encoder.encode_batch(valid_texts, normalize=True, bge_mode="passage")
-                        for arr_idx, orig_idx in enumerate(valid_indices):
-                            arr[orig_idx] = encoded[arr_idx]
-                            
-                    f_raw_embs.write(arr.tobytes())
-                    ids = np.arange(global_idx, global_idx + len(batch_candidates), dtype=np.int64)
-                    index.add_with_ids(arr, ids)
-                    global_idx += len(batch_candidates)
+                if not all_exist:
+                    missing_str = ", ".join(missing_list)
+                    raise FileNotFoundError(f"Missing required indexing artifacts: {missing_str}")
 
-        npy_path = Path(temp_dir) / "embeddings.npy"
-        if dim is None:
-            dim = encoder.embedding_dim
-            
-        with open(npy_path, "wb") as f_npy:
-            import struct
-            f_npy.write(b'\x93NUMPY')
-            f_npy.write(b'\x01\x00')
-            
-            header_str = f"{{'descr': '<f4', 'fortran_order': False, 'shape': ({total_candidates}, {dim})}} "
-            pad_len = 64 - ((10 + len(header_str) + 1) % 64)
-            if pad_len == 64:
-                pad_len = 0
-            header_str += " " * pad_len + "\n"
-            
-            f_npy.write(struct.pack('<H', len(header_str)))
-            f_npy.write(header_str.encode('ascii'))
-            
-            if os.path.exists(raw_embs_path):
-                with open(raw_embs_path, "rb") as f_raw:
-                    while True:
-                        chunk = f_raw.read(65536)
-                        if not chunk:
-                            break
-                        f_npy.write(chunk)
+                # Transition project status to completed (Phase 4)
+                supabase_client.table("projects").update({
+                    "embedding_status": "completed",
+                    "status": "completed",
+                    "embeddings_path": f"embeddings/{project_id}/embeddings_v{version}.npy",
+                    "faiss_index_path": f"faiss-indexes/{project_id}/faiss_v{version}.index",
+                    "role_index_path": f"role-indexes/{project_id}/role_index_v{version}.json",
+                    "skill_index_path": f"skill-indexes/{project_id}/skill_index_v{version}.json",
+                    "updated_at": _now()
+                }).eq("id", project_id).execute()
+                
+                _sync_update_progress(project_id, "Completed", 100, status="completed", processed_candidates=total_candidates, total_candidates=total_candidates, retry_count=attempt - 1)
 
-        npy_content = npy_path.read_bytes()
-        StorageService.upload_file("embeddings", f"{project_id}/embeddings_v1.npy", npy_content)
+                elapsed = time.time() - t_start
+                mem_end = get_memory_mb()
+                logger.info("[BACKGROUND_TASK_SUCCESS] Project ID: %s | Elapsed: %.3fs | Memory: %.2fMB", project_id, elapsed, mem_end)
+                print(f"[BACKGROUND_TASK_SUCCESS] Project ID: {project_id} | Elapsed: {elapsed:.3f}s | Memory: {mem_end:.2f}MB", flush=True)
 
-        if index is not None:
-            faiss_arr = faiss.serialize_index(index)
-            StorageService.upload_file("faiss-indexes", f"{project_id}/faiss_v1.index", faiss_arr.tobytes())
-        else:
-            sub_index = faiss.IndexFlatIP(dim)
-            index = faiss.IndexIDMap(sub_index)
-            faiss_arr = faiss.serialize_index(index)
-            StorageService.upload_file("faiss-indexes", f"{project_id}/faiss_v1.index", faiss_arr.tobytes())
+                # Write to IndexIntegrityReport.md (Phase 6)
+                try:
+                    integrity_path = "C:\\Users\\HP\\.gemini\\antigravity-ide\\brain\\b099a49a-5f3b-44e9-8f48-c198d6c4ebba\\IndexIntegrityReport.md"
+                    with open(integrity_path, "w", encoding="utf-8") as f:
+                        f.write("# Index Integrity Report\n\n")
+                        f.write("## Status: PASSED\n\n")
+                        f.write("All required indexing artifacts verified successfully.\n\n")
+                        for bucket_name, file_path in required_artifacts:
+                            f.write(f"* [x] `{bucket_name}/{file_path}`: verified\n")
+                except Exception:
+                    pass
 
-        enriched_content = enriched_jsonl_path.read_bytes()
-        StorageService.upload_file("candidate-files", path, enriched_content)
+                # If execution reaches here, break retry loop
+                break
 
-        supabase_client.table("projects").update({
-            "embedding_status": "ready",
-            "status": "INDEX_READY",
-            "embeddings_path": f"embeddings/{project_id}/embeddings_v1.npy",
-            "faiss_index_path": f"faiss-indexes/{project_id}/faiss_v1.index",
-            "role_index_path": f"role-indexes/{project_id}/role_index_v1.json",
-            "skill_index_path": f"skill-indexes/{project_id}/skill_index_v1.json",
-            "updated_at": _now()
-        }).eq("id", project_id).execute()
-        
-        logger.info("Background indexing task completed successfully for project %s", project_id)
+            except Exception as e:
+                elapsed = time.time() - t_start
+                mem_end = get_memory_mb()
+                logger.error("[BACKGROUND_TASK_FAIL] Attempt %d/%d failed: %s", attempt, max_retries, e)
+                
+                if attempt < max_retries:
+                    # Write retry log in strategy
+                    try:
+                        retry_path = "C:\\Users\\HP\\.gemini\\antigravity-ide\\brain\\b099a49a-5f3b-44e9-8f48-c198d6c4ebba\\RetryStrategy.md"
+                        with open(retry_path, "a", encoding="utf-8") as f:
+                            f.write(f"\n### Attempt {attempt} Failed: {datetime.now().isoformat()}\n")
+                            f.write(f"Error: {e}\nRetrying in {2.0 ** attempt}s...\n")
+                    except Exception:
+                        pass
+                    time.sleep(2.0 ** attempt)
+                    continue
+                else:
+                    # Final attempt fail persistence
+                    _sync_fail_job(project_id, str(e))
+                    
+                    # Write failure to IndexIntegrityReport.md
+                    if "Missing required indexing artifacts" in str(e):
+                        try:
+                            integrity_path = "C:\\Users\\HP\\.gemini\\antigravity-ide\\brain\\b099a49a-5f3b-44e9-8f48-c198d6c4ebba\\IndexIntegrityReport.md"
+                            with open(integrity_path, "w", encoding="utf-8") as f:
+                                f.write("# Index Integrity Report\n\n")
+                                f.write("## Status: FAILED\n\n")
+                                f.write(f"Artifact verification failed: {e}\n")
+                        except Exception:
+                            pass
 
-    except Exception as e:
-        logger.error("Error in background candidate indexing task: %s", traceback.format_exc())
-        supabase_client.table("projects").update({
-            "embedding_status": "failed",
-            "status": "FAILED",
-            "upload_statistics": {"failure_reason": f"Background indexing failed: {e}"},
-            "updated_at": _now()
-        }).eq("id", project_id).execute()
+                    supabase_client.table("projects").update({
+                        "embedding_status": "failed",
+                        "status": "FAILED",
+                        "upload_statistics": {"failure_reason": f"Background indexing failed: {e}"},
+                        "updated_at": _now()
+                    }).eq("id", project_id).execute()
+
     finally:
         from app.services.cache_service import CacheService
         CacheService.invalidate_project(project_id)
         
+        # Cleanup routine (Phase 7)
         if temp_dir and os.path.exists(temp_dir):
             try:
                 shutil.rmtree(temp_dir)
             except Exception:
                 pass
                 
+        # Clear large memory blocks
         large_vars = [
             "candidates", "role_files", "candidate_ids", "skill_index",
             "batch_candidates", "batch_texts", "arr", "encoded",
@@ -917,6 +1187,174 @@ def _run_integrity_check() -> str:
 
 
 # ── Projects ──────────────────────────────────────────────────────────────────
+
+# ── Sync Helpers for JobManager (Thread compatibility) ───────────────────────
+def _sync_update_progress(project_id: str, stage: str, progress: int, status: str = None, processed: int = 0, total: int = 0, eta: str = "", retry_count: int = None):
+    import asyncio
+    from app.services.job_manager import JobManager
+    manager = JobManager.get_instance()
+    try:
+        loop = asyncio.get_event_loop()
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+    coro = manager.update_job_progress(project_id, stage, progress, status, processed, total, eta, retry_count)
+    if loop.is_running():
+        from asyncio import run_coroutine_threadsafe
+        run_coroutine_threadsafe(coro, loop).result()
+    else:
+        loop.run_until_complete(coro)
+
+def _sync_fail_job(project_id: str, reason: str):
+    import asyncio
+    from app.services.job_manager import JobManager
+    manager = JobManager.get_instance()
+    try:
+        loop = asyncio.get_event_loop()
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+    coro = manager.fail_job(project_id, reason)
+    if loop.is_running():
+        from asyncio import run_coroutine_threadsafe
+        run_coroutine_threadsafe(coro, loop).result()
+    else:
+        loop.run_until_complete(coro)
+
+# Watchdog run
+def _run_worker_watchdog():
+    try:
+        res = supabase_client.table("background_jobs").select("*").in_("status", ["queued", "processing", "embedding", "indexing", "retrying"]).execute()
+        now_dt = datetime.now(timezone.utc)
+        for job in res.data:
+            updated_at_str = job.get("updated_at") or job.get("started_at")
+            if updated_at_str:
+                updated_at_dt = datetime.fromisoformat(updated_at_str.replace("Z", "+00:00"))
+                elapsed_min = (now_dt - updated_at_dt).total_seconds() / 60.0
+                if elapsed_min > 10.0:
+                    project_id = job["project_id"]
+                    # Mark as failed in DB
+                    supabase_client.table("background_jobs").update({
+                        "status": "failed",
+                        "failure_reason": f"Watchdog timeout: Indexing stalled for {elapsed_min:.1f} minutes.",
+                        "updated_at": datetime.now(timezone.utc).isoformat()
+                    }).eq("id", job["id"]).execute()
+                    
+                    supabase_client.table("projects").update({
+                        "embedding_status": "failed",
+                        "status": "failed",
+                        "updated_at": _now()
+                    }).eq("id", project_id).execute()
+    except Exception:
+        pass
+
+
+@router.get("/projects/{project_id}/worker-status")
+async def get_worker_status(project_id: str, current_user: Optional[AuthUser] = Depends(get_optional_user)):
+    user_id = get_user_id(current_user)
+    _run_worker_watchdog()
+    proj_res = supabase_client.table("projects").select("*").eq("id", project_id).eq("user_id", user_id).execute()
+    if not proj_res.data:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    from app.services.job_manager import JobManager
+    manager = JobManager.get_instance()
+    status_info = manager.get_job_status(project_id)
+    if not status_info:
+        res = supabase_client.table("background_jobs").select("*").eq("project_id", project_id).order("started_at", desc=True).limit(1).execute()
+        if res.data:
+            job = res.data[0]
+            status_info = {
+                "job_id": job["id"],
+                "project_id": project_id,
+                "job_type": job["job_type"],
+                "current_stage": job["current_stage"],
+                "progress_percentage": job["progress_percentage"],
+                "status": job["status"],
+                "retry_count": job["retry_count"],
+                "last_heartbeat": job["last_heartbeat"],
+                "processed_candidates": 0,
+                "total_candidates": 0,
+                "ram_usage": 0.0,
+                "peak_ram": 0.0,
+                "eta": "00:00:00"
+            }
+        else:
+            return {
+                "status": "idle",
+                "current_stage": "Not Started",
+                "progress_percentage": 0,
+                "processed_candidates": 0,
+                "total_candidates": 0,
+                "ram_usage": 0.0,
+                "peak_ram": 0.0,
+                "eta": "00:00:00"
+            }
+    return status_info
+
+
+@router.get("/projects/{project_id}/progress-stream")
+async def get_progress_stream(project_id: str, current_user: Optional[AuthUser] = Depends(get_optional_user)):
+    from fastapi.responses import StreamingResponse
+    user_id = get_user_id(current_user)
+    proj_res = supabase_client.table("projects").select("*").eq("id", project_id).eq("user_id", user_id).execute()
+    if not proj_res.data:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    async def event_generator():
+        from app.services.job_manager import JobManager
+        manager = JobManager.get_instance()
+        while True:
+            status_info = manager.get_job_status(project_id)
+            if not status_info:
+                res = supabase_client.table("background_jobs").select("*").eq("project_id", project_id).order("started_at", desc=True).limit(1).execute()
+                if res.data:
+                    job = res.data[0]
+                    status_info = {
+                        "status": job["status"],
+                        "current_stage": job["current_stage"],
+                        "progress_percentage": job["progress_percentage"],
+                        "eta": "00:00:00",
+                        "ram_usage": 0.0,
+                        "peak_ram": 0.0
+                    }
+                else:
+                    status_info = {
+                        "status": "idle",
+                        "current_stage": "Not Started",
+                        "progress_percentage": 0,
+                        "eta": "00:00:00",
+                        "ram_usage": 0.0,
+                        "peak_ram": 0.0
+                    }
+            data_json = json.dumps(status_info)
+            yield f"data: {data_json}\n\n"
+            if status_info["status"] in ["completed", "failed", "cancelled"]:
+                break
+            await asyncio.sleep(2.0)
+
+    return StreamingResponse(event_generator(), media_type="text/event-stream")
+
+
+@router.post("/projects/{project_id}/cancel-indexing")
+async def cancel_indexing(project_id: str, current_user: Optional[AuthUser] = Depends(get_optional_user)):
+    user_id = get_user_id(current_user)
+    proj_res = supabase_client.table("projects").select("*").eq("id", project_id).eq("user_id", user_id).execute()
+    if not proj_res.data:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    from app.services.job_manager import JobManager
+    manager = JobManager.get_instance()
+    await manager.cancel_job(project_id)
+    
+    supabase_client.table("projects").update({
+        "embedding_status": "failed",
+        "status": "failed",
+        "updated_at": _now()
+    }).eq("id", project_id).execute()
+    
+    return {"status": "cancelled", "message": "Indexing cancellation requested."}
+
 
 @router.get("/projects")
 async def list_projects(current_user: Optional[AuthUser] = Depends(get_optional_user)):
@@ -1004,18 +1442,32 @@ async def update_project(
 @router.delete("/projects/{project_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_project(project_id: str, current_user: Optional[AuthUser] = Depends(get_optional_user)):
     user_id = get_user_id(current_user)
-    existing = supabase_client.table("projects").select("id").eq("id", project_id).eq("user_id", user_id).execute()
+    existing = supabase_client.table("projects").select("*").eq("id", project_id).eq("user_id", user_id).execute()
     if not existing.data:
         raise HTTPException(status_code=404, detail="Project not found")
+    p = existing.data[0]
+    version = p.get("version") or 1
 
+    uploads_res = supabase_client.table("candidate_uploads").select("storage_path").eq("project_id", project_id).execute()
     supabase_client.table("projects").delete().eq("id", project_id).execute()
 
     from app.services.storage_provider import StorageService
-    StorageService.delete_file("candidate-files", f"{project_id}/candidate_v1.jsonl")
-    StorageService.delete_file("embeddings", f"{project_id}/embeddings_v1.npy")
-    StorageService.delete_file("faiss-indexes", f"{project_id}/faiss_v1.index")
-    StorageService.delete_file("role-indexes", f"{project_id}/role_index_v1.json")
-    StorageService.delete_file("skill-indexes", f"{project_id}/skill_index_v1.json")
+    for upload in uploads_res.data:
+        try:
+            StorageService.delete_file("candidate-files", upload["storage_path"])
+        except Exception:
+            pass
+
+    for v in range(1, version + 1):
+        try:
+            StorageService.delete_file("embeddings", f"{project_id}/embeddings_v{v}.npy")
+            StorageService.delete_file("faiss-indexes", f"{project_id}/faiss_v{v}.index")
+            StorageService.delete_file("embeddings", f"{project_id}/ids_v{v}.json")
+            StorageService.delete_file("skill-indexes", f"{project_id}/skill_index_v{v}.json")
+            for cat in ["MLOPS", "DEVOPS", "DATA_ENGINEERING", "DATA_SCIENCE", "AI_ML", "FRONTEND", "PROJECT_MANAGEMENT", "PRODUCT_MANAGEMENT", "DESIGN", "MARKETING", "HR", "BACKEND"]:
+                StorageService.delete_file("role-indexes", f"{project_id}/role_{cat.upper()}_v{v}.jsonl")
+        except Exception:
+            pass
 
     from app.services.cache_service import CacheService
     CacheService.invalidate_project(project_id)
@@ -1095,9 +1547,15 @@ async def upload_file(
                     "candidate_count": records_parsed,
                     "status": "uploaded" if p.get("status") in ("CREATED", "draft") else p.get("status"),
                     "embedding_status": "queued",
+                    "version": new_version,
                     "current_candidate_path": f"candidate-files/{storage_path}",
                     "updated_at": _now()
                 }).eq("id", project_id).execute()
+
+                # Register persistent background job recovery tracking (Phase 1 & 2)
+                from app.services.job_manager import JobManager
+                job_manager = JobManager.get_instance()
+                await job_manager.register_job(project_id, user_id, "indexing")
 
                 background_tasks.add_task(process_project_data_task, project_id)
             finally:
@@ -1375,6 +1833,109 @@ async def run_analysis(
         raise HTTPException(status_code=404, detail="Project not found")
     p = proj_res.data[0]
 
+    # Watchdog Check for indexing jobs (Phase 8)
+    embedding_status = p.get("embedding_status", "pending")
+    if embedding_status == "processing":
+        updated_at_str = p.get("updated_at")
+        if updated_at_str:
+            try:
+                from datetime import datetime, timezone
+                clean_ts = updated_at_str.replace("Z", "+00:00")
+                updated_at_dt = datetime.fromisoformat(clean_ts)
+                now_dt = datetime.now(timezone.utc)
+                if updated_at_dt.tzinfo is None:
+                    now_dt = datetime.now()
+                    
+                elapsed_min = (now_dt - updated_at_dt).total_seconds() / 60.0
+                if elapsed_min > 10.0:
+                    logger.warning("[WATCHDOG] Project %s stuck in processing for %.1f minutes. Failing it.", project_id, elapsed_min)
+                    print(f"[WATCHDOG] Project {project_id} stuck in processing for {elapsed_min:.1f} minutes. Failing it.", flush=True)
+                    # Transition to failed
+                    supabase_client.table("projects").update({
+                        "embedding_status": "failed",
+                        "status": "failed",
+                        "upload_statistics": {"failure_reason": f"Watchdog timeout: Indexing stalled for {elapsed_min:.1f} minutes."},
+                        "updated_at": _now()
+                    }).eq("id", project_id).execute()
+                    
+                    # Also write to WorkerWatchdogReport.md
+                    try:
+                        watchdog_path = "C:\\Users\\HP\\.gemini\\antigravity-ide\\brain\\b099a49a-5f3b-44e9-8f48-c198d6c4ebba\\WorkerWatchdogReport.md"
+                        with open(watchdog_path, "a", encoding="utf-8") as f:
+                            f.write(f"\n## Watchdog Expiry: {project_id} ({datetime.now().isoformat()})\n")
+                            f.write(f"Stuck state detected. Elapsed: {elapsed_min:.1f} minutes. Status set to failed.\n")
+                    except Exception:
+                        pass
+                    
+                    p["embedding_status"] = "failed"
+                    p["status"] = "failed"
+                    embedding_status = "failed"
+            except Exception as watchdog_exc:
+                logger.error("Watchdog check failed: %s", watchdog_exc)
+
+    # Verify embedding status before initiating analysis (Phase 3 & Most Important Production Change)
+    if embedding_status in ["queued", "processing", "pending"]:
+        logger.warning("Analysis attempt rejected: Candidate indexing is still in progress for project %s", project_id)
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Candidate indexing is still in progress. Please wait until indexing completes before running analysis."
+        )
+    elif embedding_status == "failed":
+        logger.warning("Analysis attempt rejected: Candidate indexing failed for project %s", project_id)
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Candidate indexing failed. Please re-upload candidate files to retry."
+        )
+
+    # 1. Verify Job exists (Phase 5 Index Integrity Validation)
+    job_res = supabase_client.table("jobs").select("*").eq("id", body.job_id).execute()
+    if not job_res.data:
+        raise HTTPException(status_code=404, detail="Job description not found. Please add a job description first.")
+    job = job_res.data[0]
+
+    # 2. Verify candidate uploads exists
+    uploads_res = supabase_client.table("candidate_uploads").select("id").eq("project_id", project_id).eq("status", "COMPLETED").execute()
+    if not uploads_res.data:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Candidate upload record not found. Please upload candidates first."
+        )
+
+    # 3. Verify physical files exist in storage (Dynamic version check, Phase 4 & 5)
+    version = p.get("version") or 1
+    faiss_key = f"{project_id}/faiss_v{version}.index"
+    embeddings_key = f"{project_id}/embeddings_v{version}.npy"
+    ids_key = f"{project_id}/ids_v{version}.json"
+    skill_key = f"{project_id}/skill_index_v{version}.json"
+
+    # Preflight Check of all required indexing artifacts
+    from app.services.storage_provider import StorageService
+    required_preflights = [
+        ("embeddings", ids_key, "Candidate ID Mapping file"),
+        ("embeddings", embeddings_key, "Numpy Embeddings file"),
+        ("faiss-indexes", faiss_key, "FAISS index file"),
+        ("skill-indexes", skill_key, "Skill Index mapping file")
+    ]
+    
+    # Determine allowed categories
+    jd_category = job.get("role_category") or "BACKEND"
+    allowed_categories = COMPATIBLE_CATEGORIES.get(jd_category.upper(), {jd_category.upper()})
+    for cat in allowed_categories:
+        required_preflights.append(("role-indexes", f"{project_id}/role_{cat.upper()}_v{version}.jsonl", f"Role specialty file for {cat}"))
+
+    missing_preflights = []
+    for bucket_name, file_key, label in required_preflights:
+        if not StorageService.file_exists(bucket_name, file_key):
+            missing_preflights.append(f"{label} ({bucket_name}/{file_key})")
+            
+    if missing_preflights:
+        missing_str = ", ".join(missing_preflights)
+        logger.error("Analysis preflight check failed for project %s: missing %s", project_id, missing_str)
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Required indexing artifacts are missing: {missing_str}. Please re-upload candidate files to rebuild the index."
+        )
+
     # Database-level check for active analyses
     if p.get("status") in ["queued", "processing", "ranking"]:
         logger.info("Duplicate database-level analysis prevented for project %s", project_id)
@@ -1425,6 +1986,7 @@ async def run_analysis(
     AFTER_FAISS = 0
 
     def log_checkpoint(num: int, name: str, details: str = ""):
+        check_overall_timeout()
         elapsed = time.time() - t_start_all
         mem = get_memory_mb()
         log_line = f"[CHECKPOINT {num}] {name} ✓ | Elapsed: {elapsed:.3f}s | RAM: {mem:.2f}MB | {details}"
@@ -1471,8 +2033,28 @@ Python Traceback:
             pass
 
     def check_overall_timeout():
-        if time.time() - t_start_all > 600.0:
-            raise asyncio.TimeoutError("Overall analysis timeout of 10 minutes exceeded.")
+        elapsed = time.time() - t_start_all
+        if elapsed > 60.0:
+            logger.error("[TIMEOUT] Analysis exceeded 60s limit. Stage: %s | RAM: %.2fMB | Elapsed: %.3fs", current_stage, get_memory_mb(), elapsed)
+            print(f"[TIMEOUT] Analysis exceeded 60s limit. Stage: {current_stage} | RAM: {get_memory_mb():.2f}MB | Elapsed: {elapsed:.3f}s", flush=True)
+            
+            # Write to AnalysisTimeoutReport.md (Phase 9)
+            try:
+                timeout_path = "C:\\Users\\HP\\.gemini\\antigravity-ide\\brain\\b099a49a-5f3b-44e9-8f48-c198d6c4ebba\\AnalysisTimeoutReport.md"
+                with open(timeout_path, "a", encoding="utf-8") as f:
+                    import datetime
+                    f.write(f"\n## Analysis Timeout: {datetime.datetime.now().isoformat()}\n")
+                    f.write(f"Project ID: {project_id}\n")
+                    f.write(f"Last Stage: {current_stage}\n")
+                    f.write(f"RAM: {get_memory_mb():.2f} MB\n")
+                    f.write(f"Elapsed: {elapsed:.3f}s\n")
+            except Exception:
+                pass
+                
+            raise HTTPException(
+                status_code=504,
+                detail="Analysis timed out. Please try again."
+            )
 
     def update_peak():
         nonlocal peak_memory
@@ -1571,8 +2153,9 @@ Python Traceback:
         # Check if role indexes are available
         role_index_used = False
         role_index_paths = []
+        version = p.get("version") or 1
         for cat in allowed_categories:
-            role_path = f"{project_id}/role_{cat.upper()}_v1.jsonl"
+            role_path = f"{project_id}/role_{cat.upper()}_v{version}.jsonl"
             if StorageService.file_exists("role-indexes", role_path):
                 role_index_paths.append(role_path)
                 
@@ -1651,7 +2234,7 @@ Python Traceback:
         metadata_only_fallback = False
         fallback_reason = None
 
-        version = 1
+        version = p.get("version") or 1
         faiss_key = f"{project_id}/faiss_v{version}.index"
         embeddings_key = f"{project_id}/embeddings_v{version}.npy"
         ids_key = f"{project_id}/ids_v{version}.json"
@@ -1661,7 +2244,7 @@ Python Traceback:
             logger.warning("[MEMORY_WARNING] Process RAM exceeds 450MB. Disabling FAISS index loading.")
             metadata_only_fallback = True
             fallback_reason = "memory_safety_limit_exceeded"
-        elif embedding_status != "ready":
+        elif embedding_status not in ["ready", "completed"]:
             metadata_only_fallback = True
             fallback_reason = f"embedding_status_{embedding_status}"
         else:
@@ -2140,9 +2723,14 @@ Python Traceback:
                 except Exception:
                     pass
                     
-        # 3. Explicitly trigger Garbage Collection
+        # 3. Explicitly trigger Garbage Collection and clear caches (Phase 7)
         import gc
         gc.collect()
+        try:
+            from src.features.embedding import _MODEL_CACHE
+            _MODEL_CACHE.clear()
+        except Exception:
+            pass
         
         # 4. Release concurrent analysis project lock
         _active_analyses.discard(project_id)

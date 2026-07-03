@@ -14,6 +14,56 @@ from app.core.config import settings
 from app.api.v1.router import api_router
 from app.middleware.rate_limit import rate_limit_middleware
 
+# JSON formatter (Phase 8)
+class JSONLogFormatter(logging.Formatter):
+    def format(self, record):
+        import json
+        import os
+        from datetime import datetime, timezone
+        
+        # Get memory usage safely
+        memory_usage = 0.0
+        try:
+            import psutil
+            process = psutil.Process(os.getpid())
+            memory_usage = process.memory_info().rss / (1024 * 1024)
+        except Exception:
+            pass
+
+        log_record = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "log_level": record.levelname,
+            "message": record.getMessage(),
+            "logger": record.name,
+            "worker_pid": os.getpid(),
+            "memory_usage": f"{memory_usage:.2f} MB"
+        }
+        
+        # Inject standard extra custom keys if present
+        for key in ["project_id", "job_id", "request_id", "stage", "elapsed_time", "candidate_count"]:
+            if hasattr(record, key):
+                log_record[key] = getattr(record, key)
+                
+        return json.dumps(log_record)
+
+def setup_json_logging():
+    root_logger = logging.getLogger()
+    # Remove existing handlers
+    for handler in root_logger.handlers[:]:
+        root_logger.removeHandler(handler)
+        
+    handler = logging.StreamHandler()
+    handler.setFormatter(JSONLogFormatter())
+    root_logger.addHandler(handler)
+    root_logger.setLevel(logging.INFO)
+    
+    # Also override uvicorn loggers
+    for uvicorn_logger_name in ["uvicorn", "uvicorn.access", "uvicorn.error"]:
+        u_logger = logging.getLogger(uvicorn_logger_name)
+        u_logger.handlers = []
+        u_logger.propagate = True
+
+setup_json_logging()
 logger = logging.getLogger(__name__)
 
 # Normalize and validate origins (Task 3 & 6)
@@ -39,9 +89,193 @@ allowed_headers = [
 ]
 
 
+# Exit Signal Handling & Diagnostics (Phase 10 & 5)
+import signal
+import sys
+import os
+import time
+import psutil
+import gc
+from datetime import datetime
+
+_startup_time = time.time()
+
+def log_deployment_diagnostics(label: str):
+    try:
+        process = psutil.Process(os.getpid())
+        pid = process.pid
+        uptime = time.time() - _startup_time
+        
+        # Memory Info
+        mem_info = process.memory_info()
+        rss = mem_info.rss / (1024 * 1024)
+        vms = mem_info.vms / (1024 * 1024)
+        
+        # Peak memory (HWM on Linux)
+        peak_hwm = 0.0
+        if os.path.exists("/proc/self/status"):
+            try:
+                with open("/proc/self/status", "r") as f:
+                    for line in f:
+                        if line.startswith("VmHWM:"):
+                            peak_hwm = float(line.split()[1]) / 1024
+                            break
+            except Exception:
+                pass
+                        
+        cpu_usage = process.cpu_percent(interval=0.1)
+        num_threads = process.num_threads()
+        gc_stats = gc.get_stats()
+        
+        msg = f"""
+==================================================
+[DEPLOYMENT_DIAGNOSTICS] - {label}
+Container PID: {pid}
+Uptime: {uptime:.2f} seconds
+Current RSS: {rss:.2f} MB
+Peak RSS (HWM): {peak_hwm:.2f} MB
+Virtual Memory (VMS): {vms:.2f} MB
+CPU Usage: {cpu_usage:.1f}%
+Thread Count: {num_threads}
+GC Stats: {gc_stats}
+==================================================
+"""
+        logger.info(msg)
+        print(msg, flush=True)
+        
+        # Write to RenderDiagnosticsReport.md (Phase 10)
+        try:
+            diag_path = "C:\\Users\\HP\\.gemini\\antigravity-ide\\brain\\b099a49a-5f3b-44e9-8f48-c198d6c4ebba\\RenderDiagnosticsReport.md"
+            with open(diag_path, "a", encoding="utf-8") as f:
+                f.write(f"\n## Diagnostics: {label} ({datetime.now().isoformat()})\n")
+                f.write(f"```\n{msg}\n```\n")
+        except Exception:
+            pass
+    except Exception as e:
+        logger.error("Failed to log diagnostics: %s", e)
+
+
+def handle_exit_signal(signum, frame):
+    sig_names = {
+        signal.SIGTERM: "SIGTERM",
+        signal.SIGINT: "SIGINT",
+    }
+    sig_name = sig_names.get(signum, f"Signal {signum}")
+    logger.info("[LIFECYCLE_EXIT] Process terminating due to %s (Signal %d).", sig_name, signum)
+    print(f"[LIFECYCLE_EXIT] Process terminating due to {sig_name} (Signal {signum}).", flush=True)
+    log_deployment_diagnostics(f"TERMINATING_BY_SIGNAL_{sig_name}")
+    sys.exit(128 + signum)
+
+
+# Register signal handlers
+for sig in [signal.SIGTERM, signal.SIGINT]:
+    try:
+        signal.signal(sig, handle_exit_signal)
+    except ValueError:
+        pass
+
+
+def verify_ai_dependencies():
+    import traceback
+    
+    dependencies = [
+        ("faiss", "FAISS Loaded"),
+        ("numpy", "Torch Loaded"),  # using Torch Loaded labels per logs requirements
+        ("torch", "Torch Loaded"),
+        ("transformers", "Transformers Loaded"),
+        ("sentence_transformers", "SentenceTransformer Loaded"),
+    ]
+    
+    # Customize standard print message exactly as requested in Phase 7
+    print("\n--- Verifying AI Dependencies ---", flush=True)
+    failed = []
+    
+    try:
+        import faiss
+        print("✓ FAISS Loaded", flush=True)
+        logger.info("✓ FAISS Loaded")
+    except ImportError as e:
+        failed.append(("faiss", traceback.format_exc()))
+        print("✗ FAISS Failed to load", flush=True)
+
+    try:
+        import numpy
+        # Numpy is standard, but check anyway
+    except ImportError:
+        pass
+
+    try:
+        import torch
+        print("✓ Torch Loaded", flush=True)
+        logger.info("✓ Torch Loaded")
+    except ImportError as e:
+        failed.append(("torch", traceback.format_exc()))
+        print("✗ Torch Failed to load", flush=True)
+
+    try:
+        import transformers
+        print("✓ Transformers Loaded", flush=True)
+        logger.info("✓ Transformers Loaded")
+    except ImportError as e:
+        failed.append(("transformers", traceback.format_exc()))
+        print("✗ Transformers Failed to load", flush=True)
+
+    try:
+        import sentence_transformers
+        print("✓ SentenceTransformer Loaded", flush=True)
+        logger.info("✓ SentenceTransformer Loaded")
+    except ImportError as e:
+        failed.append(("sentence_transformers", traceback.format_exc()))
+        print("✗ SentenceTransformer Failed to load", flush=True)
+
+    if settings.openrouter_api_key:
+        print("✓ OpenRouter Ready", flush=True)
+        logger.info("✓ OpenRouter Ready")
+    else:
+        print("⚠ OpenRouter key is missing", flush=True)
+
+    if failed:
+        # Write to DependencyHealthReport.md
+        try:
+            art_dir = "C:\\Users\\HP\\.gemini\\antigravity-ide\\brain\\b099a49a-5f3b-44e9-8f48-c198d6c4ebba"
+            report_path = os.path.join(art_dir, "DependencyHealthReport.md")
+            with open(report_path, "w", encoding="utf-8") as f:
+                f.write("# Dependency Health Report\n\n")
+                f.write("## Status: FAILED\n\n")
+                f.write("Some critical AI dependencies failed to load. The application cannot start.\n\n")
+                for pkg, tb in failed:
+                    f.write(f"### package: `{pkg}`\n")
+                    f.write(f"```\n{tb}\n```\n")
+        except Exception:
+            pass
+        print("\n✗ Critical AI dependencies failed. Terminating.", flush=True)
+        sys.exit(1)
+        
+    # Write success report
+    try:
+        art_dir = "C:\\Users\\HP\\.gemini\\antigravity-ide\\brain\\b099a49a-5f3b-44e9-8f48-c198d6c4ebba"
+        report_path = os.path.join(art_dir, "DependencyHealthReport.md")
+        with open(report_path, "w", encoding="utf-8") as f:
+            f.write("# Dependency Health Report\n\n")
+            f.write("## Status: PASSED\n\n")
+            f.write("All critical AI dependencies loaded successfully.\n\n")
+            f.write("* [x] `faiss`: FAISS Loaded\n")
+            f.write("* [x] `torch`: Torch Loaded\n")
+            f.write("* [x] `transformers`: Transformers Loaded\n")
+            f.write("* [x] `sentence_transformers`: SentenceTransformer Loaded\n")
+            f.write(f"* [x] `OpenRouter`: {'Ready' if settings.openrouter_api_key else 'Missing'}\n")
+    except Exception:
+        pass
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Pre-warm the embedding model on startup in a background thread."""
+    # Verify required AI dependencies and print status (Phase 7)
+    verify_ai_dependencies()
+    
+    # Log startup deployment diagnostics (Phase 10)
+    log_deployment_diagnostics("STARTUP")
+
     import sys
     import os
     from pathlib import Path
@@ -86,7 +320,7 @@ async def lifespan(app: FastAPI):
 
     try:
         from app.api.v1.endpoints.platform import run_startup_initialization
-        run_startup_initialization()
+        await run_startup_initialization()
     except Exception as exc:
         logger.warning("Startup lifespan platform initialization error: %s", exc)
 
@@ -141,6 +375,8 @@ async def lifespan(app: FastAPI):
         logger.warning("Could not generate RegisteredRoutes.md or MiddlewareOrder.md audit files: %s", e)
 
     yield
+    # Log shutdown deployment diagnostics (Phase 10)
+    log_deployment_diagnostics("SHUTDOWN")
 
 
 app = FastAPI(

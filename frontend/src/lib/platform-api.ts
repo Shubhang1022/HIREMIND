@@ -264,6 +264,12 @@ export const platformApi = {
     a.click();
     URL.revokeObjectURL(url);
   },
+  cancelIndexing: (projectId: string) =>
+    apiFetch<{ status: string; message: string }>(`/platform/projects/${projectId}/cancel-indexing`, {
+      method: 'POST',
+    }),
+  workerStatus: (projectId: string) =>
+    apiFetch<any>(`/platform/projects/${projectId}/worker-status`),
   healthStats: () => apiFetch<{
     projects: number;
     candidates: number;
