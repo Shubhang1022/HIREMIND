@@ -252,6 +252,25 @@ class JobManager:
         if project_id in self._cancellation_tokens:
             self._cancellation_tokens.remove(project_id)
 
+    def cancel_all_active_jobs(self):
+        """Mark all currently cached running or queued jobs as cancelled."""
+        active_ids = [pid for pid, info in self._progress_cache.items() if info.get("status") in ["queued", "processing", "embedding", "indexing"]]
+        for pid in active_ids:
+            self._cancellation_tokens.add(pid)
+            info = self._progress_cache.get(pid)
+            if info:
+                info["status"] = "cancelled"
+                info["current_stage"] = "Cancelled"
+            try:
+                db_updates = {
+                    "status": "cancelled",
+                    "current_stage": "Cancelled",
+                    "updated_at": datetime.now(timezone.utc).isoformat()
+                }
+                supabase_client.table("background_jobs").update(db_updates).eq("project_id", pid).execute()
+            except Exception as exc:
+                logger.error("Supabase job cancel persistence failed: %s", exc)
+
     def get_job_status(self, project_id: str) -> Optional[Dict[str, Any]]:
         """Retrieve current in-memory job details."""
         return self._progress_cache.get(project_id)

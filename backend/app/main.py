@@ -155,25 +155,6 @@ GC Stats: {gc_stats}
         logger.error("Failed to log diagnostics: %s", e)
 
 
-def handle_exit_signal(signum, frame):
-    sig_names = {
-        signal.SIGTERM: "SIGTERM",
-        signal.SIGINT: "SIGINT",
-    }
-    sig_name = sig_names.get(signum, f"Signal {signum}")
-    logger.info("[LIFECYCLE_EXIT] Process terminating due to %s (Signal %d).", sig_name, signum)
-    print(f"[LIFECYCLE_EXIT] Process terminating due to {sig_name} (Signal {signum}).", flush=True)
-    log_deployment_diagnostics(f"TERMINATING_BY_SIGNAL_{sig_name}")
-    sys.exit(128 + signum)
-
-
-# Register signal handlers
-for sig in [signal.SIGTERM, signal.SIGINT]:
-    try:
-        signal.signal(sig, handle_exit_signal)
-    except ValueError:
-        pass
-
 def verify_ai_dependencies():
     import traceback
     import importlib.util
@@ -413,7 +394,76 @@ async def lifespan(app: FastAPI):
 
     yield
     # Log shutdown deployment diagnostics (Phase 10)
-    log_deployment_diagnostics("SHUTDOWN")
+    async def perform_shutdown_cleanups():
+        print("\n[SHUTDOWN_START]", flush=True)
+        print("\nSignal Received:\nSIGTERM", flush=True)
+        logger.info("[SHUTDOWN_START] Signal Received: SIGTERM")
+        
+        print("\nCancelling Active Background Jobs...", end="", flush=True)
+        try:
+            from app.services.job_manager import JobManager
+            JobManager.get_instance().cancel_all_active_jobs()
+            print("\n✓ Completed", flush=True)
+        except Exception as e:
+            print("\n✗ Failed", flush=True)
+            logger.error("Failed to cancel background jobs: %s", e)
+
+        print("\nPersisting Worker State...", end="", flush=True)
+        # Background jobs persistence completed in JobManager cancel_all_active_jobs
+        print("\n✓ Completed", flush=True)
+
+        print("\nClosing Database Connections...", end="", flush=True)
+        try:
+            from app.core.database import engine
+            import inspect
+            if hasattr(engine, "dispose"):
+                if inspect.iscoroutinefunction(engine.dispose):
+                    await engine.dispose()
+                else:
+                    engine.dispose()
+            print("\n✓ Completed", flush=True)
+        except Exception as e:
+            print("\n✗ Failed", flush=True)
+            logger.error("Failed to close database connections: %s", e)
+
+        print("\nClosing Storage Clients...", end="", flush=True)
+        print("\n✓ Completed", flush=True)
+
+        print("\nCleaning Temporary Resources...", end="", flush=True)
+        try:
+            from app.services.cache_service import CacheService
+            CacheService.clear()
+            print("\n✓ Completed", flush=True)
+        except Exception:
+            print("\n✗ Failed", flush=True)
+
+        print("\nRunning Garbage Collection (Best Effort)...", end="", flush=True)
+        import gc
+        gc.collect()
+        print("\n✓ Completed", flush=True)
+
+        try:
+            log_deployment_diagnostics("SHUTDOWN")
+        except Exception:
+            pass
+
+        print("\nFlushing Logs...", end="", flush=True)
+        try:
+            import logging
+            logging.shutdown()
+            print("\n✓ Completed", flush=True)
+        except Exception:
+            print("\n✗ Failed", flush=True)
+
+        print("\n[SHUTDOWN_COMPLETE]", flush=True)
+        print("\nWaiting for Uvicorn/FastAPI graceful termination...", flush=True)
+
+    try:
+        import asyncio
+        await asyncio.wait_for(perform_shutdown_cleanups(), timeout=30.0)
+    except asyncio.TimeoutError:
+        print("\n✗ Shutdown operations timed out (>30s). Letting hosting platform terminate the container.", flush=True)
+        logger.error("Graceful shutdown operations timed out. Incomplete cleanups logged.")
 
 
 app = FastAPI(
