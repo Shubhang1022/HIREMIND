@@ -4,7 +4,7 @@ import logging
 import os
 import psutil
 import shutil
-from typing import Dict
+from typing import Dict, Any
 from fastapi import APIRouter, HTTPException
 
 from app.core.config import settings
@@ -20,7 +20,7 @@ supabase_client = create_supabase_client(settings.supabase_url, settings.supabas
 
 
 @router.get("", summary="Extended health probe")
-async def health_check() -> Dict[str, any]:
+async def health_check() -> Dict[str, Any]:
     """Perform health checks on all critical subsystems."""
     status = "healthy"
     
@@ -118,7 +118,7 @@ async def health_check() -> Dict[str, any]:
 
 
 @router.get("/metrics", summary="Production performance metrics")
-async def metrics() -> Dict[str, any]:
+async def metrics() -> Dict[str, Any]:
     """Retrieve statistical aggregates of analysis jobs and queue latency."""
     try:
         # Query total, completed, failed counts from rankings
