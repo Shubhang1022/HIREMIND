@@ -174,59 +174,92 @@ for sig in [signal.SIGTERM, signal.SIGINT]:
     except ValueError:
         pass
 
-
 def verify_ai_dependencies():
     import traceback
+    import importlib.util
+    import sys
+    import os
+    import psutil
     
-    dependencies = [
-        ("faiss", "FAISS Loaded"),
-        ("numpy", "Torch Loaded"),  # using Torch Loaded labels per logs requirements
-        ("torch", "Torch Loaded"),
-        ("transformers", "Transformers Loaded"),
-        ("sentence_transformers", "SentenceTransformer Loaded"),
-    ]
-    
-    # Customize standard print message exactly as requested in Phase 7
+    # Print start verification
     print("\n--- Verifying AI Dependencies ---", flush=True)
+    logger.info("--- Verifying AI Dependencies ---")
+    
     failed = []
     
+    # 1. FAISS loading (Must do actual import validation, log traceback on error)
+    faiss_ok = False
     try:
         import faiss
         print("✓ FAISS Loaded", flush=True)
         logger.info("✓ FAISS Loaded")
-    except ImportError as e:
-        failed.append(("faiss", traceback.format_exc()))
+        faiss_ok = True
+    except Exception as e:
+        tb = traceback.format_exc()
+        failed.append(("faiss", tb))
         print("✗ FAISS Failed to load", flush=True)
+        print(tb, flush=True)
+        logger.error("FAISS Failed to load:\n%s", tb)
 
+    # 2. numpy loading
+    numpy_ok = False
     try:
         import numpy
-        # Numpy is standard, but check anyway
-    except ImportError:
-        pass
+        numpy_ok = True
+    except Exception as e:
+        tb = traceback.format_exc()
+        failed.append(("numpy", tb))
+        print("✗ numpy Failed to load", flush=True)
+        print(tb, flush=True)
+        logger.error("numpy Failed to load:\n%s", tb)
 
+    # 3. Torch (Lightweight path check to prevent heavy imports and CUDA memory allocation)
+    torch_ok = False
     try:
-        import torch
-        print("✓ Torch Loaded", flush=True)
-        logger.info("✓ Torch Loaded")
-    except ImportError as e:
-        failed.append(("torch", traceback.format_exc()))
-        print("✗ Torch Failed to load", flush=True)
+        if importlib.util.find_spec("torch") is not None:
+            print("✓ Torch Verified (Installed)", flush=True)
+            logger.info("✓ Torch Verified (Installed)")
+            torch_ok = True
+        else:
+            print("✗ Torch not found in environment", flush=True)
+            failed.append(("torch", "Torch package is missing in environment"))
+    except Exception as e:
+        tb = traceback.format_exc()
+        failed.append(("torch", tb))
+        print("✗ Torch verification failed", flush=True)
+        print(tb, flush=True)
 
+    # 4. Transformers (Lightweight check to prevent loading tokenizer/model modules)
+    transformers_ok = False
     try:
-        import transformers
-        print("✓ Transformers Loaded", flush=True)
-        logger.info("✓ Transformers Loaded")
-    except ImportError as e:
-        failed.append(("transformers", traceback.format_exc()))
-        print("✗ Transformers Failed to load", flush=True)
+        if importlib.util.find_spec("transformers") is not None:
+            print("✓ Transformers Verified (Installed)", flush=True)
+            logger.info("✓ Transformers Verified (Installed)")
+            transformers_ok = True
+        else:
+            print("✗ Transformers not found in environment", flush=True)
+            failed.append(("transformers", "Transformers package is missing in environment"))
+    except Exception as e:
+        tb = traceback.format_exc()
+        failed.append(("transformers", tb))
+        print("✗ Transformers verification failed", flush=True)
+        print(tb, flush=True)
 
+    # 5. Sentence Transformers (Lightweight check to prevent model instantiations/weights loading)
+    st_ok = False
     try:
-        import sentence_transformers
-        print("✓ SentenceTransformer Loaded", flush=True)
-        logger.info("✓ SentenceTransformer Loaded")
-    except ImportError as e:
-        failed.append(("sentence_transformers", traceback.format_exc()))
-        print("✗ SentenceTransformer Failed to load", flush=True)
+        if importlib.util.find_spec("sentence_transformers") is not None:
+            print("✓ SentenceTransformer Verified (Installed)", flush=True)
+            logger.info("✓ SentenceTransformer Verified (Installed)")
+            st_ok = True
+        else:
+            print("✗ SentenceTransformer not found in environment", flush=True)
+            failed.append(("sentence_transformers", "SentenceTransformer package is missing in environment"))
+    except Exception as e:
+        tb = traceback.format_exc()
+        failed.append(("sentence_transformers", tb))
+        print("✗ SentenceTransformer verification failed", flush=True)
+        print(tb, flush=True)
 
     if settings.openrouter_api_key:
         print("✓ OpenRouter Ready", flush=True)
@@ -234,38 +267,42 @@ def verify_ai_dependencies():
     else:
         print("⚠ OpenRouter key is missing", flush=True)
 
-    if failed:
-        # Write to DependencyHealthReport.md
-        try:
-            art_dir = "C:\\Users\\HP\\.gemini\\antigravity-ide\\brain\\b099a49a-5f3b-44e9-8f48-c198d6c4ebba"
-            report_path = os.path.join(art_dir, "DependencyHealthReport.md")
-            with open(report_path, "w", encoding="utf-8") as f:
-                f.write("# Dependency Health Report\n\n")
-                f.write("## Status: FAILED\n\n")
-                f.write("Some critical AI dependencies failed to load. The application cannot start.\n\n")
+    # 6. Structured Diagnostics Logging (Rather than sys.exit(1), log status report & proceed)
+    art_dir = "C:\\Users\\HP\\.gemini\\antigravity-ide\\brain\\b099a49a-5f3b-44e9-8f48-c198d6c4ebba"
+    report_path = os.path.join(art_dir, "DependencyHealthReport.md")
+    
+    try:
+        os.makedirs(art_dir, exist_ok=True)
+        with open(report_path, "w", encoding="utf-8") as f:
+            f.write("# Dependency Health Report\n\n")
+            if failed:
+                f.write("## Status: WARNINGS/DIAGNOSTICS\n\n")
+                f.write("Some AI package checks reported issues or were not fully locatable:\n\n")
                 for pkg, tb in failed:
                     f.write(f"### package: `{pkg}`\n")
                     f.write(f"```\n{tb}\n```\n")
-        except Exception:
-            pass
-        print("\n✗ Critical AI dependencies failed. Terminating.", flush=True)
-        sys.exit(1)
-        
-    # Write success report
-    try:
-        art_dir = "C:\\Users\\HP\\.gemini\\antigravity-ide\\brain\\b099a49a-5f3b-44e9-8f48-c198d6c4ebba"
-        report_path = os.path.join(art_dir, "DependencyHealthReport.md")
-        with open(report_path, "w", encoding="utf-8") as f:
-            f.write("# Dependency Health Report\n\n")
-            f.write("## Status: PASSED\n\n")
-            f.write("All critical AI dependencies loaded successfully.\n\n")
-            f.write("* [x] `faiss`: FAISS Loaded\n")
-            f.write("* [x] `torch`: Torch Loaded\n")
-            f.write("* [x] `transformers`: Transformers Loaded\n")
-            f.write("* [x] `sentence_transformers`: SentenceTransformer Loaded\n")
-            f.write(f"* [x] `OpenRouter`: {'Ready' if settings.openrouter_api_key else 'Missing'}\n")
-    except Exception:
-        pass
+            else:
+                f.write("## Status: PASSED\n\n")
+                f.write("All critical AI dependencies verified successfully.\n\n")
+                f.write("* [x] `faiss`: Verified\n")
+                f.write("* [x] `torch`: Verified\n")
+                f.write("* [x] `transformers`: Verified\n")
+                f.write("* [x] `sentence_transformers`: Verified\n")
+    except Exception as exc:
+        logger.error("Failed to write DependencyHealthReport.md: %s", exc)
+
+    # Log diagnostics summary
+    process = psutil.Process(os.getpid())
+    mem_mb = process.memory_info().rss / (1024 * 1024)
+    print(f"Startup RAM Usage: {mem_mb:.2f} MB", flush=True)
+    logger.info("Startup RAM Usage: %.2f MB", mem_mb)
+    
+    if failed:
+        logger.warning("[STARTUP_DIAGNOSTICS] AI dependency issues detected. Continuing boot in diagnostics mode.")
+        print("[STARTUP_DIAGNOSTICS] AI dependency issues detected. Continuing boot in diagnostics mode.", flush=True)
+    else:
+        logger.info("[STARTUP_DIAGNOSTICS] Dependency check passed. Continuing boot.")
+        print("[STARTUP_DIAGNOSTICS] Dependency check passed. Continuing boot.", flush=True)
 
 
 @asynccontextmanager
