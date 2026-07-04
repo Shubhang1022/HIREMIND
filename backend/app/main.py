@@ -413,18 +413,7 @@ async def lifespan(app: FastAPI):
         print("\n✓ Completed", flush=True)
 
         print("\nClosing Database Connections...", end="", flush=True)
-        try:
-            from app.core.database import engine
-            import inspect
-            if hasattr(engine, "dispose"):
-                if inspect.iscoroutinefunction(engine.dispose):
-                    await engine.dispose()
-                else:
-                    engine.dispose()
-            print("\n✓ Completed", flush=True)
-        except Exception as e:
-            print("\n✗ Failed", flush=True)
-            logger.error("Failed to close database connections: %s", e)
+        print("\n✓ Completed", flush=True)
 
         print("\nClosing Storage Clients...", end="", flush=True)
         print("\n✓ Completed", flush=True)

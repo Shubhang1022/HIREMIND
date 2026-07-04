@@ -141,11 +141,12 @@ class SupabaseStorageProvider(StorageProvider):
 
     def download_stream(self, bucket_id: str, path: str) -> Generator[bytes, None, None]:
         # Stream chunks directly from Supabase Storage HTTP REST endpoint to maintain O(1) memory
+        # Use /object/{bucket}/{path} with service-key auth (NOT /authenticated/ which requires anon JWT)
         headers = {
             "Authorization": f"Bearer {self.key}",
             "apikey": self.key
         }
-        url = f"{self.url}/storage/v1/object/authenticated/{bucket_id}/{path}"
+        url = f"{self.url}/storage/v1/object/{bucket_id}/{path}"
         
         with httpx.stream("GET", url, headers=headers) as r:
             if r.status_code != 200:

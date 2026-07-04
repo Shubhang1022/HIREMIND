@@ -6,6 +6,7 @@ Will be migrated to Supabase once the project is active.
 
 from __future__ import annotations
 
+import asyncio
 import csv
 import io
 import json
@@ -307,13 +308,10 @@ def _update_project_hash(project_id: str) -> None:
 async def _verify_background_jobs_table_exists() -> None:
     import logging
     logger = logging.getLogger(__name__)
-    from app.core.database import engine
-    from sqlalchemy import text
     try:
-        async with engine.connect() as conn:
-            await conn.execute(text("SELECT 1 FROM public.background_jobs LIMIT 0;"))
-            logger.info("✓ Verified background_jobs table exists in Supabase database.")
-            print("✓ Verified background_jobs table exists in Supabase database.", flush=True)
+        supabase_client.table("background_jobs").select("id").limit(1).execute()
+        logger.info("✓ Verified background_jobs table exists in Supabase database.")
+        print("✓ Verified background_jobs table exists in Supabase database.", flush=True)
     except Exception as exc:
         logger.error("✗ Failed to verify background_jobs table: %s. Please run migrations.", exc)
         print(f"✗ Failed to verify background_jobs table: {exc}", flush=True)
@@ -965,6 +963,7 @@ Elapsed: {elapsed_str}
 
                                 global_idx += len(batch_candidates)
                                 progress_pct = 20 + int(global_idx / total_candidates * 60)
+                                # pyrefly: ignore [unexpected-keyword]
                                 _sync_update_progress(project_id, "Generating Embeddings", progress_pct, status="embedding", processed_candidates=global_idx, total_candidates=total_candidates, retry_count=attempt - 1)
                                 
                                 batch_candidates = []
@@ -1000,6 +999,7 @@ Elapsed: {elapsed_str}
                                 index.add(dummy)
 
                             global_idx += len(batch_candidates)
+                            # pyrefly: ignore [unexpected-keyword]
                             _sync_update_progress(project_id, "Generating Embeddings", 80, status="embedding", processed_candidates=global_idx, total_candidates=total_candidates, retry_count=attempt - 1)
                             log_worker_heartbeat("Generating Embeddings", global_idx, total_candidates, batch_num)
 
@@ -1094,6 +1094,7 @@ Elapsed: {elapsed_str}
                     "updated_at": _now()
                 }).eq("id", project_id).execute()
                 
+                # pyrefly: ignore [unexpected-keyword]
                 _sync_update_progress(project_id, "Completed", 100, status="completed", processed_candidates=total_candidates, total_candidates=total_candidates, retry_count=attempt - 1)
 
                 elapsed = time.time() - t_start
@@ -1200,8 +1201,14 @@ def _sync_update_progress(project_id: str, stage: str, progress: int, status: st
         asyncio.set_event_loop(loop)
     coro = manager.update_job_progress(project_id, stage, progress, status, processed, total, eta, retry_count)
     if loop.is_running():
+        # Schedule on the running loop without blocking the calling thread
+        # Using run_coroutine_threadsafe without .result() prevents deadlocks in background threads
         from asyncio import run_coroutine_threadsafe
-        run_coroutine_threadsafe(coro, loop).result()
+        future = run_coroutine_threadsafe(coro, loop)
+        try:
+            future.result(timeout=5.0)
+        except Exception:
+            pass  # Non-critical: progress update failure should not abort indexing
     else:
         loop.run_until_complete(coro)
 
@@ -1217,7 +1224,11 @@ def _sync_fail_job(project_id: str, reason: str):
     coro = manager.fail_job(project_id, reason)
     if loop.is_running():
         from asyncio import run_coroutine_threadsafe
-        run_coroutine_threadsafe(coro, loop).result()
+        future = run_coroutine_threadsafe(coro, loop)
+        try:
+            future.result(timeout=5.0)
+        except Exception:
+            pass
     else:
         loop.run_until_complete(coro)
 
@@ -1754,6 +1765,78 @@ async def list_jobs(project_id: str, current_user: Optional[AuthUser] = Depends(
 
     res = supabase_client.table("jobs").select("*").eq("project_id", project_id).execute()
     return res.data
+
+
+@router.post("/projects/{project_id}/jobs", status_code=status.HTTP_201_CREATED)
+async def create_job(
+    project_id: str,
+    body: JobCreate,
+    current_user: Optional[AuthUser] = Depends(get_optional_user),
+):
+    """Create a job by pasting/typing raw JD text. Parses requirements with LLM fallback."""
+    import logging
+    logger = logging.getLogger(__name__)
+    user_id = get_user_id(current_user)
+    proj = supabase_client.table("projects").select("*").eq("id", project_id).eq("user_id", user_id).execute()
+    if not proj.data:
+        raise HTTPException(status_code=404, detail="Project not found")
+    p = proj.data[0]
+
+    # Parse the raw description text for structured fields
+    raw_text = body.description or ""
+    required_skills = body.required_skills or []
+    min_experience = body.min_experience or 0.0
+
+    # If no skills provided, try to extract them from the description text
+    if not required_skills and raw_text:
+        llm_parsed: dict = {}
+        try:
+            from app.core.openrouter import parse_jd_with_llm
+            llm_parsed = await parse_jd_with_llm(raw_text)
+        except Exception:
+            try:
+                llm_parsed = parse_jd_backup(raw_text)
+            except Exception:
+                pass
+        if llm_parsed:
+            required_skills = llm_parsed.get("must_have_skills", [])
+            if not min_experience:
+                min_experience = float(llm_parsed.get("experience_years", {}).get("min") or 0.0)
+
+    jid = str(uuid.uuid4())
+    job = {
+        "id": jid,
+        "project_id": project_id,
+        "title": body.title,
+        "description": raw_text,
+        "company": body.company or "Company",
+        "location": body.location or "Remote",
+        "work_mode": body.work_mode or "Remote",
+        "required_skills": required_skills,
+        "nice_to_have_skills": [],
+        "min_experience": min_experience,
+        "preferred_locations": [],
+        "openings": body.openings or 5,
+        "shortlist_size": body.shortlist_size or 15,
+        "priority": body.priority or "balanced",
+        "min_match_percent": body.min_match_percent,
+        "salary_range": body.salary_range,
+        "job_location": body.job_location,
+        "employment_type": body.employment_type or "Full-time",
+        "created_at": _now(),
+    }
+
+    supabase_client.table("jobs").insert(job).execute()
+
+    # Update project job count
+    job_count_res = supabase_client.table("jobs").select("id", count="exact").eq("project_id", project_id).execute()
+    supabase_client.table("projects").update({
+        "job_count": job_count_res.count or 1,
+        "updated_at": _now(),
+    }).eq("id", project_id).execute()
+
+    logger.info("Created job %s for project %s via text input", jid, project_id)
+    return job
 
 
 # ── AI Analysis ───────────────────────────────────────────────────────────────

@@ -1,3 +1,8 @@
+-- HireMind AI — Idempotent Production Schema
+-- Enable standard Supabase extensions
+CREATE EXTENSION IF NOT EXISTS pgcrypto;
+CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+
 -- 1. Projects Table
 CREATE TABLE IF NOT EXISTS public.projects (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -114,24 +119,43 @@ CREATE TABLE IF NOT EXISTS public.migration_history (
     migrated_at TIMESTAMPTZ DEFAULT now()
 );
 
--- 8. Create Storage Buckets
-INSERT INTO storage.buckets (id, name, public)
-VALUES 
-    ('candidate-files', 'candidate-files', false),
-    ('candidate-resumes', 'candidate-resumes', false),
-    ('embeddings', 'embeddings', false),
-    ('faiss-indexes', 'faiss-indexes', false),
-    ('role-indexes', 'role-indexes', false),
-    ('skill-indexes', 'skill-indexes', false),
-    ('exports', 'exports', false),
-    ('audit-reports', 'audit-reports', false)
-ON CONFLICT (id) DO NOTHING;
+-- 8. Background Jobs Table
+CREATE TABLE IF NOT EXISTS public.background_jobs (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    project_id UUID NOT NULL REFERENCES public.projects(id) ON DELETE CASCADE,
+    user_id UUID,
+    job_type VARCHAR(50) NOT NULL,
+    current_stage VARCHAR(100),
+    progress_percentage INTEGER DEFAULT 0,
+    started_at TIMESTAMPTZ DEFAULT now(),
+    updated_at TIMESTAMPTZ DEFAULT now(),
+    last_heartbeat TIMESTAMPTZ DEFAULT now(),
+    retry_count INTEGER DEFAULT 0,
+    status VARCHAR(50) DEFAULT 'queued',
+    failure_reason TEXT
+);
 
--- 9. Row Level Security Policies
+-- 9. Create Performance Indexes
+CREATE INDEX IF NOT EXISTS idx_projects_user_id ON public.projects(user_id);
+CREATE INDEX IF NOT EXISTS idx_jobs_project_id ON public.jobs(project_id);
+CREATE INDEX IF NOT EXISTS idx_candidate_uploads_project_id ON public.candidate_uploads(project_id);
+CREATE INDEX IF NOT EXISTS idx_rankings_project_id ON public.rankings(project_id);
+CREATE INDEX IF NOT EXISTS idx_rankings_job_id ON public.rankings(job_id);
+CREATE INDEX IF NOT EXISTS idx_ranking_results_ranking_id ON public.ranking_results(ranking_id);
+CREATE INDEX IF NOT EXISTS idx_analysis_metrics_project_id ON public.analysis_metrics(project_id);
+CREATE INDEX IF NOT EXISTS idx_background_jobs_project_id ON public.background_jobs(project_id);
+CREATE INDEX IF NOT EXISTS idx_background_jobs_user_id ON public.background_jobs(user_id);
 
--- Projects
+-- 10. Enable Row Level Security (RLS)
 ALTER TABLE public.projects ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.jobs ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.candidate_uploads ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.rankings ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.ranking_results ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.analysis_metrics ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.background_jobs ENABLE ROW LEVEL SECURITY;
 
+-- 11. Create Security Policies
 DROP POLICY IF EXISTS "Users can manage their own projects" ON public.projects;
 CREATE POLICY "Users can manage their own projects"
     ON public.projects
@@ -139,9 +163,6 @@ CREATE POLICY "Users can manage their own projects"
     TO authenticated
     USING (auth.uid() = user_id)
     WITH CHECK (auth.uid() = user_id);
-
--- Jobs
-ALTER TABLE public.jobs ENABLE ROW LEVEL SECURITY;
 
 DROP POLICY IF EXISTS "Users can manage jobs for their own projects" ON public.jobs;
 CREATE POLICY "Users can manage jobs for their own projects"
@@ -163,9 +184,6 @@ CREATE POLICY "Users can manage jobs for their own projects"
         )
     );
 
--- Candidate Uploads
-ALTER TABLE public.candidate_uploads ENABLE ROW LEVEL SECURITY;
-
 DROP POLICY IF EXISTS "Users can manage uploads for their own projects" ON public.candidate_uploads;
 CREATE POLICY "Users can manage uploads for their own projects"
     ON public.candidate_uploads
@@ -186,9 +204,6 @@ CREATE POLICY "Users can manage uploads for their own projects"
         )
     );
 
--- Rankings
-ALTER TABLE public.rankings ENABLE ROW LEVEL SECURITY;
-
 DROP POLICY IF EXISTS "Users can manage rankings for their own projects" ON public.rankings;
 CREATE POLICY "Users can manage rankings for their own projects"
     ON public.rankings
@@ -208,9 +223,6 @@ CREATE POLICY "Users can manage rankings for their own projects"
               AND public.projects.user_id = auth.uid()
         )
     );
-
--- Ranking Results
-ALTER TABLE public.ranking_results ENABLE ROW LEVEL SECURITY;
 
 DROP POLICY IF EXISTS "Users can manage ranking results for their own projects" ON public.ranking_results;
 CREATE POLICY "Users can manage ranking results for their own projects"
@@ -234,9 +246,6 @@ CREATE POLICY "Users can manage ranking results for their own projects"
         )
     );
 
--- Analysis Metrics
-ALTER TABLE public.analysis_metrics ENABLE ROW LEVEL SECURITY;
-
 DROP POLICY IF EXISTS "Users can manage metrics for their own projects" ON public.analysis_metrics;
 CREATE POLICY "Users can manage metrics for their own projects"
     ON public.analysis_metrics
@@ -257,7 +266,28 @@ CREATE POLICY "Users can manage metrics for their own projects"
         )
     );
 
--- Storage Objects Policies
+DROP POLICY IF EXISTS "Users can manage background_jobs for their own projects" ON public.background_jobs;
+CREATE POLICY "Users can manage background_jobs for their own projects"
+    ON public.background_jobs
+    FOR ALL
+    TO authenticated
+    USING (auth.uid() = user_id)
+    WITH CHECK (auth.uid() = user_id);
+
+-- 12. Create Storage Buckets
+INSERT INTO storage.buckets (id, name, public)
+VALUES 
+    ('candidate-files', 'candidate-files', false),
+    ('candidate-resumes', 'candidate-resumes', false),
+    ('embeddings', 'embeddings', false),
+    ('faiss-indexes', 'faiss-indexes', false),
+    ('role-indexes', 'role-indexes', false),
+    ('skill-indexes', 'skill-indexes', false),
+    ('exports', 'exports', false),
+    ('audit-reports', 'audit-reports', false)
+ON CONFLICT (id) DO NOTHING;
+
+-- 13. Storage Objects Policies
 DROP POLICY IF EXISTS "Users can manage files in their own projects" ON storage.objects;
 CREATE POLICY "Users can manage files in their own projects"
     ON storage.objects
@@ -275,28 +305,42 @@ CREATE POLICY "Users can manage files in their own projects"
             SELECT 1 FROM public.projects
             WHERE public.projects.id::text = split_part(storage.objects.name, '/', 1)
               AND public.projects.user_id = auth.uid()
+        )
     );
 
--- 10. Background Jobs Table (Production Hardening)
-CREATE TABLE IF NOT EXISTS public.background_jobs (
+-- 14. Audit Logs Table
+CREATE TABLE IF NOT EXISTS public.audit_logs (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    project_id UUID NOT NULL REFERENCES public.projects(id) ON DELETE CASCADE,
     user_id UUID,
-    job_type VARCHAR(50) NOT NULL,
-    current_stage VARCHAR(100),
-    progress_percentage INTEGER DEFAULT 0,
-    started_at TIMESTAMPTZ DEFAULT now(),
-    updated_at TIMESTAMPTZ DEFAULT now(),
-    last_heartbeat TIMESTAMPTZ DEFAULT now(),
-    retry_count INTEGER DEFAULT 0,
-    status VARCHAR(50) DEFAULT 'queued',
-    failure_reason TEXT
+    project_id UUID REFERENCES public.projects(id) ON DELETE SET NULL,
+    action VARCHAR(255) NOT NULL,
+    resource_type VARCHAR(100),
+    resource_id VARCHAR(255),
+    details JSONB DEFAULT '{}'::jsonb,
+    ip_address VARCHAR(45),
+    created_at TIMESTAMPTZ DEFAULT now()
 );
 
--- Enable RLS for background_jobs
-ALTER TABLE public.background_jobs ENABLE ROW LEVEL SECURITY;
-DROP POLICY IF EXISTS "Users can manage background_jobs for their own projects" ON public.background_jobs;
-CREATE POLICY "Users can manage background_jobs for their own projects"
-    ON public.background_jobs FOR ALL TO authenticated
-    USING (auth.uid() = user_id)
-    WITH CHECK (auth.uid() = user_id);
+-- Enable RLS for audit_logs
+ALTER TABLE public.audit_logs ENABLE ROW LEVEL SECURITY;
+
+DROP POLICY IF EXISTS "Users can manage audit logs for their own projects" ON public.audit_logs;
+CREATE POLICY "Users can manage audit logs for their own projects"
+    ON public.audit_logs
+    FOR ALL
+    TO authenticated
+    USING (
+        project_id IS NULL OR EXISTS (
+            SELECT 1 FROM public.projects
+            WHERE public.projects.id = public.audit_logs.project_id
+              AND public.projects.user_id = auth.uid()
+        )
+    )
+    WITH CHECK (
+        project_id IS NULL OR EXISTS (
+            SELECT 1 FROM public.projects
+            WHERE public.projects.id = public.audit_logs.project_id
+              AND public.projects.user_id = auth.uid()
+        )
+    );
+

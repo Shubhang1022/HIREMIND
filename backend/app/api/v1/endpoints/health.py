@@ -4,13 +4,12 @@ import logging
 import os
 import psutil
 import shutil
+import time
 from typing import Dict, Any
 from fastapi import APIRouter, HTTPException
 
 from app.core.config import settings
 from app.services.storage_provider import create_supabase_client
-from app.core.database import engine
-from sqlalchemy import text
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -22,26 +21,26 @@ supabase_client = create_supabase_client(settings.supabase_url, settings.supabas
 @router.get("", summary="Extended health probe")
 async def health_check() -> Dict[str, Any]:
     """Perform health checks on all critical subsystems."""
-    status = "healthy"
+    system_status = "healthy"
     
     # 1. Database check
     database_ok = False
     try:
-        async with engine.connect() as conn:
-            await conn.execute(text("SELECT 1;"))
-            database_ok = True
+        # Check database connectivity using Supabase client (select 1 row from projects)
+        res = supabase_client.table("projects").select("id").limit(1).execute()
+        database_ok = True
     except Exception as e:
         logger.error("Health check: Database failure: %s", e)
-        status = "unhealthy"
+        system_status = "unhealthy"
 
     # 2. Supabase client check
     supabase_ok = False
     try:
-        res = supabase_client.table("projects").select("id").limit(1).execute()
+        res = supabase_client.table("background_jobs").select("id").limit(1).execute()
         supabase_ok = True
     except Exception as e:
         logger.error("Health check: Supabase failure: %s", e)
-        status = "unhealthy"
+        system_status = "unhealthy"
 
     # 3. Storage bucket check
     storage_ok = False
@@ -51,7 +50,7 @@ async def health_check() -> Dict[str, Any]:
         storage_ok = True
     except Exception as e:
         logger.error("Health check: Storage failure: %s", e)
-        status = "unhealthy"
+        system_status = "unhealthy"
 
     # 4. Libraries checks
     faiss_ok = False
@@ -59,28 +58,28 @@ async def health_check() -> Dict[str, Any]:
         import faiss
         faiss_ok = True
     except ImportError:
-        status = "unhealthy"
+        system_status = "unhealthy"
 
     torch_ok = False
     try:
         import torch
         torch_ok = True
     except ImportError:
-        status = "unhealthy"
+        system_status = "unhealthy"
 
     transformers_ok = False
     try:
         import transformers
         transformers_ok = True
     except ImportError:
-        status = "unhealthy"
+        system_status = "unhealthy"
 
     sentence_transformers_ok = False
     try:
         import sentence_transformers
         sentence_transformers_ok = True
     except ImportError:
-        status = "unhealthy"
+        system_status = "unhealthy"
 
     # 5. OpenRouter key verification
     openrouter_ok = bool(settings.openrouter_api_key)
@@ -102,7 +101,7 @@ async def health_check() -> Dict[str, Any]:
         pass
 
     return {
-        "status": status,
+        "status": system_status,
         "database": database_ok,
         "supabase": supabase_ok,
         "storage": storage_ok,

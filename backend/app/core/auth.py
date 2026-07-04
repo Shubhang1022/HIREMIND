@@ -78,7 +78,3 @@ async def get_optional_user(
     except HTTPException:
         return None
 
-import inspect
-print("AUTH CHECK")
-print("get_current_user signature:", inspect.signature(get_current_user))
-print("get_optional_user signature:", inspect.signature(get_optional_user))

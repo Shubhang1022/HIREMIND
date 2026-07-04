@@ -284,12 +284,6 @@ class JobManager:
                 return
 
             logger.info("[RECOVERY] Found %d unfinished background jobs.", len(res.data))
-            
-            # Write to BackgroundJobRecovery.md (Phase 1)
-            recovery_path = "C:\\Users\\HP\\.gemini\\antigravity-ide\\brain\\b099a49a-5f3b-44e9-8f48-c198d6c4ebba\\BackgroundJobRecovery.md"
-            with open(recovery_path, "a", encoding="utf-8") as f:
-                f.write(f"\n## Recovery Scan: {datetime.now(timezone.utc).isoformat()}\n")
-                f.write(f"Scanned and retrieved {len(res.data)} unfinished jobs.\n")
 
             from app.api.v1.endpoints.platform import process_project_data_task
             
@@ -308,10 +302,6 @@ class JobManager:
                         "current_stage": "Recovering",
                         "updated_at": datetime.now(timezone.utc).isoformat()
                     }).eq("id", job["id"]).execute()
-                    
-                    # Log recovery attempt in MD file
-                    with open(recovery_path, "a", encoding="utf-8") as f:
-                        f.write(f"- Job `{job['id']}` for Project `{project_id}`: Recovering (Retry {new_retry}/3).\n")
 
                     # Re-trigger task inside asyncio event loop
                     asyncio.create_task(self._safely_run_indexing(project_id))
@@ -329,9 +319,6 @@ class JobManager:
                         "status": "failed",
                         "updated_at": datetime.now(timezone.utc).isoformat()
                     }).eq("id", project_id).execute()
-
-                    with open(recovery_path, "a", encoding="utf-8") as f:
-                        f.write(f"- Job `{job['id']}` for Project `{project_id}`: Failed (exceeded 3 retries).\n")
 
         except Exception as e:
             logger.error("[RECOVERY] Error during startup background recovery: %s", e)

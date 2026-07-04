@@ -152,7 +152,9 @@ export default function ProjectDetailPage() {
     }
     
     const baseUrl = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000';
-    const streamUrl = `${baseUrl.replace(/\/$/, '')}/api/v1/platform/projects/${projectId}/progress-stream`;
+    // Strip any trailing /api/v1 suffix the env var might already contain, then re-append
+    const cleanBase = baseUrl.replace(/\/api\/v1\/?$/, '').replace(/\/$/, '');
+    const streamUrl = `${cleanBase}/api/v1/platform/projects/${projectId}/progress-stream`;
     
     const eventSource = new EventSource(streamUrl);
     
