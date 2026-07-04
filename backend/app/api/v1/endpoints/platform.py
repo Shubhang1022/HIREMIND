@@ -1566,7 +1566,14 @@ async def upload_file(
                 # Register persistent background job recovery tracking (Phase 1 & 2)
                 from app.services.job_manager import JobManager
                 job_manager = JobManager.get_instance()
-                await job_manager.register_job(project_id, user_id, "indexing")
+                job_id = await job_manager.register_job(project_id, user_id, "indexing")
+                if not job_id:
+                    import logging as _logging
+                    _logging.getLogger(__name__).warning(
+                        "[UPLOAD] background_jobs DB insert returned no job_id for project %s. "
+                        "Embedding will still run; progress tracked in-memory only.",
+                        project_id,
+                    )
 
                 background_tasks.add_task(process_project_data_task, project_id)
             finally:

@@ -56,8 +56,13 @@ class JobManager:
         allowed = VALID_TRANSITIONS.get(current_status, set())
         return target_status in allowed
 
-    async def register_job(self, project_id: str, user_id: str, job_type: str) -> str:
-        """Register a new job in Supabase background_jobs table."""
+    async def register_job(self, project_id: str, user_id: str, job_type: str) -> Optional[str]:
+        """Register a new job in Supabase background_jobs table.
+
+        Returns the job_id string on success, or None if the DB insert failed.
+        In either case the in-memory progress cache is always populated so the
+        background worker can still update progress without a DB record.
+        """
         now_str = datetime.now(timezone.utc).isoformat()
         job_data = {
             "project_id": project_id,
@@ -70,17 +75,40 @@ class JobManager:
             "last_heartbeat": now_str,
             "retry_count": 0,
             "status": "queued",
-            "failure_reason": None
+            "failure_reason": None,
         }
-        
-        # Clear cancellation token just in case
+
+        # Clear any stale cancellation token for this project
         if project_id in self._cancellation_tokens:
             self._cancellation_tokens.remove(project_id)
-            
-        res = supabase_client.table("background_jobs").insert(job_data).execute()
-        job_id = res.data[0]["id"] if res.data else None
-        
-        # Cache locally for real-time APIs
+
+        job_id: Optional[str] = None
+        try:
+            res = supabase_client.table("background_jobs").insert(job_data).execute()
+            job_id = res.data[0]["id"] if res.data else None
+            if job_id is None:
+                logger.warning(
+                    "[JOB_MANAGER] background_jobs insert returned empty data for project %s. "
+                    "Check that the 'user_id' column exists on the live table "
+                    "(run supabase/migrations/002_background_jobs_user_id.sql if missing). "
+                    "In-memory tracking will still work.",
+                    project_id,
+                )
+        except Exception as exc:
+            logger.error(
+                "[JOB_MANAGER] Failed to insert background_jobs row for project %s: %s. "
+                "Common cause: 'user_id' column missing from live table. "
+                "Run supabase/migrations/002_background_jobs_user_id.sql to fix. "
+                "In-memory tracking will still work for this session.",
+                project_id,
+                exc,
+            )
+            # Do NOT re-raise — the background task must still be allowed to start.
+            # Progress updates will use the in-memory cache only for this session.
+
+        # Always populate the in-memory cache regardless of DB outcome.
+        # This ensures progress-stream and worker-status endpoints keep working
+        # even if the DB insert failed.
         self._progress_cache[project_id] = {
             "job_id": job_id,
             "project_id": project_id,
@@ -97,10 +125,16 @@ class JobManager:
             "total_candidates": 0,
             "ram_usage": 0.0,
             "peak_ram": 0.0,
-            "eta": "00:00:00"
+            "eta": "00:00:00",
         }
-        
-        logger.info("Registered background job %s for project %s", job_id, project_id)
+
+        if job_id:
+            logger.info("Registered background job %s for project %s", job_id, project_id)
+        else:
+            logger.warning(
+                "Background job for project %s has no DB record — running in memory-only mode.",
+                project_id,
+            )
         return job_id
 
     async def update_job_progress(
