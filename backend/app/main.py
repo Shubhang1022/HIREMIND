@@ -6,6 +6,7 @@ import os
 import sys
 import time
 import gc
+import threading
 from contextlib import asynccontextmanager
 from datetime import datetime
 
@@ -226,134 +227,148 @@ GC Stats: {gc_stats}
 
 
 def verify_ai_dependencies():
+    """Legacy dependency check — kept for backward compatibility.
+    The authoritative startup check is run_startup_check() in lifespan.
+    """
     import traceback
     import importlib.util
-    import sys
-    import os
-    import psutil
-    
-    # Print start verification
-    print("\n--- Verifying AI Dependencies ---", flush=True)
-    logger.info("--- Verifying AI Dependencies ---")
-    
+
     failed = []
-    
-    # 1. FAISS loading (Must do actual import validation, log traceback on error)
-    faiss_ok = False
-    try:
-        import faiss
-        print("✓ FAISS Loaded", flush=True)
-        logger.info("✓ FAISS Loaded")
-        faiss_ok = True
-    except Exception as e:
-        tb = traceback.format_exc()
-        failed.append(("faiss", tb))
-        print("✗ FAISS Failed to load", flush=True)
-        print(tb, flush=True)
-        logger.error("FAISS Failed to load:\n%s", tb)
 
-    # 2. numpy loading
-    numpy_ok = False
+    # FAISS
     try:
-        import numpy
-        numpy_ok = True
+        import faiss  # noqa: F401
     except Exception as e:
-        tb = traceback.format_exc()
-        failed.append(("numpy", tb))
-        print("✗ numpy Failed to load", flush=True)
-        print(tb, flush=True)
-        logger.error("numpy Failed to load:\n%s", tb)
+        failed.append(("faiss", traceback.format_exc()))
+        logger.error("FAISS Failed to load:\n%s", traceback.format_exc())
 
-    # 3. Torch (Lightweight path check to prevent heavy imports and CUDA memory allocation)
-    torch_ok = False
+    # numpy
     try:
-        if importlib.util.find_spec("torch") is not None:
-            print("✓ Torch Verified (Installed)", flush=True)
-            logger.info("✓ Torch Verified (Installed)")
-            torch_ok = True
-        else:
-            print("✗ Torch not found in environment", flush=True)
-            failed.append(("torch", "Torch package is missing in environment"))
+        import numpy  # noqa: F401
     except Exception as e:
-        tb = traceback.format_exc()
-        failed.append(("torch", tb))
-        print("✗ Torch verification failed", flush=True)
-        print(tb, flush=True)
-
-    # 4. Transformers (Lightweight check to prevent loading tokenizer/model modules)
-    transformers_ok = False
-    try:
-        if importlib.util.find_spec("transformers") is not None:
-            print("✓ Transformers Verified (Installed)", flush=True)
-            logger.info("✓ Transformers Verified (Installed)")
-            transformers_ok = True
-        else:
-            print("✗ Transformers not found in environment", flush=True)
-            failed.append(("transformers", "Transformers package is missing in environment"))
-    except Exception as e:
-        tb = traceback.format_exc()
-        failed.append(("transformers", tb))
-        print("✗ Transformers verification failed", flush=True)
-        print(tb, flush=True)
-
-    # 5. Sentence Transformers (Lightweight check to prevent model instantiations/weights loading)
-    st_ok = False
-    try:
-        if importlib.util.find_spec("sentence_transformers") is not None:
-            print("✓ SentenceTransformer Verified (Installed)", flush=True)
-            logger.info("✓ SentenceTransformer Verified (Installed)")
-            st_ok = True
-        else:
-            print("✗ SentenceTransformer not found in environment", flush=True)
-            failed.append(("sentence_transformers", "SentenceTransformer package is missing in environment"))
-    except Exception as e:
-        tb = traceback.format_exc()
-        failed.append(("sentence_transformers", tb))
-        print("✗ SentenceTransformer verification failed", flush=True)
-        print(tb, flush=True)
+        failed.append(("numpy", traceback.format_exc()))
 
     if settings.openrouter_api_key:
-        print("✓ OpenRouter Ready", flush=True)
-        logger.info("✓ OpenRouter Ready")
+        logger.info("✓ OpenRouter key present")
     else:
-        print("⚠ OpenRouter key is missing", flush=True)
+        logger.warning("⚠ OpenRouter key is missing — LLM scoring will use fallback")
 
-    # 6. Structured Diagnostics Logging (Rather than sys.exit(1), log status report & proceed)
-    art_dir = "C:\\Users\\HP\\.gemini\\antigravity-ide\\brain\\b099a49a-5f3b-44e9-8f48-c198d6c4ebba"
-    report_path = os.path.join(art_dir, "DependencyHealthReport.md")
-    
-    try:
-        os.makedirs(art_dir, exist_ok=True)
-        with open(report_path, "w", encoding="utf-8") as f:
-            f.write("# Dependency Health Report\n\n")
-            if failed:
-                f.write("## Status: WARNINGS/DIAGNOSTICS\n\n")
-                f.write("Some AI package checks reported issues or were not fully locatable:\n\n")
-                for pkg, tb in failed:
-                    f.write(f"### package: `{pkg}`\n")
-                    f.write(f"```\n{tb}\n```\n")
-            else:
-                f.write("## Status: PASSED\n\n")
-                f.write("All critical AI dependencies verified successfully.\n\n")
-                f.write("* [x] `faiss`: Verified\n")
-                f.write("* [x] `torch`: Verified\n")
-                f.write("* [x] `transformers`: Verified\n")
-                f.write("* [x] `sentence_transformers`: Verified\n")
-    except Exception as exc:
-        logger.error("Failed to write DependencyHealthReport.md: %s", exc)
-
-    # Log diagnostics summary
-    process = psutil.Process(os.getpid())
-    mem_mb = process.memory_info().rss / (1024 * 1024)
-    print(f"Startup RAM Usage: {mem_mb:.2f} MB", flush=True)
-    logger.info("Startup RAM Usage: %.2f MB", mem_mb)
-    
     if failed:
-        logger.warning("[STARTUP_DIAGNOSTICS] AI dependency issues detected. Continuing boot in diagnostics mode.")
-        print("[STARTUP_DIAGNOSTICS] AI dependency issues detected. Continuing boot in diagnostics mode.", flush=True)
+        logger.warning("[STARTUP_DIAGNOSTICS] AI dependency issues: %s",
+                       [f[0] for f in failed])
     else:
-        logger.info("[STARTUP_DIAGNOSTICS] Dependency check passed. Continuing boot.")
-        print("[STARTUP_DIAGNOSTICS] Dependency check passed. Continuing boot.", flush=True)
+        logger.info("[STARTUP_DIAGNOSTICS] Dependency check passed.")
+
+
+def run_startup_check() -> bool:
+    """
+    Verify all critical subsystems before accepting traffic.
+
+    Prints a STARTUP CHECK table to stdout.
+    Returns True if all checks passed, False if any critical check failed.
+    Never raises — always returns.
+    """
+    import traceback
+    import importlib.util
+
+    checks: list[tuple[str, bool, str]] = []   # (label, passed, detail)
+
+    # ── Imports ───────────────────────────────────────────────────────────────
+    for pkg in ("fastapi", "pydantic", "supabase", "sentence_transformers", "numpy"):
+        try:
+            importlib.import_module(pkg)
+            checks.append((f"Import:{pkg}", True, ""))
+        except Exception:
+            checks.append((f"Import:{pkg}", False, traceback.format_exc()[-120:]))
+
+    # ── model_service import ──────────────────────────────────────────────────
+    try:
+        import importlib as _il
+        _il.import_module("app.services.model_service")
+        checks.append(("Model Service", True, ""))
+    except Exception:
+        checks.append(("Model Service", False, traceback.format_exc()[-200:]))
+
+    # ── FAISS ─────────────────────────────────────────────────────────────────
+    try:
+        import faiss  # noqa: F401
+        checks.append(("FAISS", True, ""))
+    except Exception:
+        checks.append(("FAISS", False, traceback.format_exc()[-120:]))
+
+    # ── Supabase DB ───────────────────────────────────────────────────────────
+    try:
+        from app.api.v1.endpoints.platform import supabase_client as _sc
+        _sc.table("projects").select("id").limit(1).execute()
+        checks.append(("Supabase DB", True, ""))
+    except Exception:
+        checks.append(("Supabase DB", False, str(sys.exc_info()[1])[:80]))
+
+    # ── background_jobs table ─────────────────────────────────────────────────
+    try:
+        from app.api.v1.endpoints.platform import supabase_client as _sc2
+        _sc2.table("background_jobs").select("id").limit(1).execute()
+        checks.append(("background_jobs table", True, ""))
+    except Exception:
+        checks.append(("background_jobs table", False, str(sys.exc_info()[1])[:80]))
+
+    # ── projects table ────────────────────────────────────────────────────────
+    try:
+        from app.api.v1.endpoints.platform import supabase_client as _sc3
+        _sc3.table("projects").select("id").limit(1).execute()
+        checks.append(("projects table", True, ""))
+    except Exception:
+        checks.append(("projects table", False, str(sys.exc_info()[1])[:80]))
+
+    # ── Storage ───────────────────────────────────────────────────────────────
+    try:
+        from app.services.storage_provider import StorageService
+        StorageService.file_exists("candidate-files", "_startup_probe")
+        checks.append(("Storage", True, ""))
+    except Exception:
+        checks.append(("Storage", False, str(sys.exc_info()[1])[:80]))
+
+    # ── OpenRouter key present ────────────────────────────────────────────────
+    openrouter_ok = bool(settings.openrouter_api_key)
+    checks.append(("OpenRouter key", openrouter_ok, "" if openrouter_ok else "OPENROUTER_API_KEY not set — LLM scoring disabled"))
+
+    # ── Print table ───────────────────────────────────────────────────────────
+    all_critical_pass = all(ok for label, ok, _ in checks
+                            if label not in ("OpenRouter key",))   # OpenRouter is non-fatal
+
+    width = 60
+    sep = "─" * width
+    lines = [
+        "",
+        "┌" + sep + "┐",
+        "│  STARTUP CHECK" + " " * (width - 15) + "│",
+        "├" + sep + "┤",
+    ]
+    for label, ok, detail in checks:
+        mark = "✓" if ok else "✗"
+        status_str = "PASS" if ok else "FAIL"
+        row = f"│  {mark} {label:<28} {status_str}"
+        row = row + " " * (width - len(row) + 1) + "│"
+        lines.append(row)
+        if not ok and detail:
+            truncated = detail[:width - 6]
+            lines.append(f"│    ↳ {truncated:<{width-6}}│")
+
+    lines += [
+        "├" + sep + "┤",
+        f"│  Ready = {'TRUE' if all_critical_pass else 'FALSE'}" + " " * (width - 14) + "│",
+        "└" + sep + "┘",
+        "",
+    ]
+    report = "\n".join(lines)
+    print(report, flush=True)
+    logger.info("[STARTUP_CHECK] all_critical_pass=%s checks=%d",
+                all_critical_pass, len(checks))
+    for label, ok, detail in checks:
+        if not ok:
+            logger.error("[STARTUP_CHECK_FAIL] %s — %s", label, detail)
+
+    return all_critical_pass
 
 
 @asynccontextmanager
@@ -361,11 +376,15 @@ async def lifespan(app: FastAPI):
     # ── Step 1: Validate required environment variables ──────────────────────
     missing_vars = validate_required_env()
     log_startup_summary(missing_vars)
-    # Warn loudly but do not sys.exit — Render will still get a 200 health check
-    # so operators can see the error in logs rather than getting a crash loop.
 
-    # ── Step 2: Verify AI dependencies ───────────────────────────────────────
-    verify_ai_dependencies()
+    # ── Step 2: Full STARTUP CHECK (subsystem verification table) ────────────
+    startup_ok = run_startup_check()
+    if not startup_ok:
+        logger.error(
+            "[STARTUP_FAILED] One or more critical subsystem checks failed. "
+            "The service will start but may not function correctly. "
+            "Fix the issues above and redeploy."
+        )
 
     # ── Step 3: Deployment diagnostics ───────────────────────────────────────
     log_deployment_diagnostics("STARTUP")
@@ -414,11 +433,46 @@ async def lifespan(app: FastAPI):
 
     try:
         from app.api.v1.endpoints.platform import run_startup_initialization, preload_model_singleton
+        # model_service was already validated in run_startup_check(); no need to re-import.
         # Kick off non-blocking model preload in background thread immediately.
-        # This ensures the model is ready (or being fetched) before the first
-        # candidate upload arrives, avoiding any inline download in a worker thread.
         preload_model_singleton()
         await run_startup_initialization()
+
+        # ── Task 8: MODEL SERVICE DIAGNOSTICS block ───────────────────────────
+        # Wait up to 2 seconds for the preload thread to get past its first check
+        # (either cache-hit fast path or has-started-downloading state).
+        await asyncio.sleep(0.1)
+
+        try:
+            from app.services import model_service as _ms_mod
+            _ms_loaded   = _ms_mod.is_loaded()
+            _ms_name     = _ms_mod.get_model_name() or settings.embedding_model
+            _ms_state    = _ms_mod.get_load_state()
+            _ms_err      = _ms_mod.get_load_error()
+            _ms_rss      = psutil.Process(os.getpid()).memory_info().rss / (1024 * 1024)
+            _ms_threads  = threading.active_count()
+            _ms_import   = "OK"
+        except Exception as _diag_exc:
+            _ms_loaded = False; _ms_name = "unknown"; _ms_state = "error"
+            _ms_err = _diag_exc; _ms_rss = 0.0; _ms_threads = 0
+            _ms_import = f"FAILED: {_diag_exc}"
+
+        _diag_block = f"""
+============================== MODEL SERVICE DIAGNOSTICS ==============================
+  Import OK         : {_ms_import}
+  Singleton Created : {"YES" if _ms_loaded else "NOT YET (loading in background)"}
+  Model Name        : {_ms_name}
+  Load State        : {_ms_state}
+  Load Error        : {_ms_err or "None"}
+  Model Ready       : {_ms_loaded}
+  Current RAM       : {_ms_rss:.1f} MB
+  Thread Count      : {_ms_threads}
+==============================
+"""
+        print(_diag_block, flush=True)
+        logger.info("[MODEL_SERVICE_DIAGNOSTICS] import=%s state=%s loaded=%s name=%s ram=%.1fMB threads=%d",
+                    _ms_import, _ms_state, _ms_loaded, _ms_name, _ms_rss, _ms_threads)
+
     except Exception as exc:
         logger.warning("Startup lifespan platform initialization error: %s", exc)
 
@@ -691,7 +745,8 @@ async def detailed_health():
     from app.services import model_service as _ms
     model_loaded = _ms.is_loaded()
     model_name = _ms.get_model_name() or settings.embedding_model
-    model_state = _ms._load_state  # type: ignore[attr-defined]
+    model_state = _ms.get_load_state()
+    model_error = str(_ms.get_load_error()) if _ms.get_load_error() else None
 
     # ── 5. FAISS availability ─────────────────────────────────────────────────
     faiss_available = False
@@ -716,6 +771,7 @@ async def detailed_health():
     # ── 7. Background jobs ────────────────────────────────────────────────────
     active_jobs: list[dict] = []
     failed_recent = 0
+    recovering_jobs = 0
     try:
         from app.services.job_manager import JobManager
         from app.api.v1.endpoints.platform import supabase_client as _sc
@@ -731,6 +787,8 @@ async def detailed_health():
             })
         _fjobs = _sc.table("background_jobs").select("id").eq("status", "failed").execute()
         failed_recent = len(_fjobs.data) if _fjobs.data else 0
+        _rjobs = _sc.table("background_jobs").select("id").eq("status", "retrying").execute()
+        recovering_jobs = len(_rjobs.data) if _rjobs.data else 0
     except Exception:
         pass
 
@@ -758,14 +816,16 @@ async def detailed_health():
         "uptime_seconds": round(_time.time() - _startup_time, 1),
         "database": {"status": db_status, "error": db_error},
         "storage": {"status": storage_status, "error": storage_error},
-        "openrouter": {"status": openrouter_status},
+        "openrouter": {"status": openrouter_status, "ready": openrouter_status == "configured"},
         "model": {
             "loaded": model_loaded,
+            "model_state": model_state,
+            "cached": model_loaded,
             "name": model_name,
-            "load_state": model_state,
+            "error": model_error,
             "configured_model": settings.embedding_model,
         },
-        "faiss": {"available": faiss_available},
+        "faiss": {"available": faiss_available, "faiss_loaded": faiss_available},
         "memory": {
             "rss_mb": round(rss_mb, 1),
             "available_mb": round(avail_mb, 1),
@@ -777,7 +837,12 @@ async def detailed_health():
         "background_jobs": {
             "active": active_jobs,
             "active_count": len(active_jobs),
-            "failed_total": failed_recent,
+            "failed_jobs": failed_recent,
+            "recovering_jobs": recovering_jobs,
         },
         "ranking_cache_size": cache_size,
+        "supabase_ready": db_status == "healthy",
+        "storage_ready": storage_status == "healthy",
+        "openrouter_ready": openrouter_status == "configured",
+        "model_loaded": model_loaded,
     }

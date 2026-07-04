@@ -50,11 +50,22 @@ class JobManager:
         return cls._instance
 
     def validate_transition(self, current_status: str, target_status: str) -> bool:
-        """Validate status transition constraints."""
+        """Validate status transition constraints.
+
+        Returns True if the transition is allowed.
+        Same-to-same is always allowed (idempotent, no log noise).
+        Backward transitions are always rejected.
+        """
         if current_status == target_status:
-            return True
+            return True  # idempotent — no error log
         allowed = VALID_TRANSITIONS.get(current_status, set())
-        return target_status in allowed
+        valid = target_status in allowed
+        if not valid:
+            logger.warning(
+                "[FSM] Rejected illegal transition %s → %s for project (call ignored)",
+                current_status, target_status,
+            )
+        return valid
 
     async def register_job(self, project_id: str, user_id: str, job_type: str) -> Optional[str]:
         """Register a new job in Supabase background_jobs table.

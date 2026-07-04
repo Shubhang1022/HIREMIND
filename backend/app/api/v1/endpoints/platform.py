@@ -102,9 +102,9 @@ def parse_jd_backup(text: str) -> dict:
     
     # Seniority
     seniority = "Mid"
-    if "senior" in text_lower or "lead" in text_lower or "sr\." in text_lower:
+    if "senior" in text_lower or "lead" in text_lower or "sr." in text_lower:
         seniority = "Senior"
-    elif "junior" in text_lower or "jr\." in text_lower or "entry" in text_lower:
+    elif "junior" in text_lower or "jr." in text_lower or "entry" in text_lower:
         seniority = "Junior"
     result["seniority"] = seniority
     
@@ -738,6 +738,56 @@ def process_project_data_task(project_id: str):
 
     peak_ram = mem_start
 
+    # ── Stage ordering for checkpoint skip logic ──────────────────────────
+    _STAGE_ORDER = [
+        "stream_candidates",
+        "upload_indexes",
+        "load_model",
+        "generate_embeddings",
+        "write_npy",
+        "build_faiss",
+        "upload_artifacts",
+        "validate_artifacts",
+        "mark_completed",
+    ]
+
+    def _stage_already_done(last_completed: str, stage: str) -> bool:
+        """Return True if stage was already completed in a prior attempt."""
+        if not last_completed:
+            return False
+        try:
+            return _STAGE_ORDER.index(last_completed) >= _STAGE_ORDER.index(stage)
+        except ValueError:
+            return False
+
+    def _save_checkpoint(stage: str) -> None:
+        """Persist last_completed_stage to background_jobs table."""
+        try:
+            supabase_client.table("background_jobs").update({
+                "current_stage": f"checkpoint:{stage}",
+                "last_heartbeat": datetime.now(timezone.utc).isoformat(),
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            }).eq("project_id", project_id).not_.in_("status", ["completed", "failed", "cancelled"]).execute()
+            logger.info("[CHECKPOINT] project=%s stage=%s saved", project_id, stage)
+        except Exception as exc:
+            logger.warning("[CHECKPOINT] project=%s stage=%s save failed: %s", project_id, stage, exc)
+
+    def _load_checkpoint() -> str:
+        """Read last_completed_stage from background_jobs. Returns '' if none."""
+        try:
+            res = supabase_client.table("background_jobs").select("current_stage").eq(
+                "project_id", project_id
+            ).order("started_at", desc=True).limit(1).execute()
+            if res.data:
+                cs = res.data[0].get("current_stage") or ""
+                if cs.startswith("checkpoint:"):
+                    stage = cs[len("checkpoint:"):]
+                    logger.info("[CHECKPOINT] project=%s resuming after stage=%s", project_id, stage)
+                    return stage
+        except Exception:
+            pass
+        return ""
+
     def log_worker_heartbeat(stage: str, processed: int, total: int, batch_num: int):
         elapsed_sec = int(time.time() - t_start)
         elapsed_str = f"{elapsed_sec // 3600:02d}:{(elapsed_sec % 3600) // 60:02d}:{elapsed_sec % 60:02d}"
@@ -769,7 +819,7 @@ Elapsed: {elapsed_str}
 
     max_retries = 3
     temp_dir = None
-    
+
     try:
         for attempt in range(1, max_retries + 1):
             try:
@@ -782,8 +832,23 @@ Elapsed: {elapsed_str}
                     logger.info("Background indexing cancelled for project %s", project_id)
                     return
 
-                _sync_update_progress(project_id, "Starting Indexing", 5, status="processing", retry_count=attempt - 1)
-                
+                # ── Load checkpoint: find last successfully completed stage ──
+                last_done = _load_checkpoint()
+                if last_done:
+                    logger.info(
+                        "[RETRY] project=%s attempt=%d resuming from after stage=%s — skipping earlier stages",
+                        project_id, attempt, last_done,
+                    )
+
+                # ── Status transition: never go backwards ──────────────────
+                # On attempt 1: queued→processing.
+                # On retry: stay in embedding/indexing (don't regress to processing).
+                _jm_cache = job_manager.get_job_status(project_id)
+                _current_job_status = _jm_cache.get("status", "queued") if _jm_cache else "queued"
+                _target_status = "processing" if _current_job_status in ("queued", "retrying") else _current_job_status
+                _sync_update_progress(project_id, "Starting Indexing", 5,
+                                      status=_target_status, retry_count=attempt - 1)
+
                 supabase_client.table("projects").update({
                     "embedding_status": "processing",
                     "status": "INDEXING",
@@ -796,35 +861,39 @@ Elapsed: {elapsed_str}
                     return
                 p = proj_res.data[0]
                 version = p.get("version") or 1
-                
+
                 current_path = p.get("current_candidate_path")
                 if not current_path:
                     raise FileNotFoundError("No candidate upload path found in project")
-                    
+
                 bucket, path = current_path.split("/", 1)
-                
+
                 from app.services.storage_provider import StorageService
                 from src.features.structured import _classify_specialization_with_confidence, classify_candidate_role_category, HARD_DISQUALIFIER_TITLES
                 from src.scoring.quality import calculate_candidate_quality_score
-                
-                # Create temp directory for streaming operations
+
+                # ── STAGE: stream_candidates ───────────────────────────────
+                # Always re-stream: the enriched temp file is needed downstream.
+                # (Even on retry we must rebuild role_files / skill_index /
+                #  candidate_ids from the stored JSONL — they aren't persisted
+                #  to disk across attempts.)
                 temp_dir = tempfile.mkdtemp(prefix=f"index_job_{project_id}_")
-                
+
                 role_files = {}
                 enriched_jsonl_path = Path(temp_dir) / "enriched_candidates.jsonl"
-                
+
                 candidate_ids = []
                 skill_index = {}
                 total_candidates = 0
                 last_heartbeat = time.time()
 
-                # Check for cancellation before candidate streaming
                 if job_manager.is_cancelled(project_id):
                     _sync_update_progress(project_id, "Cancelled", 0, status="cancelled")
                     job_manager.clear_cancellation(project_id)
                     return
 
-                _sync_update_progress(project_id, "Streaming Candidates", 10, status="processing", retry_count=attempt - 1)
+                _sync_update_progress(project_id, "Streaming Candidates", 10,
+                                      status="processing", retry_count=attempt - 1)
 
                 with open(enriched_jsonl_path, "w", encoding="utf-8") as f_enriched:
                     for idx, c_raw in enumerate(StorageService.stream_jsonl(bucket, path)):
@@ -889,15 +958,14 @@ Elapsed: {elapsed_str}
                 for f in role_files.values():
                     f.close()
 
-                # Check for cancellation before embedding generation
                 if job_manager.is_cancelled(project_id):
                     _sync_update_progress(project_id, "Cancelled", 0, status="cancelled")
                     job_manager.clear_cancellation(project_id)
                     return
 
-                _sync_update_progress(project_id, "Generating Embeddings", 20, status="embedding", retry_count=attempt - 1)
+                _sync_update_progress(project_id, "Generating Embeddings", 20,
+                                      status="embedding", retry_count=attempt - 1)
 
-                # Transition status to stream parsed (Phase 4)
                 supabase_client.table("projects").update({
                     "status": "stream parsed",
                     "updated_at": _now()
@@ -905,75 +973,104 @@ Elapsed: {elapsed_str}
 
                 logger.info("Enriched %d candidates. Starting index uploads.", total_candidates)
 
-                # ── STAGE: Upload role / skill / ids indexes ───────────────
-                t_stage = time.time()
-                logger.info("[STAGE_START] project=%s stage=upload_indexes candidates=%d", project_id, total_candidates)
-                try:
-                    for cat in role_files.keys():
-                        cat_path = Path(temp_dir) / f"role_{cat.upper()}.jsonl"
-                        content = cat_path.read_bytes()
-                        StorageService.upload_file("role-indexes", f"{project_id}/role_{cat.upper()}_v{version}.jsonl", content)
-                        logger.info("[STAGE_PROGRESS] project=%s stage=upload_indexes uploaded role-%s", project_id, cat)
+                # ── STAGE: upload_indexes ──────────────────────────────────
+                if _stage_already_done(last_done, "upload_indexes"):
+                    logger.info("[SKIP] project=%s stage=upload_indexes already completed in prior attempt", project_id)
+                    # Rebuild role_files keys from storage for downstream reference
+                    # (we still need to know which categories exist)
+                else:
+                    t_stage = time.time()
+                    logger.info("[STAGE_START] project=%s stage=upload_indexes candidates=%d", project_id, total_candidates)
+                    try:
+                        for cat in role_files.keys():
+                            cat_path = Path(temp_dir) / f"role_{cat.upper()}.jsonl"
+                            content = cat_path.read_bytes()
+                            StorageService.upload_file("role-indexes", f"{project_id}/role_{cat.upper()}_v{version}.jsonl", content)
+                            logger.info("[STAGE_PROGRESS] project=%s stage=upload_indexes uploaded role-%s", project_id, cat)
 
-                    skill_content = json.dumps(skill_index, ensure_ascii=False)
-                    StorageService.upload_file("skill-indexes", f"{project_id}/skill_index_v{version}.json", skill_content.encode("utf-8"))
-                    logger.info("[STAGE_PROGRESS] project=%s stage=upload_indexes uploaded skill_index", project_id)
+                        skill_content = json.dumps(skill_index, ensure_ascii=False)
+                        StorageService.upload_file("skill-indexes", f"{project_id}/skill_index_v{version}.json", skill_content.encode("utf-8"))
+                        logger.info("[STAGE_PROGRESS] project=%s stage=upload_indexes uploaded skill_index", project_id)
 
-                    ids_content = json.dumps(candidate_ids, ensure_ascii=False)
-                    StorageService.upload_file("embeddings", f"{project_id}/ids_v{version}.json", ids_content.encode("utf-8"))
-                    logger.info("[STAGE_PROGRESS] project=%s stage=upload_indexes uploaded ids_v%d.json", project_id, version)
-                except Exception as stage_exc:
-                    logger.exception("[STAGE_FAIL] project=%s stage=upload_indexes elapsed=%.2fs error=%s",
-                                     project_id, time.time() - t_stage, stage_exc)
-                    raise
+                        ids_content = json.dumps(candidate_ids, ensure_ascii=False)
+                        StorageService.upload_file("embeddings", f"{project_id}/ids_v{version}.json", ids_content.encode("utf-8"))
+                        logger.info("[STAGE_PROGRESS] project=%s stage=upload_indexes uploaded ids_v%d.json", project_id, version)
+                    except Exception as stage_exc:
+                        logger.exception("[STAGE_FAIL] project=%s stage=upload_indexes elapsed=%.2fs error=%s",
+                                         project_id, time.time() - t_stage, stage_exc)
+                        raise
 
-                logger.info("[STAGE_END] project=%s stage=upload_indexes elapsed=%.2fs ram=%.1fMB",
-                            project_id, time.time() - t_stage, get_memory_mb())
+                    logger.info("[STAGE_END] project=%s stage=upload_indexes elapsed=%.2fs ram=%.1fMB",
+                                project_id, time.time() - t_stage, get_memory_mb())
+
+                    # ── Verify upload_indexes artifacts exist before checkpointing ──
+                    _ui_missing = []
+                    for _cat in role_files.keys():
+                        _k = f"{project_id}/role_{_cat.upper()}_v{version}.jsonl"
+                        if not StorageService.file_exists("role-indexes", _k):
+                            _ui_missing.append(f"role-indexes/{_k}")
+                    for _bkt, _key in [
+                        ("skill-indexes", f"{project_id}/skill_index_v{version}.json"),
+                        ("embeddings",    f"{project_id}/ids_v{version}.json"),
+                    ]:
+                        if not StorageService.file_exists(_bkt, _key):
+                            _ui_missing.append(f"{_bkt}/{_key}")
+                    if _ui_missing:
+                        raise FileNotFoundError(
+                            f"[STAGE_VERIFY] upload_indexes artifacts missing: {_ui_missing}"
+                        )
+                    logger.info("[STAGE_VERIFY] project=%s stage=upload_indexes all artifacts confirmed", project_id)
+                    _save_checkpoint("upload_indexes")
 
                 # ── STAGE: Load embedding model ────────────────────────────
-                t_stage = time.time()
-                logger.info("[STAGE_START] project=%s stage=load_model model=%s ram=%.1fMB",
-                            project_id, settings.embedding_model, get_memory_mb())
-                try:
+                if _stage_already_done(last_done, "load_model"):
+                    logger.info("[SKIP] project=%s stage=load_model already completed in prior attempt — loading encoder from singleton", project_id)
                     from src.features.text_builder import build_candidate_text
-                    from app.services.model_service import is_loaded, ModelLoadTimeout, ModelLoadFailed
-                    if is_loaded():
-                        logger.info("[MODEL_SERVICE] [MODEL_CACHE_HIT] model already loaded — skipping download")
-                    else:
-                        logger.info("[MODEL_SERVICE] [MODEL_CACHE_MISS] model not yet loaded — waiting for preload")
-                    encoder = _get_encoder()  # singleton: never downloads inside this thread
-                    logger.info("[STAGE_END] project=%s stage=load_model elapsed=%.2fs ram=%.1fMB dim=%s",
-                                project_id, time.time() - t_stage, get_memory_mb(),
-                                getattr(encoder, 'embedding_dim', 'unknown'))
-                except Exception as stage_exc:
-                    logger.exception(
-                        "[STAGE_FAIL] project=%s stage=load_model elapsed=%.2fs ram=%.1fMB "
-                        "error=%s",
-                        project_id, time.time() - t_stage, get_memory_mb(), stage_exc)
-                    # Tag the failure reason so recovery loop does NOT retry
-                    from app.services.model_service import ModelLoadTimeout, ModelLoadFailed
-                    if isinstance(stage_exc, (ModelLoadTimeout, ModelLoadFailed)):
-                        _sync_fail_job(project_id, f"MODEL_LOAD_FAILED: {stage_exc}")
-                        supabase_client.table("projects").update({
-                            "embedding_status": "failed",
-                            "status": "FAILED",
-                            "upload_statistics": {"failure_reason": f"MODEL_LOAD_FAILED: {stage_exc}"},
-                            "updated_at": _now(),
-                        }).eq("id", project_id).execute()
-                        # Update in-memory cache so SSE sees terminal state immediately
-                        from app.services.job_manager import JobManager as _JM
-                        _c = _JM.get_instance()._progress_cache.get(project_id)
-                        if _c:
-                            _c["status"] = "failed"
-                            _c["current_stage"] = f"MODEL_LOAD_FAILED: {str(stage_exc)[:100]}"
-                        return  # do NOT continue to retry loop for model-load errors
-                    raise
+                    from app.services.model_service import is_loaded as _ms_is_loaded
+                    encoder = _get_encoder()
+                else:
+                    t_stage = time.time()
+                    logger.info("[STAGE_START] project=%s stage=load_model model=%s ram=%.1fMB",
+                                project_id, settings.embedding_model, get_memory_mb())
+                    try:
+                        from src.features.text_builder import build_candidate_text
+                        from app.services.model_service import is_loaded, ModelLoadTimeout, ModelLoadFailed
+                        if is_loaded():
+                            logger.info("[MODEL_SERVICE] [MODEL_CACHE_HIT] model already loaded — skipping download")
+                        else:
+                            logger.info("[MODEL_SERVICE] [MODEL_CACHE_MISS] model not yet loaded — waiting for preload")
+                        encoder = _get_encoder()  # singleton: never downloads inside this thread
+                        logger.info("[STAGE_END] project=%s stage=load_model elapsed=%.2fs ram=%.1fMB dim=%s",
+                                    project_id, time.time() - t_stage, get_memory_mb(),
+                                    getattr(encoder, 'embedding_dim', 'unknown'))
+                        _save_checkpoint("load_model")
+                    except Exception as stage_exc:
+                        logger.exception(
+                            "[STAGE_FAIL] project=%s stage=load_model elapsed=%.2fs ram=%.1fMB "
+                            "error=%s",
+                            project_id, time.time() - t_stage, get_memory_mb(), stage_exc)
+                        from app.services.model_service import ModelLoadTimeout, ModelLoadFailed
+                        if isinstance(stage_exc, (ModelLoadTimeout, ModelLoadFailed)):
+                            _sync_fail_job(project_id, f"MODEL_LOAD_FAILED: {stage_exc}")
+                            supabase_client.table("projects").update({
+                                "embedding_status": "failed",
+                                "status": "FAILED",
+                                "upload_statistics": {"failure_reason": f"MODEL_LOAD_FAILED: {stage_exc}"},
+                                "updated_at": _now(),
+                            }).eq("id", project_id).execute()
+                            from app.services.job_manager import JobManager as _JM
+                            _c = _JM.get_instance()._progress_cache.get(project_id)
+                            if _c:
+                                _c["status"] = "failed"
+                                _c["current_stage"] = f"MODEL_LOAD_FAILED: {str(stage_exc)[:100]}"
+                            return  # do NOT retry model-load failures
+                        raise
 
-                elapsed_model = time.time() - t_stage
-                if elapsed_model > 60.0:
-                    logger.warning("[PIPELINE_TIMEOUT] project=%s stage=load_model elapsed=%.2fs "
-                                   "ram=%.1fMB — model load exceeded 60s",
-                                   project_id, elapsed_model, get_memory_mb())
+                    elapsed_model = time.time() - t_stage
+                    if elapsed_model > 60.0:
+                        logger.warning("[PIPELINE_TIMEOUT] project=%s stage=load_model elapsed=%.2fs "
+                                       "ram=%.1fMB — model load exceeded 60s",
+                                       project_id, elapsed_model, get_memory_mb())
 
                 # ── STAGE: Generate embeddings + build FAISS ───────────────
                 t_stage = time.time()
@@ -1001,27 +1098,37 @@ Elapsed: {elapsed_str}
                 global_idx = 0
                 batch_num = 0
 
-                # ── Memory monitor: log RSS/CPU/threads every 10s during embedding ──
+                # ── Memory monitor: log RSS/CPU/threads every 5s during embedding ──
                 _mem_monitor_stop = threading.Event()
                 def _embedding_memory_monitor():
-                    import threading as _threading
                     MEM_ABORT_THRESHOLD_MB = float(os.environ.get("EMBEDDING_MEM_ABORT_MB", "480"))
-                    while not _mem_monitor_stop.wait(10.0):
+                    MEM_WARN_THRESHOLD_MB = MEM_ABORT_THRESHOLD_MB * 0.85
+                    while not _mem_monitor_stop.wait(5.0):
                         try:
                             proc = psutil.Process(os.getpid())
                             rss = proc.memory_info().rss / (1024 * 1024)
                             cpu = proc.cpu_percent(interval=None)
                             nthreads = proc.num_threads()
+                            remaining = max(0, total_candidates - global_idx)
                             logger.info(
                                 "[EMBEDDING_MONITOR] project=%s batch=%d/%d processed=%d/%d "
-                                "RSS=%.1fMB CPU=%.1f%% threads=%d",
-                                project_id, batch_num, total_batches, global_idx, total_candidates,
+                                "remaining=%d RSS=%.1fMB CPU=%.1f%% threads=%d",
+                                project_id, batch_num, total_batches,
+                                global_idx, total_candidates, remaining,
                                 rss, cpu, nthreads,
                             )
-                            if rss > MEM_ABORT_THRESHOLD_MB:
+                            if rss >= MEM_WARN_THRESHOLD_MB and rss < MEM_ABORT_THRESHOLD_MB:
+                                logger.warning(
+                                    "[HIGH_MEMORY_WARNING] project=%s RSS=%.1fMB is at %.0f%% "
+                                    "of abort threshold=%.1fMB",
+                                    project_id, rss,
+                                    (rss / MEM_ABORT_THRESHOLD_MB) * 100,
+                                    MEM_ABORT_THRESHOLD_MB,
+                                )
+                            elif rss >= MEM_ABORT_THRESHOLD_MB:
                                 logger.error(
-                                    "[EMBEDDING_ABORT] project=%s RSS=%.1fMB exceeds threshold=%.1fMB — "
-                                    "aborting embedding to prevent OOM kill",
+                                    "[EMBEDDING_ABORT] project=%s RSS=%.1fMB exceeds "
+                                    "threshold=%.1fMB — aborting to prevent OOM kill",
                                     project_id, rss, MEM_ABORT_THRESHOLD_MB,
                                 )
                                 _mem_monitor_stop.set()
@@ -1178,6 +1285,7 @@ Elapsed: {elapsed_str}
                             "ram=%.1fMB processed=%d batches=%d dim=%s",
                             project_id, time.time() - t_stage, get_memory_mb(),
                             global_idx, batch_num, dim)
+                _save_checkpoint("generate_embeddings")
 
                 # Check for cancellation before index creation
                 if job_manager.is_cancelled(project_id):
