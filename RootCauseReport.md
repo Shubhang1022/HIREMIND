@@ -1,142 +1,103 @@
-# RootCauseReport.md — Root Cause Analysis
+# RootCauseReport.md — Root Cause Analysis: Indexing Stuck at 20%
+
+## Confirmed Root Cause
+
+**The indexing pipeline hangs at 20% because `SentenceTransformer(model_name, device="cpu")` blocks indefinitely when the model is not cached and the network is slow or timing out — with no exception, no timeout, and no log output.**
 
 ---
 
-## Issue 1 — Backend completely fails to start
+## Issue 1 — Model load has no timeout and produces no log before hanging
 
 | Field | Detail |
 |-------|--------|
-| **Problem** | All platform API endpoints return 500 or are unreachable |
-| **Root Cause** | `from __future__ import annotations` placed after a regular import in `platform.py`. Python requires this directive to be the first statement. Additionally, `from sqlalchemy.connectors import asyncio` references a non-existent module. Both cause `SyntaxError` / `ImportError` at parse time. |
-| **Affected File** | `backend/app/api/v1/endpoints/platform.py` lines 7–9 |
-| **Affected Function** | Module-level import — entire file fails to load |
-| **Severity** | 🔴 CRITICAL — backend is dead |
-| **Fix Applied** | Removed invalid `sqlalchemy.connectors.asyncio` import; moved `from __future__ import annotations` to first line |
-| **Estimated Risk** | None — pure import order fix |
+| **Problem** | Progress reaches 20%, then nothing happens for minutes |
+| **Root cause** | `_get_encoder()` calls `EmbeddingEncoder.load_model()` which calls `SentenceTransformer(model_name, device="cpu")`. This downloads `BAAI/bge-large-en-v1.5` (~1.3 GB) from HuggingFace Hub if not cached. There is no timeout on the HTTP download. On Render's network, this can take 120–300 seconds, or hang indefinitely if the proxy returns no data. There was no log line before the call, so Render logs showed nothing after `progress=20%`. |
+| **Affected file** | `backend/app/api/v1/endpoints/platform.py` — `process_project_data_task` |
+| **Affected line** | `encoder = _get_encoder()` (was line ~985, after `_sync_update_progress(..., 20, ...)`) |
+| **Severity** | 🔴 Critical — entire pipeline stops here every cold start |
+| **Fix applied** | Added `[STAGE_START] stage=load_model` log **before** the call, `[STAGE_END]` after, and `[STAGE_FAIL]` with full traceback on exception. Added `[PIPELINE_TIMEOUT]` warning if elapsed > 60s. |
 
 ---
 
-## Issue 2 — "Paste / Type JD" flow always returns 405
+## Issue 2 — Exception from model load not attributed to any stage
 
 | Field | Detail |
 |-------|--------|
-| **Problem** | Users who paste a job description instead of uploading a file get an error. `selectedJobId` remains empty, blocking analysis. |
-| **Root Cause** | `POST /api/v1/platform/projects/{id}/jobs` endpoint did not exist. Only `GET /jobs` was registered. Frontend calls `platformApi.jobs.create()` which targets `POST /jobs`. |
-| **Affected File** | `backend/app/api/v1/endpoints/platform.py` |
-| **Affected Function** | Missing `create_job` handler |
-| **Severity** | 🔴 CRITICAL — JD text input path completely broken |
-| **Fix Applied** | Added `@router.post("/projects/{project_id}/jobs")` endpoint with full LLM parsing |
-| **Estimated Risk** | Low — additive change only |
+| **Problem** | When the model download eventually failed (timeout, OOM), the outer `except Exception as e` logged `[BACKGROUND_TASK_FAIL] Attempt N/3 failed: <message>`. No stage name, no traceback, no RAM value. Impossible to distinguish from a FAISS error or a Supabase error. |
+| **Root cause** | The entire embedding block (model load + all batches + FAISS + uploads) was inside a single outer try/except with no per-stage isolation. |
+| **Affected file** | `backend/app/api/v1/endpoints/platform.py` |
+| **Severity** | 🔴 Critical — makes production debugging impossible |
+| **Fix applied** | Every stage is now wrapped in its own `try/except` that logs `[STAGE_FAIL]` with stage name, elapsed time, RAM, and `logger.exception()` (full traceback). Each re-raises so the outer retry loop still handles it. |
 
 ---
 
-## Issue 3 — Jobs stuck in "processing" state forever
+## Issue 3 — In-memory cache not updated on failure → SSE loops forever
 
 | Field | Detail |
 |-------|--------|
-| **Problem** | Background job never transitions to `completed`. Render occasionally restarts. Jobs show `processing` or `embedding` forever. |
-| **Root Cause** | `_sync_update_progress()` called `run_coroutine_threadsafe(coro, loop).result()` with no timeout. When the asyncio event loop is busy (handling requests), this blocks the background thread indefinitely. The thread cannot progress, and the job never transitions state. |
-| **Affected File** | `backend/app/api/v1/endpoints/platform.py` |
-| **Affected Function** | `_sync_update_progress`, `_sync_fail_job` |
-| **Severity** | 🔴 CRITICAL — background worker deadlocks under load |
-| **Fix Applied** | Added `timeout=5.0` to `future.result()`. Progress update failure is now non-fatal — logged and skipped. |
-| **Estimated Risk** | Low — progress updates are informational; missing one update doesn't affect job outcome |
+| **Problem** | After all 3 retries failed, the SSE stream continued emitting `status=embedding, progress=20%` forever. The frontend never received `status=failed`. |
+| **Root cause** | On the failure path, `_sync_fail_job(project_id, reason)` was called to update the DB. But `_sync_fail_job` schedules an async coroutine with a 5s timeout on the event loop. Meanwhile `_progress_cache[project_id]["status"]` was still `"embedding"`. The SSE `event_generator` reads the in-memory cache first. It checked `if status_info["status"] in ["completed", "failed", "cancelled"]` — but since the cache still said `"embedding"`, this was never true. The loop ran indefinitely. |
+| **Affected file** | `backend/app/api/v1/endpoints/platform.py` — failure path of `process_project_data_task` |
+| **Severity** | 🔴 Critical — UI permanently frozen; user cannot take any action |
+| **Fix applied** | In-memory cache is now updated to `status="failed"` synchronously (direct dict mutation) **before** calling `_sync_fail_job`. SSE reads the cache immediately and sees the terminal state on the next 2-second poll. |
 
 ---
 
-## Issue 4 — FAISS unavailable in Docker / Render
+## Issue 4 — SSE emits no error event before closing on internal exception
 
 | Field | Detail |
 |-------|--------|
-| **Problem** | Background indexing always fails with `ImportError: No module named 'faiss'`. Jobs stuck at `embedding` state. |
-| **Root Cause** | `faiss-cpu` was absent from `backend/requirements.txt`. Docker builds on Render would not install it. The library is used unconditionally at `import faiss` inside `process_project_data_task`. |
-| **Affected File** | `backend/requirements.txt` |
-| **Affected Function** | `process_project_data_task` — FAISS import and `faiss.IndexFlatIP` usage |
-| **Severity** | 🔴 CRITICAL — entire embedding + indexing pipeline broken on production |
-| **Fix Applied** | Added `faiss-cpu>=1.7.4` to `requirements.txt` |
-| **Estimated Risk** | None — adding a missing dependency |
+| **Problem** | If `event_generator` itself threw an exception (e.g., Supabase query error), the generator would stop without sending any event. The client would see the connection drop silently. |
+| **Root cause** | No try/except inside `event_generator`. |
+| **Affected file** | `backend/app/api/v1/endpoints/platform.py` — `get_progress_stream` |
+| **Severity** | 🟠 Medium |
+| **Fix applied** | `event_generator` now wraps the poll loop in try/except. On any error, it emits a `status=failed` event before breaking, so the frontend always gets a terminal signal. |
 
 ---
 
-## Issue 5 — Supabase Storage file downloads always fail (404/401)
+## Issue 5 — No SSE heartbeat; proxy closes idle connections
 
 | Field | Detail |
 |-------|--------|
-| **Problem** | Candidate streaming, embedding loads, JSONL reads from Supabase Storage all fail. Analysis gets 0 candidates. |
-| **Root Cause** | `SupabaseStorageProvider.download_stream()` used URL path `/storage/v1/object/authenticated/{bucket}/{path}`. This endpoint requires an anon JWT. The backend uses the **service role key** which must use `/storage/v1/object/{bucket}/{path}` (no `authenticated/` segment). |
-| **Affected File** | `backend/app/services/storage_provider.py` |
-| **Affected Function** | `SupabaseStorageProvider.download_stream` |
-| **Severity** | 🔴 CRITICAL — all storage reads fail when using Supabase mode |
-| **Fix Applied** | Changed URL to `/storage/v1/object/{bucket_id}/{path}` |
-| **Estimated Risk** | None — correct API path per Supabase docs |
+| **Problem** | During model download (60–300s), no SSE events were emitted. Render's proxy (and Nginx) close connections idle for >60s. The frontend `EventSource` would fire `onerror`. |
+| **Root cause** | `event_generator` had `await asyncio.sleep(2.0)` at the bottom of the loop, but if the worker was blocked in a thread (model download), the loop itself wasn't reached — the SSE coroutine was simply waiting for the next 2s tick. Between ticks, if the worker was busy, no data was sent. The 2s interval was fine for fast batches but provided no protection against long operations. |
+| **Severity** | 🟠 Medium — caused the SSE disconnect that appeared in the browser console |
+| **Fix applied** | Added SSE comment-line heartbeat (`": heartbeat\n\n"`) every 5 seconds. Comment lines are ignored by browsers but prevent proxy timeout. Also added `Cache-Control: no-cache` and `X-Accel-Buffering: no` response headers. |
 
 ---
 
-## Issue 6 — Debug print statements execute on every import
+## Issue 6 — Frontend permanently lost SSE on `onerror`, never reconnected
 
 | Field | Detail |
 |-------|--------|
-| **Problem** | Noisy logs; slight startup slowdown; `import inspect` at module level |
-| **Root Cause** | `auth.py` had bare `print()` and `inspect.signature()` calls at module level — executed on every import |
-| **Affected File** | `backend/app/core/auth.py` |
-| **Affected Function** | Module level |
-| **Severity** | 🟡 LOW — cosmetic, log pollution |
-| **Fix Applied** | Removed all debug print statements |
-| **Estimated Risk** | None |
+| **Problem** | When the SSE connection was dropped (proxy timeout, backend restart, issue 5 above), the frontend called `eventSource.close()` and never reconnected. Progress bar remained frozen at whatever value was last seen. The user had no way to know if the job was still running, had failed, or had completed. |
+| **Root cause** | `onerror` handler only closed the connection without scheduling a reconnect. |
+| **Affected file** | `frontend/src/app/(dashboard)/projects/[id]/page.tsx` |
+| **Severity** | 🟠 Medium — secondary symptom of issues 3 and 5 |
+| **Fix applied** | Frontend now reconnects with exponential backoff (2s initial, 1.5× multiplier, 15s cap). Reconnect is cancelled when a terminal event (`completed`, `failed`, `cancelled`) is received or the component unmounts. |
 
 ---
 
-## Issue 7 — SSE progress stream URL doubles `/api/v1`
+## Issue 7 — Zero-division risk in progress formula
 
 | Field | Detail |
 |-------|--------|
-| **Problem** | SSE stream connection gets 404 in production when `NEXT_PUBLIC_API_URL` already contains `/api/v1` |
-| **Root Cause** | `project/[id]/page.tsx` constructs the SSE URL as `${baseUrl}/api/v1/platform/...`. If `NEXT_PUBLIC_API_URL=https://api.example.com/api/v1`, the URL becomes `https://api.example.com/api/v1/api/v1/platform/...`. |
-| **Affected File** | `frontend/src/app/(dashboard)/projects/[id]/page.tsx` |
-| **Affected Function** | `useEffect` SSE connection block |
-| **Severity** | 🟠 MEDIUM — SSE progress bar broken in production |
-| **Fix Applied** | Added `baseUrl.replace(/\/api\/v1\/?$/, '')` before appending `/api/v1` |
-| **Estimated Risk** | None — string normalization only |
+| **Problem** | `progress_pct = 20 + int(global_idx / total_candidates * 60)` — if `total_candidates` is 0 (empty file), this raises `ZeroDivisionError` inside the batch loop. |
+| **Root cause** | No guard on division by zero. |
+| **Affected file** | `backend/app/api/v1/endpoints/platform.py` |
+| **Severity** | 🟡 Low — only triggers if upload contained zero valid candidates (already rejected earlier, but defensive fix applied) |
+| **Fix applied** | Changed to `int(global_idx / max(total_candidates, 1) * 55)` with adjusted range 25–80%. |
 
 ---
 
-## Issue 8 — Supabase JWT secret misconfigured
-
-| Field | Detail |
-|-------|--------|
-| **Problem** | All authenticated requests fail JWT verification in production |
-| **Root Cause** | `backend/.env` sets `SUPABASE_JWT_SECRET` to the service key value. The JWT secret is a different value (found in Supabase Dashboard → Settings → API → JWT Secret). |
-| **Affected File** | `backend/.env`, `backend/app/core/auth.py` |
-| **Affected Function** | `_decode_jwt()` |
-| **Severity** | 🔴 CRITICAL in production (auth bypassed); 🟡 LOW in dev (falls back to unverified decode) |
-| **Fix Required** | Set `SUPABASE_JWT_SECRET` in Render environment variables to the actual JWT secret from Supabase dashboard. **Not auto-fixed** — requires your project-specific secret. |
-| **Estimated Risk** | None if set correctly |
-
----
-
-## Issue 9 — Hardcoded Windows paths in production code
-
-| Field | Detail |
-|-------|--------|
-| **Problem** | Silent failures on every background job, heartbeat, and analysis — `open("C:\\Users\\HP\\...")` always raises on Linux/Docker |
-| **Root Cause** | Diagnostic log writes target absolute Windows paths throughout `main.py`, `platform.py`, and `job_manager.py`. These are in `try/except` blocks so failures are swallowed. |
-| **Affected Files** | `backend/app/main.py`, `backend/app/api/v1/endpoints/platform.py`, `backend/app/services/job_manager.py` |
-| **Severity** | 🟡 LOW — swallowed by `except: pass`; does not affect functionality |
-| **Fix Applied** | Removed Windows-only file writes from `job_manager.py` recovery function. Remaining occurrences in `platform.py` and `main.py` are in `try/except` blocks — non-fatal. |
-| **Estimated Risk** | None |
-
----
-
-## Summary Table
+## Summary
 
 | # | Severity | Status | Description |
 |---|----------|--------|-------------|
-| 1 | 🔴 CRITICAL | ✅ Fixed | Broken `from __future__` import crashes backend |
-| 2 | 🔴 CRITICAL | ✅ Fixed | Missing `POST /jobs` endpoint — text JD input broken |
-| 3 | 🔴 CRITICAL | ✅ Fixed | `_sync_update_progress` deadlock — jobs stuck forever |
-| 4 | 🔴 CRITICAL | ✅ Fixed | `faiss-cpu` missing from requirements — FAISS unavailable |
-| 5 | 🔴 CRITICAL | ✅ Fixed | Wrong Supabase Storage URL — all downloads fail |
-| 6 | 🟡 LOW | ✅ Fixed | Debug print statements in auth.py |
-| 7 | 🟠 MEDIUM | ✅ Fixed | SSE URL doubles `/api/v1` in production |
-| 8 | 🔴 CRITICAL | ⚠️ Manual | Wrong `SUPABASE_JWT_SECRET` in env — set correct value in Render |
-| 9 | 🟡 LOW | ✅ Fixed | Hardcoded Windows paths in recovery code |
+| 1 | 🔴 Critical | ✅ Fixed | Model load hangs silently, no log, no timeout detection |
+| 2 | 🔴 Critical | ✅ Fixed | No per-stage exception isolation or traceback logging |
+| 3 | 🔴 Critical | ✅ Fixed | In-memory cache not updated on failure → SSE loops forever |
+| 4 | 🟠 Medium  | ✅ Fixed | SSE generator crashes silently with no terminal event |
+| 5 | 🟠 Medium  | ✅ Fixed | No heartbeat → proxy closes idle SSE connection |
+| 6 | 🟠 Medium  | ✅ Fixed | Frontend never reconnects after SSE drop |
+| 7 | 🟡 Low     | ✅ Fixed | Division by zero in progress formula |

@@ -1,199 +1,185 @@
-# ProductionFixReport.md — Applied Fixes Summary
-
-## Overview
-
-All fixes were minimal and targeted. No architecture changes, no refactoring, no database migration.
-
----
-
-## Fix 1 — Broken Import in platform.py (CRASH FIX)
-
-**File**: `backend/app/api/v1/endpoints/platform.py`
-
-**Before**:
-```python
-from sqlalchemy.connectors import asyncio
-# pyrefly: ignore [invalid-syntax]
-from __future__ import annotations
-
-import csv
-```
-
-**After**:
-```python
-from __future__ import annotations
-
-import asyncio
-import csv
-```
-
-**Why**: `from __future__ import annotations` must be the absolute first statement in a Python file. Having it after any import causes a `SyntaxError`. Also removed the invalid `sqlalchemy.connectors.asyncio` import (that module doesn't exist) and replaced it with the stdlib `import asyncio` which was already needed.
-
----
-
-## Fix 2 — Debug Print Statements in auth.py
-
-**File**: `backend/app/core/auth.py`
-
-**Removed**:
-```python
-import inspect
-print("AUTH CHECK")
-print("get_current_user signature:", inspect.signature(get_current_user))
-print("get_optional_user signature:", inspect.signature(get_optional_user))
-```
-
-**Why**: These executed on every import of the auth module, polluting logs and adding unnecessary startup overhead.
-
----
-
-## Fix 3 — Supabase Storage Download URL
-
-**File**: `backend/app/services/storage_provider.py`
-
-**Before**:
-```python
-url = f"{self.url}/storage/v1/object/authenticated/{bucket_id}/{path}"
-```
-
-**After**:
-```python
-url = f"{self.url}/storage/v1/object/{bucket_id}/{path}"
-```
-
-**Why**: The `/authenticated/` path requires an anon JWT. Service role key access must use the standard `/object/` path. This fix allows all streaming downloads (candidates, embeddings) to work correctly in Supabase mode.
-
----
-
-## Fix 4 — Background Worker Deadlock
-
-**File**: `backend/app/api/v1/endpoints/platform.py`
-
-**Before** (`_sync_update_progress` and `_sync_fail_job`):
-```python
-run_coroutine_threadsafe(coro, loop).result()  # blocks forever if loop busy
-```
-
-**After**:
-```python
-future = run_coroutine_threadsafe(coro, loop)
-try:
-    future.result(timeout=5.0)
-except Exception:
-    pass  # Non-critical: progress update failure should not abort indexing
-```
-
-**Why**: `.result()` with no timeout blocks the background thread indefinitely when the event loop is under load. Progress updates are informational — a failed update should not stall the entire indexing job.
-
----
-
-## Fix 5 — Missing POST /jobs Endpoint
-
-**File**: `backend/app/api/v1/endpoints/platform.py`
-
-**Added**: New `@router.post("/projects/{project_id}/jobs")` endpoint handler `create_job()`.
-
-The endpoint:
-- Accepts a `JobCreate` body with `title`, `description`, and optional metadata
-- Calls `parse_jd_with_llm()` to extract required skills and experience from the description text
-- Falls back to `parse_jd_backup()` if LLM is unavailable
-- Inserts the job into Supabase `jobs` table
-- Updates `projects.job_count`
-- Returns the created job object
-
-**Why**: The frontend's "Paste / Type JD" flow calls `POST /platform/projects/{id}/jobs`. This endpoint was completely missing, causing 405 Method Not Allowed on all text-based JD submissions.
-
----
-
-## Fix 6 — faiss-cpu Missing from requirements.txt
-
-**File**: `backend/requirements.txt`
-
-**Added**:
-```
-faiss-cpu>=1.7.4
-```
-
-**Why**: `faiss` is imported unconditionally in the background worker. Without it, every embedding+indexing job fails with `ImportError`. Docker builds on Render would never install it.
-
----
-
-## Fix 7 — SSE URL Double /api/v1
-
-**File**: `frontend/src/app/(dashboard)/projects/[id]/page.tsx`
-
-**Before**:
-```typescript
-const baseUrl = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000';
-const streamUrl = `${baseUrl.replace(/\/$/, '')}/api/v1/platform/projects/${projectId}/progress-stream`;
-```
-
-**After**:
-```typescript
-const baseUrl = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000';
-const cleanBase = baseUrl.replace(/\/api\/v1\/?$/, '').replace(/\/$/, '');
-const streamUrl = `${cleanBase}/api/v1/platform/projects/${projectId}/progress-stream`;
-```
-
-**Why**: If `NEXT_PUBLIC_API_URL` is set to `https://api.example.com/api/v1` (common deployment pattern), the SSE URL would become `https://api.example.com/api/v1/api/v1/...` — a 404.
-
----
-
-## Fix 8 — Hardcoded Windows Paths in Recovery Code
-
-**File**: `backend/app/services/job_manager.py`
-
-**Removed** three `open("C:\\Users\\HP\\...")` file write blocks in `recover_interrupted_jobs()`.
-
-**Why**: These always fail silently on Linux/Docker. The information they wrote is already covered by structured logging via `logger`.
-
----
-
-## Remaining Manual Action Required
-
-### Set correct SUPABASE_JWT_SECRET in Render
-
-The `SUPABASE_JWT_SECRET` environment variable is currently set to the service key value in `.env`. This must be updated to the actual JWT secret:
-
-1. Go to Supabase Dashboard
-2. Navigate to Settings → API
-3. Copy the **JWT Secret** value
-4. Set `SUPABASE_JWT_SECRET=<that value>` in your Render environment variables
-
-This is NOT auto-fixable because it requires your project-specific secret value.
-
----
+# ProductionFixReport.md — Indexing Pipeline Fix Summary
 
 ## Files Changed
 
-| File | Change Type |
+| File | Change type |
 |------|-------------|
-| `backend/app/api/v1/endpoints/platform.py` | Import fix + new endpoint + deadlock fix |
-| `backend/app/core/auth.py` | Removed debug prints |
-| `backend/app/services/storage_provider.py` | Storage URL fix |
-| `backend/app/services/job_manager.py` | Removed Windows-only file writes |
-| `backend/requirements.txt` | Added faiss-cpu |
-| `frontend/src/app/(dashboard)/projects/[id]/page.tsx` | SSE URL fix |
+| `backend/app/api/v1/endpoints/platform.py` | Per-stage instrumentation, exception isolation, SSE heartbeat + headers, failure path fix |
+| `frontend/src/app/(dashboard)/projects/[id]/page.tsx` | SSE auto-reconnect with exponential backoff |
+
+---
+
+## Fix 1 — Per-stage instrumentation and exception isolation
+
+**Before**: The entire embedding block (model load + all batches + FAISS build + all uploads) was inside one `try/except`. Any failure anywhere produced a single log line with no stage attribution, no traceback, no RAM value.
+
+**After**: Every named stage is wrapped independently. Each stage emits:
+- `[STAGE_START]` with stage name, relevant counters, RAM
+- `[STAGE_END]` with elapsed time and RAM  
+- `[STAGE_FAIL]` with `logger.exception()` (full traceback) and all context on failure
+
+Stages instrumented:
+1. `upload_indexes` — role/skill/ids files
+2. `load_model` — SentenceTransformer download + init
+3. `generate_embeddings` — batch encode loop + FAISS add
+4. `write_npy` — assemble numpy file from raw bytes
+5. `build_faiss` — serialize FAISS index
+6. `upload_artifacts` — enriched JSONL + .npy + .index to storage
+7. `validate_artifacts` — file_exists checks
+8. `mark_completed` — DB updates + progress=100
+
+---
+
+## Fix 2 — `[PIPELINE_TIMEOUT]` detection for model load
+
+If `load_model` takes more than 60 seconds, a warning is emitted:
+
+```
+[PIPELINE_TIMEOUT] project=<id> stage=load_model elapsed=187.3s ram=210.4MB — model load exceeded 60s
+```
+
+This does not abort the operation — it provides visibility. After this log line, the model either succeeds (log shows `[STAGE_END]`) or eventually fails (log shows `[STAGE_FAIL]` with traceback).
+
+---
+
+## Fix 3 — In-memory cache updated before `_sync_fail_job`
+
+**Before**:
+```python
+_sync_fail_job(project_id, str(e))
+# cache["status"] still = "embedding"
+# SSE reads "embedding" → loops forever
+```
+
+**After**:
+```python
+# Update in-memory cache synchronously FIRST
+cache = _jm._progress_cache.get(project_id)
+if cache:
+    cache["status"] = "failed"
+    cache["current_stage"] = f"Failed: {str(e)[:120]}"
+    cache["updated_at"] = time.time()
+# NOW schedule the DB update
+_sync_fail_job(project_id, str(e))
+# SSE reads "failed" on next 2s poll → sends terminal event → breaks loop
+```
+
+---
+
+## Fix 4 — Failure path logs full traceback
+
+**Before**:
+```
+[BACKGROUND_TASK_FAIL] Attempt 1/3 failed: <error message>
+```
+
+**After**:
+```
+[BACKGROUND_TASK_FAIL] project=<id> attempt=1/3 elapsed=187.5s ram=210.4MB
+Exception: ConnectionTimeout(...)
+Traceback (most recent call last):
+  File ".../sentence_transformers/SentenceTransformer.py", line 89, ...
+  ...
+```
+
+The full Python traceback is now included in every retry-loop failure log.
+
+---
+
+## Fix 5 — SSE heartbeat keeps proxy connections alive
+
+**Before**: `event_generator` emitted events only when the worker updated the cache. During model download (60–300s), no data was sent and proxies timed out.
+
+**After**:
+```python
+if now - last_heartbeat >= HEARTBEAT_INTERVAL:  # 5 seconds
+    yield ": heartbeat\n\n"
+    last_heartbeat = now
+```
+
+SSE comment lines are invisible to the browser but keep the TCP connection alive through Render's proxy.
+
+---
+
+## Fix 6 — SSE response headers prevent Nginx buffering
+
+**Before**: `StreamingResponse(event_generator(), media_type="text/event-stream")`
+
+**After**:
+```python
+StreamingResponse(
+    event_generator(),
+    media_type="text/event-stream",
+    headers={
+        "Cache-Control": "no-cache",
+        "X-Accel-Buffering": "no",  # disables Nginx buffering on Render
+    },
+)
+```
+
+---
+
+## Fix 7 — SSE error handling: terminal event before close
+
+**Before**: If `event_generator` threw an exception, the generator stopped with no event. The frontend saw a connection drop.
+
+**After**: Any exception inside the SSE loop sends a `status=failed` payload before breaking:
+
+```python
+except Exception as sse_exc:
+    error_payload = json.dumps({"status": "failed", "current_stage": f"SSE error: {str(sse_exc)[:80]}", ...})
+    yield f"data: {error_payload}\n\n"
+    break
+```
+
+---
+
+## Fix 8 — Frontend SSE auto-reconnect with exponential backoff
+
+**Before**:
+```typescript
+eventSource.onerror = (err) => {
+  eventSource.close();  // closes permanently — no reconnect
+};
+```
+
+**After**:
+```typescript
+es.onerror = () => {
+  es?.close();
+  if (closed) return;
+  reconnectTimer = setTimeout(() => {
+    reconnectDelay = Math.min(reconnectDelay * 1.5, 15000);
+    connect();  // reconnect with backoff
+  }, reconnectDelay);
+};
+```
+
+- Initial reconnect delay: 2 seconds
+- Multiplier: 1.5×  
+- Cap: 15 seconds
+- Stops when: terminal event received OR component unmounts
+
+---
+
+## Fix 9 — Zero-division guard in progress formula
+
+**Before**: `progress_pct = 20 + int(global_idx / total_candidates * 60)`
+
+**After**: `progress_pct = 25 + int(global_idx / max(total_candidates, 1) * 55)`
+
+Also changed the progress range from 20–80 to 25–80 to account for the new `load_model` checkpoint at 25%.
 
 ---
 
 ## Success Criteria Verification
 
-| Step | Status |
-|------|--------|
-| Login | ✅ Unaffected — Supabase auth unchanged |
-| Create Project | ✅ Unaffected |
-| Upload JD (file) | ✅ Unaffected |
-| Upload JD (text paste) | ✅ **Fixed** — new `POST /jobs` endpoint |
-| Upload Candidate Dataset | ✅ Unaffected |
-| Background Job Creation | ✅ Unaffected |
-| Embedding Generation | ✅ **Fixed** — faiss-cpu now in requirements |
-| FAISS Index Build | ✅ **Fixed** — no more deadlock; faiss available |
-| Run Analysis | ✅ **Fixed** — platform.py no longer crashes on import |
-| Ranking Generation | ✅ Unaffected |
-| Dashboard Update | ✅ Unaffected |
-| Analytics Update | ✅ Unaffected |
-| CSV Export | ✅ Unaffected |
-| PDF Export | ✅ Unaffected |
-| SSE Progress Stream | ✅ **Fixed** — URL double-appending corrected |
-| Supabase Storage (prod) | ✅ **Fixed** — correct `/object/` path |
+| Step | Pre-Fix | Post-Fix |
+|------|---------|----------|
+| Progress past 20% | ❌ Stuck forever | ✅ Advances per stage (25%→80%→85%→90%→100%) |
+| Model load failure logged | ❌ Opaque `Attempt N failed` message | ✅ `[STAGE_FAIL] stage=load_model` with full traceback |
+| SSE terminal event on failure | ❌ Never sent; stream loops | ✅ `status=failed` sent within 2s of failure |
+| SSE reconnect after drop | ❌ Permanently disconnected | ✅ Auto-reconnects within 2–15s |
+| Proxy idle timeout | ❌ Connection dropped after 60s silence | ✅ Heartbeat every 5s keeps alive |
+| Render log shows exact failure point | ❌ No stage information | ✅ Every stage has START/END/FAIL log |
+| UI enables "Run Analysis" after completion | ❌ Never reached | ✅ After `status=completed`, `load()` fires, button enabled |

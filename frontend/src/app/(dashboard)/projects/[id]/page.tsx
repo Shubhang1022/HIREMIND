@@ -150,34 +150,54 @@ export default function ProjectDetailPage() {
       setWorkerStatus(null);
       return;
     }
-    
+
     const baseUrl = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000';
     // Strip any trailing /api/v1 suffix the env var might already contain, then re-append
     const cleanBase = baseUrl.replace(/\/api\/v1\/?$/, '').replace(/\/$/, '');
     const streamUrl = `${cleanBase}/api/v1/platform/projects/${projectId}/progress-stream`;
-    
-    const eventSource = new EventSource(streamUrl);
-    
-    eventSource.onmessage = (event) => {
-      try {
-        const data = JSON.parse(event.data);
-        setWorkerStatus(data);
-        if (data.status === 'completed' || data.status === 'failed' || data.status === 'cancelled') {
-          eventSource.close();
-          load();
+
+    let es: EventSource | null = null;
+    let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+    let closed = false;
+    let reconnectDelay = 2000; // start at 2s, cap at 15s
+
+    const connect = () => {
+      if (closed) return;
+      es = new EventSource(streamUrl);
+
+      es.onmessage = (event) => {
+        try {
+          const data = JSON.parse(event.data);
+          setWorkerStatus(data);
+          if (data.status === 'completed' || data.status === 'failed' || data.status === 'cancelled') {
+            closed = true;
+            es?.close();
+            load();
+          }
+        } catch (err) {
+          console.error('[SSE] Error parsing event data:', err);
         }
-      } catch (err) {
-        console.error('Error parsing SSE data:', err);
-      }
+      };
+
+      es.onerror = () => {
+        es?.close();
+        es = null;
+        if (closed) return;
+        // Reconnect with backoff — the worker may still be running
+        console.warn(`[SSE] Connection dropped, reconnecting in ${reconnectDelay}ms…`);
+        reconnectTimer = setTimeout(() => {
+          reconnectDelay = Math.min(reconnectDelay * 1.5, 15000);
+          connect();
+        }, reconnectDelay);
+      };
     };
-    
-    eventSource.onerror = (err) => {
-      console.error('EventSource error, closing stream:', err);
-      eventSource.close();
-    };
-    
+
+    connect();
+
     return () => {
-      eventSource.close();
+      closed = true;
+      if (reconnectTimer) clearTimeout(reconnectTimer);
+      es?.close();
     };
   }, [project?.embedding_status, projectId, load]);
 

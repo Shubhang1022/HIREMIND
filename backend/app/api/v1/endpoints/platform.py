@@ -884,65 +884,166 @@ Elapsed: {elapsed_str}
 
                 logger.info("Enriched %d candidates. Starting index uploads.", total_candidates)
 
-                # Upload role Specialty files with version (Phase 4)
-                for cat in role_files.keys():
-                    cat_path = Path(temp_dir) / f"role_{cat.upper()}.jsonl"
-                    content = cat_path.read_bytes()
-                    StorageService.upload_file("role-indexes", f"{project_id}/role_{cat.upper()}_v{version}.jsonl", content)
+                # ── STAGE: Upload role / skill / ids indexes ───────────────
+                t_stage = time.time()
+                logger.info("[STAGE_START] project=%s stage=upload_indexes candidates=%d", project_id, total_candidates)
+                try:
+                    for cat in role_files.keys():
+                        cat_path = Path(temp_dir) / f"role_{cat.upper()}.jsonl"
+                        content = cat_path.read_bytes()
+                        StorageService.upload_file("role-indexes", f"{project_id}/role_{cat.upper()}_v{version}.jsonl", content)
+                        logger.info("[STAGE_PROGRESS] project=%s stage=upload_indexes uploaded role-%s", project_id, cat)
 
-                skill_content = json.dumps(skill_index, ensure_ascii=False)
-                StorageService.upload_file("skill-indexes", f"{project_id}/skill_index_v{version}.json", skill_content.encode("utf-8"))
+                    skill_content = json.dumps(skill_index, ensure_ascii=False)
+                    StorageService.upload_file("skill-indexes", f"{project_id}/skill_index_v{version}.json", skill_content.encode("utf-8"))
+                    logger.info("[STAGE_PROGRESS] project=%s stage=upload_indexes uploaded skill_index", project_id)
 
-                ids_content = json.dumps(candidate_ids, ensure_ascii=False)
-                StorageService.upload_file("embeddings", f"{project_id}/ids_v{version}.json", ids_content.encode("utf-8"))
+                    ids_content = json.dumps(candidate_ids, ensure_ascii=False)
+                    StorageService.upload_file("embeddings", f"{project_id}/ids_v{version}.json", ids_content.encode("utf-8"))
+                    logger.info("[STAGE_PROGRESS] project=%s stage=upload_indexes uploaded ids_v%d.json", project_id, version)
+                except Exception as stage_exc:
+                    logger.exception("[STAGE_FAIL] project=%s stage=upload_indexes elapsed=%.2fs error=%s",
+                                     project_id, time.time() - t_stage, stage_exc)
+                    raise
 
-                from src.features.text_builder import build_candidate_text
-                encoder = _get_encoder()
-                
+                logger.info("[STAGE_END] project=%s stage=upload_indexes elapsed=%.2fs ram=%.1fMB",
+                            project_id, time.time() - t_stage, get_memory_mb())
+
+                # ── STAGE: Load embedding model ────────────────────────────
+                t_stage = time.time()
+                logger.info("[STAGE_START] project=%s stage=load_model model=%s ram=%.1fMB",
+                            project_id, settings.embedding_model, get_memory_mb())
+                try:
+                    from src.features.text_builder import build_candidate_text
+                    encoder = _get_encoder()
+                    logger.info("[STAGE_END] project=%s stage=load_model elapsed=%.2fs ram=%.1fMB dim=%s",
+                                project_id, time.time() - t_stage, get_memory_mb(),
+                                getattr(encoder, 'embedding_dim', 'unknown'))
+                except Exception as stage_exc:
+                    logger.exception(
+                        "[STAGE_FAIL] project=%s stage=load_model elapsed=%.2fs ram=%.1fMB "
+                        "error=%s  — likely cause: model download timeout on Render free tier "
+                        "or missing sentence-transformers package",
+                        project_id, time.time() - t_stage, get_memory_mb(), stage_exc)
+                    raise
+
+                elapsed_model = time.time() - t_stage
+                if elapsed_model > 60.0:
+                    logger.warning("[PIPELINE_TIMEOUT] project=%s stage=load_model elapsed=%.2fs "
+                                   "ram=%.1fMB — model load exceeded 60s",
+                                   project_id, elapsed_model, get_memory_mb())
+
+                # ── STAGE: Generate embeddings + build FAISS ───────────────
+                t_stage = time.time()
+                logger.info("[STAGE_START] project=%s stage=generate_embeddings total_candidates=%d batch_size=32 ram=%.1fMB",
+                            project_id, total_candidates, get_memory_mb())
+                _sync_update_progress(project_id, "Generating Embeddings", 25, status="embedding",
+                                      processed_candidates=0, total_candidates=total_candidates,
+                                      retry_count=attempt - 1)
+
                 batch_size = 32
                 raw_embs_path = Path(temp_dir) / "embeddings.raw"
-                
-                import faiss
+
+                try:
+                    import faiss
+                    logger.info("[STAGE_PROGRESS] project=%s stage=generate_embeddings faiss_imported", project_id)
+                except Exception as stage_exc:
+                    logger.exception("[STAGE_FAIL] project=%s stage=generate_embeddings faiss_import_error=%s "
+                                     "— faiss-cpu may not be installed", project_id, stage_exc)
+                    raise
+
                 index = None
                 dim = None
                 global_idx = 0
                 batch_num = 0
 
-                with open(raw_embs_path, "wb") as f_raw_embs:
-                    batch_candidates = []
-                    batch_texts = []
-                    
-                    with open(enriched_jsonl_path, "r", encoding="utf-8") as f_enriched:
-                        for line in f_enriched:
-                            if global_idx % 10 == 0 and job_manager.is_cancelled(project_id):
-                                _sync_update_progress(project_id, "Cancelled", 0, status="cancelled")
-                                job_manager.clear_cancellation(project_id)
-                                return
+                try:
+                    with open(raw_embs_path, "wb") as f_raw_embs:
+                        batch_candidates = []
+                        batch_texts = []
 
-                            c = json.loads(line)
-                            batch_candidates.append(c)
-                            if c.get("is_disqualified", False):
-                                batch_texts.append("")
-                            else:
-                                batch_texts.append(build_candidate_text(c))
+                        with open(enriched_jsonl_path, "r", encoding="utf-8") as f_enriched:
+                            for line in f_enriched:
+                                if global_idx % 10 == 0 and job_manager.is_cancelled(project_id):
+                                    _sync_update_progress(project_id, "Cancelled", 0, status="cancelled")
+                                    job_manager.clear_cancellation(project_id)
+                                    return
 
-                            if len(batch_candidates) >= batch_size:
+                                c = json.loads(line)
+                                batch_candidates.append(c)
+                                if c.get("is_disqualified", False):
+                                    batch_texts.append("")
+                                else:
+                                    batch_texts.append(build_candidate_text(c))
+
+                                if len(batch_candidates) >= batch_size:
+                                    batch_num += 1
+                                    valid_indices = [i for i, text in enumerate(batch_texts) if text != ""]
+                                    valid_texts = [batch_texts[i] for i in valid_indices]
+
+                                    t_batch = time.time()
+                                    if valid_texts:
+                                        try:
+                                            encoded = encoder.encode_batch(valid_texts)
+                                        except Exception as encode_exc:
+                                            logger.exception("[STAGE_FAIL] project=%s stage=generate_embeddings "
+                                                             "batch=%d encode_error=%s", project_id, batch_num, encode_exc)
+                                            time.sleep(1.0)
+                                            encoded = encoder.encode_batch(valid_texts)
+
+                                        arr = np.array(encoded, dtype=np.float32)
+                                        if dim is None:
+                                            dim = arr.shape[1]
+                                            logger.info("[STAGE_PROGRESS] project=%s stage=generate_embeddings "
+                                                        "first_batch_done dim=%d", project_id, dim)
+
+                                        if index is None:
+                                            index = faiss.IndexFlatIP(dim)
+
+                                        full_batch_embs = np.zeros((len(batch_candidates), dim), dtype=np.float32)
+                                        for idx_in_batch, original_idx in enumerate(valid_indices):
+                                            full_batch_embs[original_idx] = arr[idx_in_batch]
+
+                                        f_raw_embs.write(full_batch_embs.tobytes())
+                                        index.add(full_batch_embs)
+                                    else:
+                                        if dim is None:
+                                            dim = encoder.embedding_dim
+                                        if index is None:
+                                            index = faiss.IndexFlatIP(dim)
+                                        dummy = np.zeros((len(batch_candidates), dim), dtype=np.float32)
+                                        f_raw_embs.write(dummy.tobytes())
+                                        index.add(dummy)
+
+                                    global_idx += len(batch_candidates)
+                                    progress_pct = 25 + int(global_idx / max(total_candidates, 1) * 55)
+                                    _sync_update_progress(project_id, "Generating Embeddings", progress_pct,
+                                                          status="embedding",
+                                                          processed_candidates=global_idx,
+                                                          total_candidates=total_candidates,
+                                                          retry_count=attempt - 1)
+
+                                    batch_elapsed = time.time() - t_batch
+                                    if batch_elapsed > 60.0:
+                                        logger.warning("[PIPELINE_TIMEOUT] project=%s stage=generate_embeddings "
+                                                       "batch=%d elapsed=%.2fs ram=%.1fMB candidates_so_far=%d",
+                                                       project_id, batch_num, batch_elapsed, get_memory_mb(), global_idx)
+
+                                    batch_candidates = []
+                                    batch_texts = []
+                                    log_worker_heartbeat("Generating Embeddings", global_idx, total_candidates, batch_num)
+
+                            # Final partial batch
+                            if batch_candidates:
                                 batch_num += 1
                                 valid_indices = [i for i, text in enumerate(batch_texts) if text != ""]
                                 valid_texts = [batch_texts[i] for i in valid_indices]
 
                                 if valid_texts:
-                                    try:
-                                        encoded = encoder.encode_batch(valid_texts)
-                                    except Exception as encode_exc:
-                                        logger.error("Encoding failed: %s. Retrying batch once.", encode_exc)
-                                        time.sleep(1.0)
-                                        encoded = encoder.encode_batch(valid_texts)
-
+                                    encoded = encoder.encode_batch(valid_texts)
                                     arr = np.array(encoded, dtype=np.float32)
                                     if dim is None:
                                         dim = arr.shape[1]
-                                        
                                     if index is None:
                                         index = faiss.IndexFlatIP(dim)
 
@@ -962,46 +1063,24 @@ Elapsed: {elapsed_str}
                                     index.add(dummy)
 
                                 global_idx += len(batch_candidates)
-                                progress_pct = 20 + int(global_idx / total_candidates * 60)
-                                # pyrefly: ignore [unexpected-keyword]
-                                _sync_update_progress(project_id, "Generating Embeddings", progress_pct, status="embedding", processed_candidates=global_idx, total_candidates=total_candidates, retry_count=attempt - 1)
-                                
-                                batch_candidates = []
-                                batch_texts = []
+                                _sync_update_progress(project_id, "Generating Embeddings", 80,
+                                                      status="embedding",
+                                                      processed_candidates=global_idx,
+                                                      total_candidates=total_candidates,
+                                                      retry_count=attempt - 1)
                                 log_worker_heartbeat("Generating Embeddings", global_idx, total_candidates, batch_num)
 
-                        if batch_candidates:
-                            batch_num += 1
-                            valid_indices = [i for i, text in enumerate(batch_texts) if text != ""]
-                            valid_texts = [batch_texts[i] for i in valid_indices]
+                except Exception as stage_exc:
+                    logger.exception("[STAGE_FAIL] project=%s stage=generate_embeddings "
+                                     "elapsed=%.2fs ram=%.1fMB processed=%d/%d error=%s",
+                                     project_id, time.time() - t_stage, get_memory_mb(),
+                                     global_idx, total_candidates, stage_exc)
+                    raise
 
-                            if valid_texts:
-                                encoded = encoder.encode_batch(valid_texts)
-                                arr = np.array(encoded, dtype=np.float32)
-                                if dim is None:
-                                    dim = arr.shape[1]
-                                if index is None:
-                                    index = faiss.IndexFlatIP(dim)
-
-                                full_batch_embs = np.zeros((len(batch_candidates), dim), dtype=np.float32)
-                                for idx_in_batch, original_idx in enumerate(valid_indices):
-                                    full_batch_embs[original_idx] = arr[idx_in_batch]
-
-                                f_raw_embs.write(full_batch_embs.tobytes())
-                                index.add(full_batch_embs)
-                            else:
-                                if dim is None:
-                                    dim = encoder.embedding_dim
-                                if index is None:
-                                    index = faiss.IndexFlatIP(dim)
-                                dummy = np.zeros((len(batch_candidates), dim), dtype=np.float32)
-                                f_raw_embs.write(dummy.tobytes())
-                                index.add(dummy)
-
-                            global_idx += len(batch_candidates)
-                            # pyrefly: ignore [unexpected-keyword]
-                            _sync_update_progress(project_id, "Generating Embeddings", 80, status="embedding", processed_candidates=global_idx, total_candidates=total_candidates, retry_count=attempt - 1)
-                            log_worker_heartbeat("Generating Embeddings", global_idx, total_candidates, batch_num)
+                logger.info("[STAGE_END] project=%s stage=generate_embeddings elapsed=%.2fs "
+                            "ram=%.1fMB processed=%d batches=%d dim=%s",
+                            project_id, time.time() - t_stage, get_memory_mb(),
+                            global_idx, batch_num, dim)
 
                 # Check for cancellation before index creation
                 if job_manager.is_cancelled(project_id):
@@ -1017,31 +1096,58 @@ Elapsed: {elapsed_str}
                     "updated_at": _now()
                 }).eq("id", project_id).execute()
 
+                # ── STAGE: Write .npy file ─────────────────────────────────
+                t_stage = time.time()
+                logger.info("[STAGE_START] project=%s stage=write_npy total_candidates=%d dim=%s ram=%.1fMB",
+                            project_id, total_candidates, dim, get_memory_mb())
                 npy_path = Path(temp_dir) / "embeddings.npy"
-                if dim is None:
-                    dim = encoder.embedding_dim
-                    
-                with open(npy_path, "wb") as f_npy:
-                    import struct
-                    f_npy.write(b'\x93NUMPY')
-                    f_npy.write(b'\x01\x00')
-                    
-                    header_str = f"{{'descr': '<f4', 'fortran_order': False, 'shape': ({total_candidates}, {dim})}} "
-                    pad_len = 64 - ((10 + len(header_str) + 1) % 64)
-                    if pad_len == 64:
-                        pad_len = 0
-                    header_str += " " * pad_len + "\n"
-                    
-                    f_npy.write(struct.pack('<H', len(header_str)))
-                    f_npy.write(header_str.encode('ascii'))
-                    
-                    if os.path.exists(raw_embs_path):
-                        with open(raw_embs_path, "rb") as f_raw:
-                            while True:
-                                chunk = f_raw.read(65536)
-                                if not chunk:
-                                    break
-                                f_npy.write(chunk)
+                try:
+                    if dim is None:
+                        dim = encoder.embedding_dim
+                    with open(npy_path, "wb") as f_npy:
+                        import struct
+                        f_npy.write(b'\x93NUMPY')
+                        f_npy.write(b'\x01\x00')
+                        header_str = f"{{'descr': '<f4', 'fortran_order': False, 'shape': ({total_candidates}, {dim})}} "
+                        pad_len = 64 - ((10 + len(header_str) + 1) % 64)
+                        if pad_len == 64:
+                            pad_len = 0
+                        header_str += " " * pad_len + "\n"
+                        f_npy.write(struct.pack('<H', len(header_str)))
+                        f_npy.write(header_str.encode('ascii'))
+                        if os.path.exists(raw_embs_path):
+                            with open(raw_embs_path, "rb") as f_raw:
+                                while True:
+                                    chunk = f_raw.read(65536)
+                                    if not chunk:
+                                        break
+                                    f_npy.write(chunk)
+                    npy_size_mb = npy_path.stat().st_size / (1024 * 1024)
+                    logger.info("[STAGE_END] project=%s stage=write_npy elapsed=%.2fs size=%.2fMB ram=%.1fMB",
+                                project_id, time.time() - t_stage, npy_size_mb, get_memory_mb())
+                except Exception as stage_exc:
+                    logger.exception("[STAGE_FAIL] project=%s stage=write_npy elapsed=%.2fs ram=%.1fMB error=%s",
+                                     project_id, time.time() - t_stage, get_memory_mb(), stage_exc)
+                    raise
+
+                # ── STAGE: Build FAISS + serialize ─────────────────────────
+                t_stage = time.time()
+                logger.info("[STAGE_START] project=%s stage=build_faiss index_ntotal=%s ram=%.1fMB",
+                            project_id, getattr(index, 'ntotal', 'none'), get_memory_mb())
+                try:
+                    if index is None:
+                        raise RuntimeError("FAISS index is None — no candidates were encoded. "
+                                           "Check that candidates have non-empty text fields.")
+                    faiss_content = faiss.serialize_index(index)
+                    faiss_size_kb = len(faiss_content) / 1024
+                    logger.info("[STAGE_END] project=%s stage=build_faiss elapsed=%.2fs "
+                                "serialized_size=%.1fKB ntotal=%d ram=%.1fMB",
+                                project_id, time.time() - t_stage, faiss_size_kb,
+                                index.ntotal, get_memory_mb())
+                except Exception as stage_exc:
+                    logger.exception("[STAGE_FAIL] project=%s stage=build_faiss elapsed=%.2fs ram=%.1fMB error=%s",
+                                     project_id, time.time() - t_stage, get_memory_mb(), stage_exc)
+                    raise
 
                 # Transition status to FAISS built (Phase 4)
                 supabase_client.table("projects").update({
@@ -1051,102 +1157,129 @@ Elapsed: {elapsed_str}
 
                 _sync_update_progress(project_id, "Uploading Indexes", 90, status="indexing", retry_count=attempt - 1)
 
-                enriched_content = enriched_jsonl_path.read_bytes()
-                StorageService.upload_file("candidate-files", path, enriched_content)
+                # ── STAGE: Upload artifacts ────────────────────────────────
+                t_stage = time.time()
+                logger.info("[STAGE_START] project=%s stage=upload_artifacts ram=%.1fMB", project_id, get_memory_mb())
+                try:
+                    enriched_content = enriched_jsonl_path.read_bytes()
+                    StorageService.upload_file("candidate-files", path, enriched_content)
+                    logger.info("[STAGE_PROGRESS] project=%s stage=upload_artifacts uploaded enriched_candidates", project_id)
+                    del enriched_content
 
-                npy_content = npy_path.read_bytes()
-                StorageService.upload_file("embeddings", f"{project_id}/embeddings_v{version}.npy", npy_content)
+                    npy_content = npy_path.read_bytes()
+                    StorageService.upload_file("embeddings", f"{project_id}/embeddings_v{version}.npy", npy_content)
+                    logger.info("[STAGE_PROGRESS] project=%s stage=upload_artifacts uploaded embeddings_v%d.npy size=%.2fMB",
+                                project_id, version, len(npy_content) / (1024 * 1024))
+                    del npy_content
 
-                faiss_content = faiss.serialize_index(index)
-                StorageService.upload_file("faiss-indexes", f"{project_id}/faiss_v{version}.index", faiss_content)
+                    StorageService.upload_file("faiss-indexes", f"{project_id}/faiss_v{version}.index", faiss_content)
+                    logger.info("[STAGE_PROGRESS] project=%s stage=upload_artifacts uploaded faiss_v%d.index size=%.1fKB",
+                                project_id, version, len(faiss_content) / 1024)
+                    del faiss_content
+                except Exception as stage_exc:
+                    logger.exception("[STAGE_FAIL] project=%s stage=upload_artifacts elapsed=%.2fs ram=%.1fMB error=%s",
+                                     project_id, time.time() - t_stage, get_memory_mb(), stage_exc)
+                    raise
 
-                # Validate that all required artifacts exist (Phase 6 / Integrity verification)
+                logger.info("[STAGE_END] project=%s stage=upload_artifacts elapsed=%.2fs ram=%.1fMB",
+                            project_id, time.time() - t_stage, get_memory_mb())
+
+                # ── STAGE: Validate artifacts ──────────────────────────────
+                t_stage = time.time()
+                logger.info("[STAGE_START] project=%s stage=validate_artifacts", project_id)
                 required_artifacts = [
                     ("embeddings", f"{project_id}/embeddings_v{version}.npy"),
                     ("faiss-indexes", f"{project_id}/faiss_v{version}.index"),
                     ("embeddings", f"{project_id}/ids_v{version}.json"),
                     ("skill-indexes", f"{project_id}/skill_index_v{version}.json"),
                 ]
-                
-                # Check role indexes for each category created
                 for r_cat in role_files.keys():
                     required_artifacts.append(("role-indexes", f"{project_id}/role_{r_cat.upper()}_v{version}.jsonl"))
 
-                all_exist = True
-                missing_list = []
-                for bucket_name, file_path in required_artifacts:
-                    if not StorageService.file_exists(bucket_name, file_path):
-                        all_exist = False
-                        missing_list.append(f"{bucket_name}/{file_path}")
-                        
-                if not all_exist:
-                    missing_str = ", ".join(missing_list)
-                    raise FileNotFoundError(f"Missing required indexing artifacts: {missing_str}")
+                try:
+                    all_exist = True
+                    missing_list = []
+                    for bucket_name, file_path in required_artifacts:
+                        if not StorageService.file_exists(bucket_name, file_path):
+                            all_exist = False
+                            missing_list.append(f"{bucket_name}/{file_path}")
+                            logger.error("[STAGE_FAIL] project=%s stage=validate_artifacts missing=%s",
+                                         project_id, f"{bucket_name}/{file_path}")
 
-                # Transition project status to completed (Phase 4)
-                supabase_client.table("projects").update({
-                    "embedding_status": "completed",
-                    "status": "completed",
-                    "embeddings_path": f"embeddings/{project_id}/embeddings_v{version}.npy",
-                    "faiss_index_path": f"faiss-indexes/{project_id}/faiss_v{version}.index",
-                    "role_index_path": f"role-indexes/{project_id}/role_index_v{version}.json",
-                    "skill_index_path": f"skill-indexes/{project_id}/skill_index_v{version}.json",
-                    "updated_at": _now()
-                }).eq("id", project_id).execute()
-                
-                # pyrefly: ignore [unexpected-keyword]
-                _sync_update_progress(project_id, "Completed", 100, status="completed", processed_candidates=total_candidates, total_candidates=total_candidates, retry_count=attempt - 1)
+                    if not all_exist:
+                        missing_str = ", ".join(missing_list)
+                        raise FileNotFoundError(f"Missing required indexing artifacts: {missing_str}")
+
+                    logger.info("[STAGE_END] project=%s stage=validate_artifacts elapsed=%.2fs all_present=True",
+                                project_id, time.time() - t_stage)
+                except Exception as stage_exc:
+                    logger.exception("[STAGE_FAIL] project=%s stage=validate_artifacts elapsed=%.2fs error=%s",
+                                     project_id, time.time() - t_stage, stage_exc)
+                    raise
+
+                # ── STAGE: Update project + job to completed ───────────────
+                t_stage = time.time()
+                logger.info("[STAGE_START] project=%s stage=mark_completed ram=%.1fMB", project_id, get_memory_mb())
+                try:
+                    supabase_client.table("projects").update({
+                        "embedding_status": "completed",
+                        "status": "completed",
+                        "embeddings_path": f"embeddings/{project_id}/embeddings_v{version}.npy",
+                        "faiss_index_path": f"faiss-indexes/{project_id}/faiss_v{version}.index",
+                        "role_index_path": f"role-indexes/{project_id}/role_index_v{version}.json",
+                        "skill_index_path": f"skill-indexes/{project_id}/skill_index_v{version}.json",
+                        "updated_at": _now()
+                    }).eq("id", project_id).execute()
+                    logger.info("[STAGE_PROGRESS] project=%s stage=mark_completed projects_table_updated", project_id)
+
+                    _sync_update_progress(project_id, "Completed", 100, status="completed",
+                                          processed_candidates=total_candidates,
+                                          total_candidates=total_candidates,
+                                          retry_count=attempt - 1)
+                    logger.info("[STAGE_END] project=%s stage=mark_completed elapsed=%.2fs", project_id, time.time() - t_stage)
+                except Exception as stage_exc:
+                    logger.exception("[STAGE_FAIL] project=%s stage=mark_completed elapsed=%.2fs error=%s",
+                                     project_id, time.time() - t_stage, stage_exc)
+                    raise
 
                 elapsed = time.time() - t_start
                 mem_end = get_memory_mb()
-                logger.info("[BACKGROUND_TASK_SUCCESS] Project ID: %s | Elapsed: %.3fs | Memory: %.2fMB", project_id, elapsed, mem_end)
+                logger.info("[BACKGROUND_TASK_SUCCESS] Project ID: %s | Elapsed: %.3fs | Memory: %.2fMB",
+                            project_id, elapsed, mem_end)
                 print(f"[BACKGROUND_TASK_SUCCESS] Project ID: {project_id} | Elapsed: {elapsed:.3f}s | Memory: {mem_end:.2f}MB", flush=True)
-
-                # Write to IndexIntegrityReport.md (Phase 6)
-                try:
-                    integrity_path = "C:\\Users\\HP\\.gemini\\antigravity-ide\\brain\\b099a49a-5f3b-44e9-8f48-c198d6c4ebba\\IndexIntegrityReport.md"
-                    with open(integrity_path, "w", encoding="utf-8") as f:
-                        f.write("# Index Integrity Report\n\n")
-                        f.write("## Status: PASSED\n\n")
-                        f.write("All required indexing artifacts verified successfully.\n\n")
-                        for bucket_name, file_path in required_artifacts:
-                            f.write(f"* [x] `{bucket_name}/{file_path}`: verified\n")
-                except Exception:
-                    pass
 
                 # If execution reaches here, break retry loop
                 break
 
             except Exception as e:
+                import traceback as _tb
                 elapsed = time.time() - t_start
                 mem_end = get_memory_mb()
-                logger.error("[BACKGROUND_TASK_FAIL] Attempt %d/%d failed: %s", attempt, max_retries, e)
-                
+                tb_str = _tb.format_exc()
+                logger.error(
+                    "[BACKGROUND_TASK_FAIL] project=%s attempt=%d/%d elapsed=%.3fs ram=%.1fMB\n"
+                    "Exception: %s\nTraceback:\n%s",
+                    project_id, attempt, max_retries, elapsed, mem_end, e, tb_str
+                )
+
                 if attempt < max_retries:
-                    # Write retry log in strategy
-                    try:
-                        retry_path = "C:\\Users\\HP\\.gemini\\antigravity-ide\\brain\\b099a49a-5f3b-44e9-8f48-c198d6c4ebba\\RetryStrategy.md"
-                        with open(retry_path, "a", encoding="utf-8") as f:
-                            f.write(f"\n### Attempt {attempt} Failed: {datetime.now().isoformat()}\n")
-                            f.write(f"Error: {e}\nRetrying in {2.0 ** attempt}s...\n")
-                    except Exception:
-                        pass
-                    time.sleep(2.0 ** attempt)
+                    sleep_secs = 2.0 ** attempt
+                    logger.info("[BACKGROUND_TASK_RETRY] project=%s sleeping=%.1fs before attempt %d",
+                                project_id, sleep_secs, attempt + 1)
+                    time.sleep(sleep_secs)
                     continue
                 else:
-                    # Final attempt fail persistence
+                    # Final failure — guarantee in-memory cache is set to failed
+                    # BEFORE calling _sync_fail_job, so SSE sees the terminal state immediately
+                    from app.services.job_manager import JobManager as _JM
+                    _jm = _JM.get_instance()
+                    cache = _jm._progress_cache.get(project_id)
+                    if cache:
+                        cache["status"] = "failed"
+                        cache["current_stage"] = f"Failed: {str(e)[:120]}"
+                        cache["updated_at"] = time.time()
+                    logger.error("[BACKGROUND_TASK_FINAL_FAIL] project=%s marking failed in DB", project_id)
                     _sync_fail_job(project_id, str(e))
-                    
-                    # Write failure to IndexIntegrityReport.md
-                    if "Missing required indexing artifacts" in str(e):
-                        try:
-                            integrity_path = "C:\\Users\\HP\\.gemini\\antigravity-ide\\brain\\b099a49a-5f3b-44e9-8f48-c198d6c4ebba\\IndexIntegrityReport.md"
-                            with open(integrity_path, "w", encoding="utf-8") as f:
-                                f.write("# Index Integrity Report\n\n")
-                                f.write("## Status: FAILED\n\n")
-                                f.write(f"Artifact verification failed: {e}\n")
-                        except Exception:
-                            pass
 
                     supabase_client.table("projects").update({
                         "embedding_status": "failed",
@@ -1313,38 +1446,86 @@ async def get_progress_stream(project_id: str, current_user: Optional[AuthUser] 
         raise HTTPException(status_code=404, detail="Project not found")
 
     async def event_generator():
+        import logging as _log
+        _logger = _log.getLogger(__name__)
         from app.services.job_manager import JobManager
         manager = JobManager.get_instance()
+        last_heartbeat = asyncio.get_event_loop().time()
+        HEARTBEAT_INTERVAL = 5.0  # send a comment ping every 5s to keep connection alive
+        TERMINAL_STATES = {"completed", "failed", "cancelled"}
+
         while True:
-            status_info = manager.get_job_status(project_id)
-            if not status_info:
-                res = supabase_client.table("background_jobs").select("*").eq("project_id", project_id).order("started_at", desc=True).limit(1).execute()
-                if res.data:
-                    job = res.data[0]
-                    status_info = {
-                        "status": job["status"],
-                        "current_stage": job["current_stage"],
-                        "progress_percentage": job["progress_percentage"],
-                        "eta": "00:00:00",
-                        "ram_usage": 0.0,
-                        "peak_ram": 0.0
-                    }
-                else:
-                    status_info = {
-                        "status": "idle",
-                        "current_stage": "Not Started",
-                        "progress_percentage": 0,
-                        "eta": "00:00:00",
-                        "ram_usage": 0.0,
-                        "peak_ram": 0.0
-                    }
-            data_json = json.dumps(status_info)
-            yield f"data: {data_json}\n\n"
-            if status_info["status"] in ["completed", "failed", "cancelled"]:
+            try:
+                status_info = manager.get_job_status(project_id)
+                if not status_info:
+                    res = supabase_client.table("background_jobs").select("*").eq("project_id", project_id).order("started_at", desc=True).limit(1).execute()
+                    if res.data:
+                        job = res.data[0]
+                        status_info = {
+                            "status": job["status"],
+                            "current_stage": job["current_stage"],
+                            "progress_percentage": job["progress_percentage"],
+                            "processed_candidates": 0,
+                            "total_candidates": 0,
+                            "eta": "00:00:00",
+                            "ram_usage": 0.0,
+                            "peak_ram": 0.0,
+                        }
+                    else:
+                        status_info = {
+                            "status": "idle",
+                            "current_stage": "Not Started",
+                            "progress_percentage": 0,
+                            "processed_candidates": 0,
+                            "total_candidates": 0,
+                            "eta": "00:00:00",
+                            "ram_usage": 0.0,
+                            "peak_ram": 0.0,
+                        }
+
+                data_json = json.dumps(status_info)
+                yield f"data: {data_json}\n\n"
+
+                current_status = status_info.get("status", "idle")
+                if current_status in TERMINAL_STATES:
+                    _logger.info("[SSE] project=%s sending terminal event status=%s progress=%s",
+                                 project_id, current_status, status_info.get("progress_percentage"))
+                    # Send one final event explicitly confirming terminal state, then close
+                    yield f"data: {data_json}\n\n"
+                    break
+
+                # Send SSE comment as heartbeat ping to keep the connection alive
+                now = asyncio.get_event_loop().time()
+                if now - last_heartbeat >= HEARTBEAT_INTERVAL:
+                    yield ": heartbeat\n\n"
+                    last_heartbeat = now
+
+            except Exception as sse_exc:
+                _logger.error("[SSE] project=%s event_generator error: %s", project_id, sse_exc)
+                # Send a failed event before closing so the frontend knows
+                error_payload = json.dumps({
+                    "status": "failed",
+                    "current_stage": f"SSE error: {str(sse_exc)[:80]}",
+                    "progress_percentage": 0,
+                    "processed_candidates": 0,
+                    "total_candidates": 0,
+                    "eta": "00:00:00",
+                    "ram_usage": 0.0,
+                    "peak_ram": 0.0,
+                })
+                yield f"data: {error_payload}\n\n"
                 break
+
             await asyncio.sleep(2.0)
 
-    return StreamingResponse(event_generator(), media_type="text/event-stream")
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",  # disable Nginx buffering on Render
+        },
+    )
 
 
 @router.post("/projects/{project_id}/cancel-indexing")
