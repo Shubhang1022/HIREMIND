@@ -310,52 +310,106 @@ class JobManager:
         return self._progress_cache.get(project_id)
 
     async def recover_interrupted_jobs(self):
-        """Startup job checker: restarts interrupted queued/processing tasks or transitions to failed."""
+        """Startup job checker: restarts interrupted jobs with exponential backoff.
+
+        Backoff schedule (seconds): attempt 1 → 60, 2 → 120, 3 → 300.
+        Jobs that have exceeded 3 retries are permanently failed.
+        Jobs whose failure_reason contains MODEL_LOAD_FAILED or MODEL_LOAD_TIMEOUT
+        are also permanently failed — retrying would produce the same hang.
+
+        Prints a recovery summary table to logs on completion.
+        """
+        BACKOFF_SECONDS = {1: 60, 2: 120, 3: 300}
+        NON_RETRYABLE_REASONS = ("MODEL_LOAD_FAILED", "MODEL_LOAD_TIMEOUT", "model_load_failed")
+
+        recovered = 0
+        skipped = 0
+        permanent_failures = 0
+        retry_counts: dict[str, int] = {}
+
         try:
-            res = supabase_client.table("background_jobs").select("*").in_("status", ["queued", "processing", "embedding", "indexing", "retrying"]).execute()
+            res = supabase_client.table("background_jobs").select("*").in_(
+                "status", ["queued", "processing", "embedding", "indexing", "retrying"]
+            ).execute()
             if not res.data:
                 logger.info("[RECOVERY] No interrupted background jobs found.")
+                logger.info(
+                    "[RECOVERY_SUMMARY] recovered=0 skipped=0 permanent_failures=0 retry_counts={}"
+                )
                 return
 
             logger.info("[RECOVERY] Found %d unfinished background jobs.", len(res.data))
 
-            from app.api.v1.endpoints.platform import process_project_data_task
-            
             for job in res.data:
                 project_id = job["project_id"]
                 retry_count = job.get("retry_count", 0)
-                
-                if retry_count < 3:
-                    new_retry = retry_count + 1
-                    logger.info("[RECOVERY] Retrying job %s for project %s (Attempt %d/3)", job["id"], project_id, new_retry)
-                    
-                    # Update status in db
-                    supabase_client.table("background_jobs").update({
-                        "status": "retrying",
-                        "retry_count": new_retry,
-                        "current_stage": "Recovering",
-                        "updated_at": datetime.now(timezone.utc).isoformat()
-                    }).eq("id", job["id"]).execute()
+                failure_reason = job.get("failure_reason") or ""
 
-                    # Re-trigger task inside asyncio event loop
-                    asyncio.create_task(self._safely_run_indexing(project_id))
-                else:
-                    logger.warning("[RECOVERY] Job %s has exceeded max recovery retries. Failing it.", job["id"])
+                is_non_retryable = any(r in failure_reason for r in NON_RETRYABLE_REASONS)
+
+                if is_non_retryable or retry_count >= 3:
+                    reason = (
+                        "Non-retryable failure: model load error." if is_non_retryable
+                        else "Exceeded maximum recovery retries (3)."
+                    )
+                    logger.warning(
+                        "[RECOVERY] Permanently failing job %s for project %s: %s",
+                        job["id"], project_id, reason,
+                    )
                     supabase_client.table("background_jobs").update({
                         "status": "failed",
-                        "failure_reason": "Interrupted by container restart and exceeded max retries.",
-                        "updated_at": datetime.now(timezone.utc).isoformat()
+                        "failure_reason": reason,
+                        "updated_at": datetime.now(timezone.utc).isoformat(),
                     }).eq("id", job["id"]).execute()
-                    
-                    # Update project status
                     supabase_client.table("projects").update({
                         "embedding_status": "failed",
                         "status": "failed",
-                        "updated_at": datetime.now(timezone.utc).isoformat()
+                        "updated_at": datetime.now(timezone.utc).isoformat(),
                     }).eq("id", project_id).execute()
+                    permanent_failures += 1
+                    continue
+
+                new_retry = retry_count + 1
+                delay = BACKOFF_SECONDS.get(new_retry, 300)
+                logger.info(
+                    "[RECOVERY] Scheduling retry %d/3 for job %s project %s in %ds",
+                    new_retry, job["id"], project_id, delay,
+                )
+                supabase_client.table("background_jobs").update({
+                    "status": "retrying",
+                    "retry_count": new_retry,
+                    "current_stage": f"Recovering (attempt {new_retry}/3, backoff {delay}s)",
+                    "updated_at": datetime.now(timezone.utc).isoformat(),
+                }).eq("id", job["id"]).execute()
+
+                asyncio.create_task(self._safely_run_indexing_with_backoff(project_id, delay))
+                recovered += 1
+                retry_counts[project_id] = new_retry
 
         except Exception as e:
             logger.error("[RECOVERY] Error during startup background recovery: %s", e)
+
+        # ── Recovery summary ──────────────────────────────────────────────────
+        logger.info(
+            "[RECOVERY_SUMMARY] recovered=%d skipped=%d permanent_failures=%d retry_counts=%s",
+            recovered, skipped, permanent_failures, retry_counts or "none",
+        )
+        print(
+            f"\n[RECOVERY_SUMMARY] "
+            f"Recovered={recovered} | Skipped={skipped} | "
+            f"Permanent Failures={permanent_failures} | "
+            f"Retry Counts={retry_counts or 'none'}",
+            flush=True,
+        )
+
+    async def _safely_run_indexing_with_backoff(self, project_id: str, delay_seconds: float):
+        """Wait ``delay_seconds`` then spawn the indexing task."""
+        logger.info(
+            "[RECOVERY] Waiting %ds before retrying indexing for project %s",
+            int(delay_seconds), project_id,
+        )
+        await asyncio.sleep(delay_seconds)
+        await self._safely_run_indexing(project_id)
 
     async def _safely_run_indexing(self, project_id: str):
         """Spawns process_project_data_task under a safe wrapper."""

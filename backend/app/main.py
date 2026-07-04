@@ -2,7 +2,14 @@
 
 import asyncio
 import logging
+import os
+import sys
+import time
+import gc
 from contextlib import asynccontextmanager
+from datetime import datetime
+
+import psutil
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -89,14 +96,77 @@ allowed_headers = [
 ]
 
 
-# Exit Signal Handling & Diagnostics (Phase 10 & 5)
-import signal
-import sys
-import os
-import time
-import psutil
-import gc
-from datetime import datetime
+# ── Startup environment validation ────────────────────────────────────────────
+
+_REQUIRED_ENV_VARS = {
+    "SUPABASE_URL": "Supabase project URL (e.g. https://xyz.supabase.co)",
+    "SUPABASE_SERVICE_KEY": "Supabase service role key",
+    "OPENROUTER_API_KEY": "OpenRouter API key for LLM scoring",
+}
+
+def validate_required_env() -> list[str]:
+    """
+    Check all required environment variables. Returns list of missing var names.
+    Logs a clear STARTUP_ERROR for each missing var.
+    Does NOT raise — caller decides whether to abort.
+    """
+    missing = []
+    for var, description in _REQUIRED_ENV_VARS.items():
+        # Check both raw os.environ and settings object
+        raw = os.environ.get(var, "").strip()
+        settings_val = ""
+        if var == "SUPABASE_URL":
+            settings_val = (settings.supabase_url or "").strip()
+        elif var == "SUPABASE_SERVICE_KEY":
+            settings_val = (settings.supabase_service_key or "").strip()
+        elif var == "OPENROUTER_API_KEY":
+            settings_val = (settings.openrouter_api_key or "").strip()
+
+        value = raw or settings_val
+        if not value:
+            logger.error(
+                "[STARTUP_ERROR] Required environment variable %s is not set. "
+                "Description: %s. "
+                "Set this in Render environment variables or .env file before deploying.",
+                var, description,
+            )
+            missing.append(var)
+        else:
+            logger.info("[STARTUP_ENV] %s = %s...", var, value[:8] if len(value) > 8 else "***")
+    return missing
+
+
+def log_startup_summary(missing_vars: list[str]) -> None:
+    """Print a concise, human-readable startup summary to stderr."""
+    proc = psutil.Process(os.getpid())
+    rss = proc.memory_info().rss / (1024 * 1024)
+    avail = psutil.virtual_memory().available / (1024 * 1024)
+    cpu = proc.cpu_percent(interval=None)
+
+    status_line = "✓ ALL REQUIRED VARS PRESENT" if not missing_vars else f"✗ MISSING VARS: {', '.join(missing_vars)}"
+
+    summary = f"""
+╔══════════════════════════════════════════════════════╗
+║         HireMind AI — STARTUP SUMMARY                ║
+╠══════════════════════════════════════════════════════╣
+║  PID          : {os.getpid():<38}║
+║  Python       : {sys.version.split()[0]:<38}║
+║  RSS Memory   : {rss:>6.1f} MB                                 ║
+║  Avail RAM    : {avail:>6.1f} MB                                 ║
+║  CPU          : {cpu:>5.1f}%                                   ║
+║  Embedding    : {settings.embedding_model:<38}║
+║  App Env      : {settings.app_env:<38}║
+║  Supabase URL : {(settings.supabase_url or 'NOT SET')[:38]:<38}║
+║  CORS Origins : {str(settings.cors_origins)[:38]:<38}║
+║  Env Vars     : {status_line:<38}║
+╚══════════════════════════════════════════════════════╝
+"""
+    print(summary, file=sys.stderr, flush=True)
+    logger.info("[STARTUP_SUMMARY] pid=%d rss=%.1fMB avail_ram=%.1fMB model=%s env=%s missing_vars=%s",
+                os.getpid(), rss, avail, settings.embedding_model, settings.app_env,
+                missing_vars or "none")
+
+
 
 _startup_time = time.time()
 
@@ -288,10 +358,16 @@ def verify_ai_dependencies():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Verify required AI dependencies and print status (Phase 7)
+    # ── Step 1: Validate required environment variables ──────────────────────
+    missing_vars = validate_required_env()
+    log_startup_summary(missing_vars)
+    # Warn loudly but do not sys.exit — Render will still get a 200 health check
+    # so operators can see the error in logs rather than getting a crash loop.
+
+    # ── Step 2: Verify AI dependencies ───────────────────────────────────────
     verify_ai_dependencies()
-    
-    # Log startup deployment diagnostics (Phase 10)
+
+    # ── Step 3: Deployment diagnostics ───────────────────────────────────────
     log_deployment_diagnostics("STARTUP")
 
     import sys
@@ -337,7 +413,11 @@ async def lifespan(app: FastAPI):
         print(f"[CORS_STARTUP_WARNING] Production frontend URL {frontend_prod} is missing from CORS allowed origins!", file=sys.stderr, flush=True)
 
     try:
-        from app.api.v1.endpoints.platform import run_startup_initialization
+        from app.api.v1.endpoints.platform import run_startup_initialization, preload_model_singleton
+        # Kick off non-blocking model preload in background thread immediately.
+        # This ensures the model is ready (or being fetched) before the first
+        # candidate upload arrives, avoiding any inline download in a worker thread.
+        preload_model_singleton()
         await run_startup_initialization()
     except Exception as exc:
         logger.warning("Startup lifespan platform initialization error: %s", exc)
@@ -581,10 +661,10 @@ async def health_cors(request: Request):
 
 @app.get("/health", tags=["health"])
 async def detailed_health():
-    import time
-    from app.core.config import settings
-    
-    # 1. Check Supabase database connectivity
+    import time as _time
+    import threading as _threading
+
+    # ── 1. Supabase connectivity ──────────────────────────────────────────────
     db_status = "healthy"
     db_error = None
     try:
@@ -593,8 +673,8 @@ async def detailed_health():
     except Exception as e:
         db_status = "unhealthy"
         db_error = str(e)
-        
-    # 2. Check Storage Service
+
+    # ── 2. Storage connectivity ───────────────────────────────────────────────
     storage_status = "healthy"
     storage_error = None
     try:
@@ -603,46 +683,101 @@ async def detailed_health():
     except Exception as e:
         storage_status = "unhealthy"
         storage_error = str(e)
-        
-    # 3. Model Status (lazy loaded or cached)
-    model_cached = False
-    model_name = settings.embedding_model
+
+    # ── 3. OpenRouter connectivity (lightweight key-presence check) ───────────
+    openrouter_status = "configured" if settings.openrouter_api_key else "not_configured"
+
+    # ── 4. Model singleton status ─────────────────────────────────────────────
+    from app.services import model_service as _ms
+    model_loaded = _ms.is_loaded()
+    model_name = _ms.get_model_name() or settings.embedding_model
+    model_state = _ms._load_state  # type: ignore[attr-defined]
+
+    # ── 5. FAISS availability ─────────────────────────────────────────────────
+    faiss_available = False
     try:
-        from app.api.v1.endpoints.platform import _encoder
-        if _encoder is not None and _encoder._model is not None:
-            model_cached = True
+        import faiss as _faiss  # noqa: F401
+        faiss_available = True
+    except ImportError:
+        pass
+
+    # ── 6. Memory telemetry ───────────────────────────────────────────────────
+    rss_mb = 0.0
+    cpu_pct = 0.0
+    avail_mb = 0.0
+    try:
+        _proc = psutil.Process(os.getpid())
+        rss_mb = _proc.memory_info().rss / (1024 * 1024)
+        cpu_pct = _proc.cpu_percent(interval=None)
+        avail_mb = psutil.virtual_memory().available / (1024 * 1024)
     except Exception:
         pass
-        
-    # 4. Memory Telemetry
+
+    # ── 7. Background jobs ────────────────────────────────────────────────────
+    active_jobs: list[dict] = []
+    failed_recent = 0
     try:
-        from app.api.v1.endpoints.platform import get_memory_mb
-        ram_mb = get_memory_mb()
+        from app.services.job_manager import JobManager
+        from app.api.v1.endpoints.platform import supabase_client as _sc
+        _jm = JobManager.get_instance()
+        for pid, info in _jm._progress_cache.items():
+            active_jobs.append({
+                "project_id": pid,
+                "status": info.get("status"),
+                "stage": info.get("current_stage"),
+                "progress": info.get("progress_percentage"),
+                "processed": info.get("processed_candidates"),
+                "total": info.get("total_candidates"),
+            })
+        _fjobs = _sc.table("background_jobs").select("id").eq("status", "failed").execute()
+        failed_recent = len(_fjobs.data) if _fjobs.data else 0
     except Exception:
-        ram_mb = 0.0
-        
-    overall_status = "healthy"
+        pass
+
+    # ── 8. In-process ranking cache size ─────────────────────────────────────
+    cache_size = 0
+    try:
+        from app.api.v1.endpoints.platform import _backend_ranking_cache
+        cache_size = len(_backend_ranking_cache)
+    except Exception:
+        pass
+
+    # ── 9. Thread count ───────────────────────────────────────────────────────
+    thread_count = _threading.active_count()
+
+    # ── Overall status ────────────────────────────────────────────────────────
+    overall = "healthy"
     if db_status == "unhealthy" or storage_status == "unhealthy":
-        overall_status = "degraded"
-        
+        overall = "degraded"
+    if not model_loaded:
+        overall = "degraded" if overall == "healthy" else overall
+
     return {
-        "status": overall_status,
-        "timestamp": time.time(),
-        "database": {
-            "status": db_status,
-            "error": db_error
-        },
-        "storage": {
-            "status": storage_status,
-            "error": storage_error
-        },
+        "status": overall,
+        "timestamp": _time.time(),
+        "uptime_seconds": round(_time.time() - _startup_time, 1),
+        "database": {"status": db_status, "error": db_error},
+        "storage": {"status": storage_status, "error": storage_error},
+        "openrouter": {"status": openrouter_status},
         "model": {
-            "configured_model": model_name,
-            "is_cached_in_ram": model_cached
+            "loaded": model_loaded,
+            "name": model_name,
+            "load_state": model_state,
+            "configured_model": settings.embedding_model,
         },
+        "faiss": {"available": faiss_available},
         "memory": {
-            "rss_ram_mb": round(ram_mb, 2),
+            "rss_mb": round(rss_mb, 1),
+            "available_mb": round(avail_mb, 1),
             "safety_limit_mb": 450.0,
-            "is_under_safety_threshold": ram_mb < 450.0
-        }
+            "under_threshold": rss_mb < 450.0,
+        },
+        "cpu_percent": round(cpu_pct, 1),
+        "threads": thread_count,
+        "background_jobs": {
+            "active": active_jobs,
+            "active_count": len(active_jobs),
+            "failed_total": failed_recent,
+        },
+        "ranking_cache_size": cache_size,
     }

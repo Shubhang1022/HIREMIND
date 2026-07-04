@@ -17,7 +17,7 @@ _MODEL_CACHE: dict[str, object] = {}
 class EmbeddingEncoder:
     """Wraps sentence-transformers for CPU-only batch encoding."""
 
-    def __init__(self, model_name: str = "BAAI/bge-large-en-v1.5") -> None:
+    def __init__(self, model_name: str = "BAAI/bge-base-en-v1.5") -> None:
         self.model_name = model_name
         self._model = None  # lazy load
 

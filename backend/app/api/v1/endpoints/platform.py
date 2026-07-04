@@ -346,37 +346,56 @@ async def run_startup_initialization() -> None:
         logger.warning("Startup initialization encountered an error: %s", exc)
 
 
-# ── Cached embedding model (loaded once, reused across all requests) ──────────
-_encoder = None
+# ── Embedding model singleton ─────────────────────────────────────────────────
+# All code in this file must go through _get_encoder() to access the model.
+# The model is loaded ONCE via ModelService (preloaded at startup).
+# Never call EmbeddingEncoder() or SentenceTransformer() directly here.
+_encoder = None  # kept for health-check compatibility (main.py references it)
+
 
 def _get_encoder():
-    global _encoder
-    from app.core.config import settings
-    target_model = settings.embedding_model
-    
-    if _encoder is not None:
-        if _encoder.model_name != target_model:
-            import logging
-            logging.getLogger(__name__).info("Embedding model configuration changed from %s to %s. Reloading model...", _encoder.model_name, target_model)
-            try:
-                from src.features.embedding import _MODEL_CACHE
-                _MODEL_CACHE.clear()
-            except Exception:
-                pass
-            _encoder = None
-            import gc
-            gc.collect()
+    """Return the process-wide EmbeddingEncoder backed by the ModelService singleton.
 
-    if _encoder is None:
-        import sys, os
-        _project_root = os.path.dirname(os.path.dirname(os.path.dirname(
-            os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))))
-        if _project_root not in sys.path:
-            sys.path.insert(0, _project_root)
-        from src.features.embedding import EmbeddingEncoder
-        _encoder = EmbeddingEncoder(model_name=target_model)
-        _encoder.load_model()
+    Raises ModelLoadTimeout / ModelLoadFailed on failure — never hangs forever.
+    """
+    global _encoder
+    from app.services.model_service import get_model, is_loaded, ModelLoadTimeout, ModelLoadFailed
+
+    # Fast path: return cached wrapper if already resolved
+    if _encoder is not None:
+        # Verify the underlying model is still the same
+        from app.core.config import settings as _settings
+        if _encoder.model_name == _settings.embedding_model and _encoder._model is not None:
+            return _encoder
+
+    # Get (or wait for) the singleton model
+    raw_model = get_model()  # raises on timeout/failure; never returns None
+
+    # Wrap in EmbeddingEncoder so encode_batch / encode_single / embedding_dim work
+    import sys, os as _os
+    _project_root = _os.path.dirname(_os.path.dirname(_os.path.dirname(
+        _os.path.dirname(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))))))
+    if _project_root not in sys.path:
+        sys.path.insert(0, _project_root)
+
+    from app.core.config import settings as _settings
+    from src.features.embedding import EmbeddingEncoder
+    enc = EmbeddingEncoder(model_name=_settings.embedding_model)
+    enc._model = raw_model  # inject the already-loaded model — no download
+    _encoder = enc
     return _encoder
+
+
+def preload_model_singleton() -> None:
+    """Call from FastAPI lifespan to kick off non-blocking model preload.
+
+    The model loads in a daemon thread so startup is not delayed.
+    The first call to _get_encoder() will block only if the preload is still
+    in progress, but subsequent calls are instant.
+    """
+    from app.services.model_service import preload
+    from app.core.config import settings as _settings
+    preload(model_name=_settings.embedding_model)
 
 
 # ── Memory Telemetry & Active Project Lock ────────────────────────────────────
@@ -705,6 +724,8 @@ def process_project_data_task(project_id: str):
     import tempfile
     import shutil
     import os
+    import threading
+    import psutil
     from pathlib import Path
     import numpy as np
     from datetime import datetime
@@ -915,16 +936,37 @@ Elapsed: {elapsed_str}
                             project_id, settings.embedding_model, get_memory_mb())
                 try:
                     from src.features.text_builder import build_candidate_text
-                    encoder = _get_encoder()
+                    from app.services.model_service import is_loaded, ModelLoadTimeout, ModelLoadFailed
+                    if is_loaded():
+                        logger.info("[MODEL_SERVICE] [MODEL_CACHE_HIT] model already loaded — skipping download")
+                    else:
+                        logger.info("[MODEL_SERVICE] [MODEL_CACHE_MISS] model not yet loaded — waiting for preload")
+                    encoder = _get_encoder()  # singleton: never downloads inside this thread
                     logger.info("[STAGE_END] project=%s stage=load_model elapsed=%.2fs ram=%.1fMB dim=%s",
                                 project_id, time.time() - t_stage, get_memory_mb(),
                                 getattr(encoder, 'embedding_dim', 'unknown'))
                 except Exception as stage_exc:
                     logger.exception(
                         "[STAGE_FAIL] project=%s stage=load_model elapsed=%.2fs ram=%.1fMB "
-                        "error=%s  — likely cause: model download timeout on Render free tier "
-                        "or missing sentence-transformers package",
+                        "error=%s",
                         project_id, time.time() - t_stage, get_memory_mb(), stage_exc)
+                    # Tag the failure reason so recovery loop does NOT retry
+                    from app.services.model_service import ModelLoadTimeout, ModelLoadFailed
+                    if isinstance(stage_exc, (ModelLoadTimeout, ModelLoadFailed)):
+                        _sync_fail_job(project_id, f"MODEL_LOAD_FAILED: {stage_exc}")
+                        supabase_client.table("projects").update({
+                            "embedding_status": "failed",
+                            "status": "FAILED",
+                            "upload_statistics": {"failure_reason": f"MODEL_LOAD_FAILED: {stage_exc}"},
+                            "updated_at": _now(),
+                        }).eq("id", project_id).execute()
+                        # Update in-memory cache so SSE sees terminal state immediately
+                        from app.services.job_manager import JobManager as _JM
+                        _c = _JM.get_instance()._progress_cache.get(project_id)
+                        if _c:
+                            _c["status"] = "failed"
+                            _c["current_stage"] = f"MODEL_LOAD_FAILED: {str(stage_exc)[:100]}"
+                        return  # do NOT continue to retry loop for model-load errors
                     raise
 
                 elapsed_model = time.time() - t_stage
@@ -935,9 +977,11 @@ Elapsed: {elapsed_str}
 
                 # ── STAGE: Generate embeddings + build FAISS ───────────────
                 t_stage = time.time()
-                logger.info("[STAGE_START] project=%s stage=generate_embeddings total_candidates=%d batch_size=32 ram=%.1fMB",
-                            project_id, total_candidates, get_memory_mb())
-                _sync_update_progress(project_id, "Generating Embeddings", 25, status="embedding",
+                total_batches = max(1, (total_candidates + 31) // 32)
+                logger.info("[STAGE_START] project=%s stage=generate_embeddings total_candidates=%d "
+                            "total_batches=%d batch_size=32 ram=%.1fMB",
+                            project_id, total_candidates, total_batches, get_memory_mb())
+                _sync_update_progress(project_id, "Loading Embedding Model", 20, status="embedding",
                                       processed_candidates=0, total_candidates=total_candidates,
                                       retry_count=attempt - 1)
 
@@ -957,7 +1001,43 @@ Elapsed: {elapsed_str}
                 global_idx = 0
                 batch_num = 0
 
+                # ── Memory monitor: log RSS/CPU/threads every 10s during embedding ──
+                _mem_monitor_stop = threading.Event()
+                def _embedding_memory_monitor():
+                    import threading as _threading
+                    MEM_ABORT_THRESHOLD_MB = float(os.environ.get("EMBEDDING_MEM_ABORT_MB", "480"))
+                    while not _mem_monitor_stop.wait(10.0):
+                        try:
+                            proc = psutil.Process(os.getpid())
+                            rss = proc.memory_info().rss / (1024 * 1024)
+                            cpu = proc.cpu_percent(interval=None)
+                            nthreads = proc.num_threads()
+                            logger.info(
+                                "[EMBEDDING_MONITOR] project=%s batch=%d/%d processed=%d/%d "
+                                "RSS=%.1fMB CPU=%.1f%% threads=%d",
+                                project_id, batch_num, total_batches, global_idx, total_candidates,
+                                rss, cpu, nthreads,
+                            )
+                            if rss > MEM_ABORT_THRESHOLD_MB:
+                                logger.error(
+                                    "[EMBEDDING_ABORT] project=%s RSS=%.1fMB exceeds threshold=%.1fMB — "
+                                    "aborting embedding to prevent OOM kill",
+                                    project_id, rss, MEM_ABORT_THRESHOLD_MB,
+                                )
+                                _mem_monitor_stop.set()
+                                job_manager.request_cancellation(project_id)
+                        except Exception:
+                            pass
+                _monitor_thread = threading.Thread(
+                    target=_embedding_memory_monitor, name=f"mem-monitor-{project_id[:8]}", daemon=True
+                )
+                _monitor_thread.start()
+
                 try:
+                    _sync_update_progress(project_id, "Generating Embeddings", 25, status="embedding",
+                                          processed_candidates=0, total_candidates=total_candidates,
+                                          retry_count=attempt - 1)
+
                     with open(raw_embs_path, "wb") as f_raw_embs:
                         batch_candidates = []
                         batch_texts = []
@@ -1016,14 +1096,24 @@ Elapsed: {elapsed_str}
                                         index.add(dummy)
 
                                     global_idx += len(batch_candidates)
-                                    progress_pct = 25 + int(global_idx / max(total_candidates, 1) * 55)
-                                    _sync_update_progress(project_id, "Generating Embeddings", progress_pct,
+                                    # Progress: 25% → 78% across all batches
+                                    progress_pct = 25 + int(global_idx / max(total_candidates, 1) * 53)
+                                    batch_elapsed = time.time() - t_batch
+                                    speed = len(batch_candidates) / max(batch_elapsed, 0.001)
+                                    stage_label = f"Embedding batch {batch_num}/{total_batches} ({global_idx}/{total_candidates})"
+                                    _sync_update_progress(project_id, stage_label, progress_pct,
                                                           status="embedding",
                                                           processed_candidates=global_idx,
                                                           total_candidates=total_candidates,
                                                           retry_count=attempt - 1)
-
-                                    batch_elapsed = time.time() - t_batch
+                                    logger.info(
+                                        "[EMBEDDING_BATCH] project=%s batch=%d/%d "
+                                        "processed=%d/%d progress=%d%% "
+                                        "speed=%.1f cand/s elapsed=%.2fs ram=%.1fMB",
+                                        project_id, batch_num, total_batches,
+                                        global_idx, total_candidates, progress_pct,
+                                        speed, batch_elapsed, get_memory_mb(),
+                                    )
                                     if batch_elapsed > 60.0:
                                         logger.warning("[PIPELINE_TIMEOUT] project=%s stage=generate_embeddings "
                                                        "batch=%d elapsed=%.2fs ram=%.1fMB candidates_so_far=%d",
@@ -1063,11 +1153,15 @@ Elapsed: {elapsed_str}
                                     index.add(dummy)
 
                                 global_idx += len(batch_candidates)
-                                _sync_update_progress(project_id, "Generating Embeddings", 80,
-                                                      status="embedding",
-                                                      processed_candidates=global_idx,
-                                                      total_candidates=total_candidates,
-                                                      retry_count=attempt - 1)
+                                _sync_update_progress(
+                                    project_id,
+                                    f"Embedding batch {batch_num}/{total_batches} ({global_idx}/{total_candidates})",
+                                    78,
+                                    status="embedding",
+                                    processed_candidates=global_idx,
+                                    total_candidates=total_candidates,
+                                    retry_count=attempt - 1,
+                                )
                                 log_worker_heartbeat("Generating Embeddings", global_idx, total_candidates, batch_num)
 
                 except Exception as stage_exc:
@@ -1076,6 +1170,9 @@ Elapsed: {elapsed_str}
                                      project_id, time.time() - t_stage, get_memory_mb(),
                                      global_idx, total_candidates, stage_exc)
                     raise
+                finally:
+                    # Always stop the memory monitor thread
+                    _mem_monitor_stop.set()
 
                 logger.info("[STAGE_END] project=%s stage=generate_embeddings elapsed=%.2fs "
                             "ram=%.1fMB processed=%d batches=%d dim=%s",
@@ -1365,32 +1462,36 @@ def _sync_fail_job(project_id: str, reason: str):
     else:
         loop.run_until_complete(coro)
 
-# Watchdog run
+# Watchdog run — marks jobs whose heartbeat is older than 2 minutes as failed
 def _run_worker_watchdog():
+    WATCHDOG_TIMEOUT_MINUTES = float(os.environ.get("WATCHDOG_TIMEOUT_MINUTES", "2"))
     try:
         res = supabase_client.table("background_jobs").select("*").in_("status", ["queued", "processing", "embedding", "indexing", "retrying"]).execute()
         now_dt = datetime.now(timezone.utc)
         for job in res.data:
-            updated_at_str = job.get("updated_at") or job.get("started_at")
+            updated_at_str = job.get("last_heartbeat") or job.get("updated_at") or job.get("started_at")
             if updated_at_str:
                 updated_at_dt = datetime.fromisoformat(updated_at_str.replace("Z", "+00:00"))
                 elapsed_min = (now_dt - updated_at_dt).total_seconds() / 60.0
-                if elapsed_min > 10.0:
+                if elapsed_min > WATCHDOG_TIMEOUT_MINUTES:
                     project_id = job["project_id"]
-                    # Mark as failed in DB
+                    logger.warning(
+                        "[WATCHDOG] job=%s project=%s status=%s heartbeat_age=%.1f min > threshold=%.1f min — marking failed",
+                        job["id"], project_id, job["status"], elapsed_min, WATCHDOG_TIMEOUT_MINUTES,
+                    )
                     supabase_client.table("background_jobs").update({
                         "status": "failed",
-                        "failure_reason": f"Watchdog timeout: Indexing stalled for {elapsed_min:.1f} minutes.",
+                        "failure_reason": f"Watchdog timeout: no heartbeat for {elapsed_min:.1f} minutes (threshold {WATCHDOG_TIMEOUT_MINUTES:.0f} min).",
                         "updated_at": datetime.now(timezone.utc).isoformat()
                     }).eq("id", job["id"]).execute()
-                    
+
                     supabase_client.table("projects").update({
                         "embedding_status": "failed",
                         "status": "failed",
                         "updated_at": _now()
                     }).eq("id", project_id).execute()
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.error("[WATCHDOG] Error in watchdog: %s", exc)
 
 
 @router.get("/projects/{project_id}/worker-status")

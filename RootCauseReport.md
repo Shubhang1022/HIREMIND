@@ -1,103 +1,119 @@
-# RootCauseReport.md — Root Cause Analysis: Indexing Stuck at 20%
+# RootCauseReport.md — Indexing Stuck at 20%: Root Cause
 
-## Confirmed Root Cause
+## The Exact Failure Chain
 
-**The indexing pipeline hangs at 20% because `SentenceTransformer(model_name, device="cpu")` blocks indefinitely when the model is not cached and the network is slow or timing out — with no exception, no timeout, and no log output.**
-
----
-
-## Issue 1 — Model load has no timeout and produces no log before hanging
-
-| Field | Detail |
-|-------|--------|
-| **Problem** | Progress reaches 20%, then nothing happens for minutes |
-| **Root cause** | `_get_encoder()` calls `EmbeddingEncoder.load_model()` which calls `SentenceTransformer(model_name, device="cpu")`. This downloads `BAAI/bge-large-en-v1.5` (~1.3 GB) from HuggingFace Hub if not cached. There is no timeout on the HTTP download. On Render's network, this can take 120–300 seconds, or hang indefinitely if the proxy returns no data. There was no log line before the call, so Render logs showed nothing after `progress=20%`. |
-| **Affected file** | `backend/app/api/v1/endpoints/platform.py` — `process_project_data_task` |
-| **Affected line** | `encoder = _get_encoder()` (was line ~985, after `_sync_update_progress(..., 20, ...)`) |
-| **Severity** | 🔴 Critical — entire pipeline stops here every cold start |
-| **Fix applied** | Added `[STAGE_START] stage=load_model` log **before** the call, `[STAGE_END]` after, and `[STAGE_FAIL]` with full traceback on exception. Added `[PIPELINE_TIMEOUT]` warning if elapsed > 60s. |
-
----
-
-## Issue 2 — Exception from model load not attributed to any stage
-
-| Field | Detail |
-|-------|--------|
-| **Problem** | When the model download eventually failed (timeout, OOM), the outer `except Exception as e` logged `[BACKGROUND_TASK_FAIL] Attempt N/3 failed: <message>`. No stage name, no traceback, no RAM value. Impossible to distinguish from a FAISS error or a Supabase error. |
-| **Root cause** | The entire embedding block (model load + all batches + FAISS + uploads) was inside a single outer try/except with no per-stage isolation. |
-| **Affected file** | `backend/app/api/v1/endpoints/platform.py` |
-| **Severity** | 🔴 Critical — makes production debugging impossible |
-| **Fix applied** | Every stage is now wrapped in its own `try/except` that logs `[STAGE_FAIL]` with stage name, elapsed time, RAM, and `logger.exception()` (full traceback). Each re-raises so the outer retry loop still handles it. |
+```
+1. Upload candidates → background task starts → progress reaches 20%
+2. _get_encoder() is called from inside process_project_data_task()
+3. _encoder is None (no startup preload) → calls EmbeddingEncoder.load_model()
+4. load_model() calls SentenceTransformer("BAAI/bge-large-en-v1.5", device="cpu")
+5. HuggingFace Hub starts downloading 1.34 GB of model weights
+6. Download stalls (Render free tier network: slow, proxy idle-timeout, no HF cache mounted)
+7. SentenceTransformer() has NO download timeout — the call blocks indefinitely
+8. Worker thread hangs. No log output. No progress update.
+9. Render detects the process as unresponsive (no HTTP traffic, or memory pressure)
+10. Render restarts the container.
+11. FastAPI lifespan runs → recover_interrupted_jobs() fires
+12. DB still shows job status = "embedding" / "processing"
+13. retry_count < 3 → job re-queued via asyncio.create_task(_safely_run_indexing)
+14. New process starts → _get_encoder() called again
+15. Model cache is gone (new process) → re-downloads again → hangs again
+16. GOTO step 9. Infinite loop.
+```
 
 ---
 
-## Issue 3 — In-memory cache not updated on failure → SSE loops forever
+## Root Cause 1 — Wrong model size (LARGE instead of BASE)
 
-| Field | Detail |
-|-------|--------|
-| **Problem** | After all 3 retries failed, the SSE stream continued emitting `status=embedding, progress=20%` forever. The frontend never received `status=failed`. |
-| **Root cause** | On the failure path, `_sync_fail_job(project_id, reason)` was called to update the DB. But `_sync_fail_job` schedules an async coroutine with a 5s timeout on the event loop. Meanwhile `_progress_cache[project_id]["status"]` was still `"embedding"`. The SSE `event_generator` reads the in-memory cache first. It checked `if status_info["status"] in ["completed", "failed", "cancelled"]` — but since the cache still said `"embedding"`, this was never true. The loop ran indefinitely. |
-| **Affected file** | `backend/app/api/v1/endpoints/platform.py` — failure path of `process_project_data_task` |
-| **Severity** | 🔴 Critical — UI permanently frozen; user cannot take any action |
-| **Fix applied** | In-memory cache is now updated to `status="failed"` synchronously (direct dict mutation) **before** calling `_sync_fail_job`. SSE reads the cache immediately and sees the terminal state on the next 2-second poll. |
+**File**: `backend/app/core/config.py` line 83
 
----
+```python
+embedding_model: str = "BAAI/bge-large-en-v1.5"
+```
 
-## Issue 4 — SSE emits no error event before closing on internal exception
+`BAAI/bge-large-en-v1.5` is **1.34 GB** on disk. `BAAI/bge-base-en-v1.5` is **438 MB** — 3× smaller with <3% quality difference for retrieval tasks. On Render's free tier (512 MB RAM) the large model alone exceeds available memory, causing the process to be OOM-killed mid-download.
 
-| Field | Detail |
-|-------|--------|
-| **Problem** | If `event_generator` itself threw an exception (e.g., Supabase query error), the generator would stop without sending any event. The client would see the connection drop silently. |
-| **Root cause** | No try/except inside `event_generator`. |
-| **Affected file** | `backend/app/api/v1/endpoints/platform.py` — `get_progress_stream` |
-| **Severity** | 🟠 Medium |
-| **Fix applied** | `event_generator` now wraps the poll loop in try/except. On any error, it emits a `status=failed` event before breaking, so the frontend always gets a terminal signal. |
+**No `EMBEDDING_MODEL` or `EMBEDDING_MODEL_NAME` environment variable is set in `.env`**, so the hardcoded large model is always used.
 
 ---
 
-## Issue 5 — No SSE heartbeat; proxy closes idle connections
+## Root Cause 2 — No model preload; model loaded inside background thread
 
-| Field | Detail |
-|-------|--------|
-| **Problem** | During model download (60–300s), no SSE events were emitted. Render's proxy (and Nginx) close connections idle for >60s. The frontend `EventSource` would fire `onerror`. |
-| **Root cause** | `event_generator` had `await asyncio.sleep(2.0)` at the bottom of the loop, but if the worker was blocked in a thread (model download), the loop itself wasn't reached — the SSE coroutine was simply waiting for the next 2s tick. Between ticks, if the worker was busy, no data was sent. The 2s interval was fine for fast batches but provided no protection against long operations. |
-| **Severity** | 🟠 Medium — caused the SSE disconnect that appeared in the browser console |
-| **Fix applied** | Added SSE comment-line heartbeat (`": heartbeat\n\n"`) every 5 seconds. Comment lines are ignored by browsers but prevent proxy timeout. Also added `Cache-Control: no-cache` and `X-Accel-Buffering: no` response headers. |
+**File**: `backend/app/api/v1/endpoints/platform.py` — `process_project_data_task()`
 
----
+```python
+encoder = _get_encoder()  # called inside the worker thread, after progress=20%
+```
 
-## Issue 6 — Frontend permanently lost SSE on `onerror`, never reconnected
-
-| Field | Detail |
-|-------|--------|
-| **Problem** | When the SSE connection was dropped (proxy timeout, backend restart, issue 5 above), the frontend called `eventSource.close()` and never reconnected. Progress bar remained frozen at whatever value was last seen. The user had no way to know if the job was still running, had failed, or had completed. |
-| **Root cause** | `onerror` handler only closed the connection without scheduling a reconnect. |
-| **Affected file** | `frontend/src/app/(dashboard)/projects/[id]/page.tsx` |
-| **Severity** | 🟠 Medium — secondary symptom of issues 3 and 5 |
-| **Fix applied** | Frontend now reconnects with exponential backoff (2s initial, 1.5× multiplier, 15s cap). Reconnect is cancelled when a terminal event (`completed`, `failed`, `cancelled`) is received or the component unmounts. |
+`_get_encoder()` calls `load_model()` which calls `SentenceTransformer(model_name, device="cpu")`. This is a blocking synchronous call inside a background thread. There is no timeout on the HTTP download. The thread simply waits forever.
 
 ---
 
-## Issue 7 — Zero-division risk in progress formula
+## Root Cause 3 — No download timeout on SentenceTransformer
 
-| Field | Detail |
-|-------|--------|
-| **Problem** | `progress_pct = 20 + int(global_idx / total_candidates * 60)` — if `total_candidates` is 0 (empty file), this raises `ZeroDivisionError` inside the batch loop. |
-| **Root cause** | No guard on division by zero. |
-| **Affected file** | `backend/app/api/v1/endpoints/platform.py` |
-| **Severity** | 🟡 Low — only triggers if upload contained zero valid candidates (already rejected earlier, but defensive fix applied) |
-| **Fix applied** | Changed to `int(global_idx / max(total_candidates, 1) * 55)` with adjusted range 25–80%. |
+**File**: `src/features/embedding.py` — `load_model()`
+
+```python
+model = SentenceTransformer(self.model_name, **kwargs)
+```
+
+`SentenceTransformer.__init__` calls `huggingface_hub.snapshot_download()` internally. No timeout is passed. On a slow or stalled network connection, this call blocks for minutes or indefinitely.
+
+---
+
+## Root Cause 4 — Recovery loop recreates the infinite hang
+
+**File**: `backend/app/services/job_manager.py` — `recover_interrupted_jobs()`
+
+```python
+if retry_count < 3:
+    new_retry = retry_count + 1
+    # Update DB to retrying
+    asyncio.create_task(self._safely_run_indexing(project_id))
+```
+
+This fires on every Render restart. `_safely_run_indexing` calls `process_project_data_task` which calls `_get_encoder()` which hangs. The model cache does not survive restarts (it lives in `src/features/embedding._MODEL_CACHE`, a module-level dict that is empty in every new process). So every restart produces exactly the same hang.
+
+The fix_count check (`retry_count < 3`) provides three restarts worth of retries before permanently failing — but each retry takes as long as the download timeout, and if Render kills the process before any retry completes, `retry_count` is never actually incremented in DB (since the failure path is never reached), so the same job is retried on every restart indefinitely.
+
+---
+
+## Root Cause 5 — HuggingFace cache not persistent on Render
+
+**File**: `src/features/embedding.py` — `load_model()`
+
+```python
+os.environ["HF_HOME"] = "/app/.cache/huggingface"
+```
+
+`/app/.cache/huggingface` is inside the ephemeral Docker filesystem on Render. It is destroyed on every restart. Unless a persistent disk is mounted at this path, the 1.34 GB model is re-downloaded from scratch on every cold start.
+
+---
+
+## Root Cause 6 — Model instantiated in multiple code paths
+
+Every execution path that needs embeddings creates its own `EmbeddingEncoder` instance or calls `_get_encoder()` independently:
+
+| File | Line | Call |
+|------|------|------|
+| `backend/app/api/v1/endpoints/platform.py` | ~918 | `encoder = _get_encoder()` inside indexing task |
+| `backend/app/api/v1/endpoints/platform.py` | ~2578 | `encoder = _get_encoder()` inside analysis task |
+| `backend/app/api/v1/endpoints/platform.py` | ~2741 | `UnifiedRankingEngine(encoder=_get_encoder(), ...)` |
+| `src/intelligence/embeddings.py` | 22 | `self._encoder = EmbeddingEncoder(model_name=...)` + `load()` |
+| `rank.py` | 178 | `encoder = EmbeddingEncoder(model_name=settings.embedding_model)` |
+| `precompute.py` | 141 | `encoder = EmbeddingEncoder(model_name=args.model)` |
+
+The `_MODEL_CACHE` dict in `src/features/embedding.py` prevents double-instantiation **within the same process lifetime**, but does not prevent re-download after restart.
 
 ---
 
 ## Summary
 
-| # | Severity | Status | Description |
-|---|----------|--------|-------------|
-| 1 | 🔴 Critical | ✅ Fixed | Model load hangs silently, no log, no timeout detection |
-| 2 | 🔴 Critical | ✅ Fixed | No per-stage exception isolation or traceback logging |
-| 3 | 🔴 Critical | ✅ Fixed | In-memory cache not updated on failure → SSE loops forever |
-| 4 | 🟠 Medium  | ✅ Fixed | SSE generator crashes silently with no terminal event |
-| 5 | 🟠 Medium  | ✅ Fixed | No heartbeat → proxy closes idle SSE connection |
-| 6 | 🟠 Medium  | ✅ Fixed | Frontend never reconnects after SSE drop |
-| 7 | 🟡 Low     | ✅ Fixed | Division by zero in progress formula |
+| # | Severity | Root Cause |
+|---|----------|-----------|
+| 1 | 🔴 Critical | `bge-large-en-v1.5` (1.34 GB) exceeds Render free-tier RAM; blocks download indefinitely |
+| 2 | 🔴 Critical | Model loaded inside background thread with no timeout — hangs silently |
+| 3 | 🔴 Critical | Recovery loop retries same hanging job on every restart → infinite loop |
+| 4 | 🟠 High | No startup preload — first upload always cold-loads the model |
+| 5 | 🟠 High | HF cache at `/app/.cache/` is ephemeral — re-downloaded on every restart |
+| 6 | 🟡 Medium | Multiple instantiation sites risk repeated loads if cache is cleared |
