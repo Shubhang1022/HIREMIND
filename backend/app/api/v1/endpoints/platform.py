@@ -1994,11 +1994,42 @@ async def cancel_indexing(project_id: str, current_user: Optional[AuthUser] = De
 
 @router.get("/projects")
 async def list_projects(current_user: Optional[AuthUser] = Depends(get_optional_user)):
-    _enforce_analysis_timeouts()
-    _enforce_embedding_timeouts()
-    user_id = get_user_id(current_user)
-    res = supabase_client.table("projects").select("*").eq("user_id", user_id).execute()
-    return res.data
+    import traceback as _tb
+    import threading as _thr
+    _t0 = time.time()
+    _tid = _thr.get_ident()
+    _pid = os.getpid()
+    logger.info("[REQUEST_RECEIVED] GET /projects pid=%d tid=%d", _pid, _tid)
+    try:
+        user_id = get_user_id(current_user)
+        logger.info("[AUTH_VERIFIED] GET /projects user=%s elapsed=%.3fs", user_id[:8], time.time() - _t0)
+        logger.info("[USER_RESOLVED] GET /projects user=%s elapsed=%.3fs", user_id[:8], time.time() - _t0)
+
+        logger.info("[QUERY_STARTED] GET /projects elapsed=%.3fs", time.time() - _t0)
+        res = supabase_client.table("projects").select("*").eq("user_id", user_id).execute()
+        logger.info("[SUPABASE_RESPONSE] GET /projects rows=%d elapsed=%.3fs",
+                    len(res.data) if res.data else 0, time.time() - _t0)
+
+        data = res.data or []
+        logger.info("[SERIALIZATION] GET /projects rows=%d elapsed=%.3fs", len(data), time.time() - _t0)
+        logger.info("[RESPONSE_SENT] GET /projects elapsed=%.3fs", time.time() - _t0)
+        return data
+
+    except HTTPException:
+        raise
+    except Exception as exc:
+        tb_str = _tb.format_exc()
+        rss = get_memory_mb()
+        logger.error(
+            "[REQUEST_EXCEPTION] GET /projects elapsed=%.3fs rss=%.1fMB tid=%d\n"
+            "Exception: %s\nTraceback:\n%s",
+            time.time() - _t0, rss, _tid, exc, tb_str,
+        )
+        return JSONResponse(
+            status_code=500,
+            content={"detail": f"Internal error listing projects: {exc}",
+                     "traceback": tb_str},
+        )
 
 
 @router.post("/projects", status_code=status.HTTP_201_CREATED)
@@ -2039,8 +2070,6 @@ async def create_project(
 
 @router.get("/projects/{project_id}")
 async def get_project(project_id: str, current_user: Optional[AuthUser] = Depends(get_optional_user)):
-    _enforce_analysis_timeouts()
-    _enforce_embedding_timeouts()
     user_id = get_user_id(current_user)
     res = supabase_client.table("projects").select("*").eq("id", project_id).eq("user_id", user_id).execute()
     if not res.data:

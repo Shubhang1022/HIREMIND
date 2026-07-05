@@ -407,6 +407,20 @@ async def lifespan(app: FastAPI):
     async def _deferred_startup():
         # Small yield so uvicorn finishes binding and starts accepting connections
         await asyncio.sleep(0.5)
+
+        # Mark API as ready immediately — server is live and accepting requests
+        try:
+            from app.core.startup_state import (
+                mark_api_ready,
+                mark_startup_check_complete,
+                mark_initialization_complete,
+            )
+            mark_api_ready()
+            logger.info("[STARTUP_STATE] mark_api_ready() called")
+        except Exception as exc:
+            logger.warning("[STARTUP_STATE] mark_api_ready failed: %s", exc)
+
+        startup_ok = False
         try:
             startup_ok = run_startup_check()
             if not startup_ok:
@@ -416,12 +430,26 @@ async def lifespan(app: FastAPI):
                 )
         except Exception as exc:
             logger.warning("[STARTUP] run_startup_check deferred error: %s", exc)
+        finally:
+            try:
+                from app.core.startup_state import mark_startup_check_complete
+                mark_startup_check_complete(ok=startup_ok)
+                logger.info("[STARTUP_STATE] mark_startup_check_complete(ok=%s) called", startup_ok)
+            except Exception as exc:
+                logger.warning("[STARTUP_STATE] mark_startup_check_complete failed: %s", exc)
 
         try:
             from app.api.v1.endpoints.platform import run_startup_initialization
             await run_startup_initialization()
         except Exception as exc:
             logger.warning("[STARTUP] run_startup_initialization error: %s", exc)
+        finally:
+            try:
+                from app.core.startup_state import mark_initialization_complete
+                mark_initialization_complete()
+                logger.info("[STARTUP_STATE] mark_initialization_complete() called")
+            except Exception as exc:
+                logger.warning("[STARTUP_STATE] mark_initialization_complete failed: %s", exc)
 
         # Model service diagnostics (runs ~0.5s after boot, non-blocking)
         try:
