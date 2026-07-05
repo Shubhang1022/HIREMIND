@@ -373,220 +373,125 @@ def run_startup_check() -> bool:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # ── Step 1: Validate required environment variables ──────────────────────
+    # ── Step 1: Validate env vars — fast, no I/O ─────────────────────────────
     missing_vars = validate_required_env()
     log_startup_summary(missing_vars)
 
-    # ── Step 2: Full STARTUP CHECK (subsystem verification table) ────────────
-    startup_ok = run_startup_check()
-    if not startup_ok:
-        logger.error(
-            "[STARTUP_FAILED] One or more critical subsystem checks failed. "
-            "The service will start but may not function correctly. "
-            "Fix the issues above and redeploy."
-        )
+    # ── Step 2: Record pre-preload RSS for the performance report ─────────────
+    _rss_before_preload = psutil.Process(os.getpid()).memory_info().rss / (1024 * 1024)
+    _api_ready_time = time.time()
+    logger.info(
+        "[STARTUP_PERF] API ready in %.2fs | RSS=%.1fMB (before model preload)",
+        _api_ready_time - _startup_time, _rss_before_preload,
+    )
+    print(
+        f"[STARTUP_PERF] API accepting requests — "
+        f"elapsed={_api_ready_time - _startup_time:.2f}s RSS={_rss_before_preload:.1f}MB",
+        flush=True,
+    )
 
-    # ── Step 3: Deployment diagnostics ───────────────────────────────────────
-    log_deployment_diagnostics("STARTUP")
-
-    import sys
-    import os
-    from pathlib import Path
-
-    # Verify OpenRouter Key Loaded (Requirement 2)
-    key_val = settings.openrouter_api_key
-    key_preview = key_val[:12] if key_val else "MISSING"
-
-    # Check key source
-    env_file_path = Path(__file__).resolve().parent.parent.parent / ".env"
-    has_system_env = "OPENROUTER_API_KEY" in os.environ
-    env_file_key = None
-    if env_file_path.is_file():
-        try:
-            with open(env_file_path, "r", encoding="utf-8") as f:
-                for line in f:
-                    if line.strip().startswith("OPENROUTER_API_KEY="):
-                        env_file_key = line.split("=", 1)[1].strip()
-                        if env_file_key.startswith(('"', "'")) and env_file_key.endswith(('"', "'")):
-                            env_file_key = env_file_key[1:-1]
-        except Exception:
-            pass
-
-    source = "system environment"
-    if env_file_key and key_val == env_file_key:
-        source = ".env file"
-    elif has_system_env:
-        source = "system environment (overridden by custom source priority)"
-
-    print(f"OpenRouter Key Loaded: {key_preview}... (Source: {source})", file=sys.stderr, flush=True)
-    logger.warning("OpenRouter Key Loaded: %s... (Source: %s)", key_preview, source)
-
-    # Log normalized origin list (Task 3)
-    logger.info("[CORS_STARTUP] Normalized CORS Allowed Origins: %s", allowed_origins)
-    print(f"[CORS_STARTUP] Normalized CORS Allowed Origins: {allowed_origins}", file=sys.stderr, flush=True)
-
-    # Compare Origin vs Configured Frontend URL (Task 7)
-    frontend_prod = "https://hiremind-gilt.vercel.app"
-    if frontend_prod not in allowed_origins:
-        logger.warning("[CORS_STARTUP] Production frontend URL %s is missing from CORS allowed origins!", frontend_prod)
-        print(f"[CORS_STARTUP_WARNING] Production frontend URL {frontend_prod} is missing from CORS allowed origins!", file=sys.stderr, flush=True)
-
+    # ── Step 3: Kick off non-blocking model preload in background thread ──────
+    # preload_model_singleton() returns immediately — model loads in a daemon thread.
+    # The /health endpoint reports model_state=loading until it completes.
+    # NO blocking calls before yield — server starts accepting requests NOW.
     try:
-        from app.api.v1.endpoints.platform import run_startup_initialization, preload_model_singleton
-        # model_service was already validated in run_startup_check(); no need to re-import.
-        # Kick off non-blocking model preload in background thread immediately.
+        from app.api.v1.endpoints.platform import preload_model_singleton
         preload_model_singleton()
-        await run_startup_initialization()
+    except Exception as exc:
+        logger.warning("[STARTUP] preload_model_singleton failed: %s", exc)
 
-        # ── Task 8: MODEL SERVICE DIAGNOSTICS block ───────────────────────────
-        # Wait up to 2 seconds for the preload thread to get past its first check
-        # (either cache-hit fast path or has-started-downloading state).
-        await asyncio.sleep(0.1)
+    # ── Step 4: Schedule deferred startup tasks as a background asyncio task ──
+    # run_startup_check() makes network calls (Supabase, Storage).
+    # Scheduling it as a background task means the server yields and becomes
+    # ready immediately; the check runs after the first event-loop iteration.
+    async def _deferred_startup():
+        # Small yield so uvicorn finishes binding and starts accepting connections
+        await asyncio.sleep(0.5)
+        try:
+            startup_ok = run_startup_check()
+            if not startup_ok:
+                logger.error(
+                    "[STARTUP_FAILED] One or more critical subsystem checks failed. "
+                    "Service is running but may be degraded."
+                )
+        except Exception as exc:
+            logger.warning("[STARTUP] run_startup_check deferred error: %s", exc)
 
+        try:
+            from app.api.v1.endpoints.platform import run_startup_initialization
+            await run_startup_initialization()
+        except Exception as exc:
+            logger.warning("[STARTUP] run_startup_initialization error: %s", exc)
+
+        # Model service diagnostics (runs ~0.5s after boot, non-blocking)
         try:
             from app.services import model_service as _ms_mod
-            _ms_loaded   = _ms_mod.is_loaded()
-            _ms_name     = _ms_mod.get_model_name() or settings.embedding_model
-            _ms_state    = _ms_mod.get_load_state()
-            _ms_err      = _ms_mod.get_load_error()
-            _ms_rss      = psutil.Process(os.getpid()).memory_info().rss / (1024 * 1024)
-            _ms_threads  = threading.active_count()
-            _ms_import   = "OK"
-        except Exception as _diag_exc:
-            _ms_loaded = False; _ms_name = "unknown"; _ms_state = "error"
-            _ms_err = _diag_exc; _ms_rss = 0.0; _ms_threads = 0
-            _ms_import = f"FAILED: {_diag_exc}"
+            _ms_state  = _ms_mod.get_load_state()
+            _ms_name   = _ms_mod.get_model_name() or settings.embedding_model
+            _ms_rss    = psutil.Process(os.getpid()).memory_info().rss / (1024 * 1024)
+            _ms_threads = threading.active_count()
+            print(
+                f"\n============================== MODEL SERVICE DIAGNOSTICS ==============================\n"
+                f"  Import OK    : OK\n"
+                f"  Load State   : {_ms_state}\n"
+                f"  Model Name   : {_ms_name}\n"
+                f"  Current RAM  : {_ms_rss:.1f} MB\n"
+                f"  Thread Count : {_ms_threads}\n"
+                f"==============================",
+                flush=True,
+            )
+            logger.info(
+                "[MODEL_SERVICE_DIAGNOSTICS] state=%s name=%s ram=%.1fMB threads=%d",
+                _ms_state, _ms_name, _ms_rss, _ms_threads,
+            )
+        except Exception as exc:
+            logger.warning("[STARTUP] model diagnostics error: %s", exc)
 
-        _diag_block = f"""
-============================== MODEL SERVICE DIAGNOSTICS ==============================
-  Import OK         : {_ms_import}
-  Singleton Created : {"YES" if _ms_loaded else "NOT YET (loading in background)"}
-  Model Name        : {_ms_name}
-  Load State        : {_ms_state}
-  Load Error        : {_ms_err or "None"}
-  Model Ready       : {_ms_loaded}
-  Current RAM       : {_ms_rss:.1f} MB
-  Thread Count      : {_ms_threads}
-==============================
-"""
-        print(_diag_block, flush=True)
-        logger.info("[MODEL_SERVICE_DIAGNOSTICS] import=%s state=%s loaded=%s name=%s ram=%.1fMB threads=%d",
-                    _ms_import, _ms_state, _ms_loaded, _ms_name, _ms_rss, _ms_threads)
+        log_deployment_diagnostics("STARTUP_COMPLETE")
 
-    except Exception as exc:
-        logger.warning("Startup lifespan platform initialization error: %s", exc)
+    asyncio.create_task(_deferred_startup())
 
-    # Print middleware stack execution order (Task 1)
-    print("--- Audited Middleware Execution Order (First to Last) ---", file=sys.stderr, flush=True)
-    for idx, m in enumerate(reversed(app.user_middleware)):
-        print(f"[{idx}] Middleware Class: {m.cls.__name__}", file=sys.stderr, flush=True)
+    # Log CORS config
+    logger.info("[CORS_STARTUP] Allowed Origins: %s", allowed_origins)
+    frontend_prod = "https://hiremind-gilt.vercel.app"
+    if frontend_prod not in allowed_origins:
+        logger.warning("[CORS_STARTUP] Production frontend URL %s missing from allowed origins!", frontend_prod)
 
-    # Programmatically generate RegisteredRoutes.md and MiddlewareOrder.md (Task 1 & 4)
-    try:
-        artifacts_dir = "C:\\Users\\HP\\.gemini\\antigravity-ide\\brain\\b099a49a-5f3b-44e9-8f48-c198d6c4ebba"
-        os.makedirs(artifacts_dir, exist_ok=True)
-        
-        # RegisteredRoutes.md
-        routes_lines = [
-            "# Registered API Routes\n",
-            "This document lists all active routes and HTTP methods registered on the FastAPI backend.\n",
-            "| Route Path | HTTP Methods | Description |",
-            "| :--- | :--- | :--- |"
-        ]
-        for route in app.routes:
-            methods = ", ".join(route.methods) if getattr(route, "methods", None) else "ASGI App / Lifespan"
-            desc = getattr(route, "description", None) or getattr(route, "summary", None) or "No description"
-            routes_lines.append(f"| `{route.path}` | `{methods}` | {desc} |")
-        with open(os.path.join(artifacts_dir, "RegisteredRoutes.md"), "w", encoding="utf-8") as f:
-            f.write("\n".join(routes_lines))
-        logger.info("Successfully programmatically generated RegisteredRoutes.md")
-        
-        # MiddlewareOrder.md
-        mw_lines = [
-            "# Audited Middleware Order\n",
-            "This document details the exact execution order of the middleware stack in the FastAPI application.\n",
-            "```",
-            "Incoming Request",
-            "   ↓"
-        ]
-        for m in reversed(app.user_middleware):
-            mw_lines.append(f"[{m.cls.__name__}]")
-            mw_lines.append("   ↓")
-        mw_lines.append("[FastAPI Router]")
-        mw_lines.append("```\n")
-        mw_lines.append("### Detailed Middleware Configuration")
-        for m in app.user_middleware:
-            mw_lines.append(f"* **Class**: `{m.cls.__module__}.{m.cls.__name__}`")
-            opts = getattr(m, "options", None) or getattr(m, "kwargs", None)
-            if opts:
-                mw_lines.append(f"  * **Options**: `{opts}`")
-        with open(os.path.join(artifacts_dir, "MiddlewareOrder.md"), "w", encoding="utf-8") as f:
-            f.write("\n".join(mw_lines))
-        logger.info("Successfully programmatically generated MiddlewareOrder.md")
-    except Exception as e:
-        logger.warning("Could not generate RegisteredRoutes.md or MiddlewareOrder.md audit files: %s", e)
-
+    # ── Yield: server is now live and accepting requests ─────────────────────
     yield
-    # Log shutdown deployment diagnostics (Phase 10)
+
+    # ── Shutdown ──────────────────────────────────────────────────────────────
     async def perform_shutdown_cleanups():
         print("\n[SHUTDOWN_START]", flush=True)
-        print("\nSignal Received:\nSIGTERM", flush=True)
         logger.info("[SHUTDOWN_START] Signal Received: SIGTERM")
-        
-        print("\nCancelling Active Background Jobs...", end="", flush=True)
+
         try:
             from app.services.job_manager import JobManager
             JobManager.get_instance().cancel_all_active_jobs()
-            print("\n✓ Completed", flush=True)
         except Exception as e:
-            print("\n✗ Failed", flush=True)
             logger.error("Failed to cancel background jobs: %s", e)
 
-        print("\nPersisting Worker State...", end="", flush=True)
-        # Background jobs persistence completed in JobManager cancel_all_active_jobs
-        print("\n✓ Completed", flush=True)
-
-        print("\nClosing Database Connections...", end="", flush=True)
-        print("\n✓ Completed", flush=True)
-
-        print("\nClosing Storage Clients...", end="", flush=True)
-        print("\n✓ Completed", flush=True)
-
-        print("\nCleaning Temporary Resources...", end="", flush=True)
         try:
             from app.services.cache_service import CacheService
             CacheService.clear()
-            print("\n✓ Completed", flush=True)
         except Exception:
-            print("\n✗ Failed", flush=True)
+            pass
 
-        print("\nRunning Garbage Collection (Best Effort)...", end="", flush=True)
-        import gc
         gc.collect()
-        print("\n✓ Completed", flush=True)
 
         try:
             log_deployment_diagnostics("SHUTDOWN")
         except Exception:
             pass
 
-        print("\nFlushing Logs...", end="", flush=True)
-        try:
-            import logging
-            logging.shutdown()
-            print("\n✓ Completed", flush=True)
-        except Exception:
-            print("\n✗ Failed", flush=True)
-
+        logging.shutdown()
         print("\n[SHUTDOWN_COMPLETE]", flush=True)
-        print("\nWaiting for Uvicorn/FastAPI graceful termination...", flush=True)
 
     try:
-        import asyncio
         await asyncio.wait_for(perform_shutdown_cleanups(), timeout=30.0)
     except asyncio.TimeoutError:
-        print("\n✗ Shutdown operations timed out (>30s). Letting hosting platform terminate the container.", flush=True)
-        logger.error("Graceful shutdown operations timed out. Incomplete cleanups logged.")
+        print("\n✗ Shutdown timed out (>30s).", flush=True)
+        logger.error("Graceful shutdown operations timed out.")
 
 
 app = FastAPI(
