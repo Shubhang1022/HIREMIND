@@ -515,8 +515,49 @@ app.add_middleware(
     allow_headers=allowed_headers,
 )
 
-# 3. Custom CORS Preflight Failure Logger Middleware (Task 2)
-# Register it last so it is the absolute outer layer, executing FIRST on requests
+# 3. Request logging middleware — logs every request with timing, status, and exceptions
+@app.middleware("http")
+async def request_logging_middleware(request: Request, call_next):
+    _t0 = time.time()
+    _pid = os.getpid()
+    _method = request.method
+    _path = request.url.path
+    _content_length = request.headers.get("content-length", "?")
+
+    logger.info(
+        "[REQUEST_START] method=%s path=%s content_length=%s pid=%d",
+        _method, _path, _content_length, _pid,
+    )
+
+    exc_info = None
+    try:
+        response = await call_next(request)
+        elapsed = time.time() - _t0
+        logger.info(
+            "[REQUEST_END] method=%s path=%s status=%d elapsed=%.3fs",
+            _method, _path, response.status_code, elapsed,
+        )
+        if response.status_code >= 500:
+            logger.error(
+                "[REQUEST_ERROR] method=%s path=%s status=%d elapsed=%.3fs — server error returned",
+                _method, _path, response.status_code, elapsed,
+            )
+        return response
+    except Exception as exc:
+        elapsed = time.time() - _t0
+        import traceback as _tb
+        logger.error(
+            "[REQUEST_EXCEPTION] method=%s path=%s elapsed=%.3fs error=%s\n%s",
+            _method, _path, elapsed, exc, _tb.format_exc(),
+        )
+        from fastapi.responses import JSONResponse as _JR
+        return _JR(
+            status_code=500,
+            content={"detail": f"Unhandled exception: {exc}"},
+        )
+
+
+# 4. Custom CORS Preflight Failure Logger Middleware
 @app.middleware("http")
 async def log_cors_preflight_middleware(request: Request, call_next):
     if request.method == "OPTIONS":

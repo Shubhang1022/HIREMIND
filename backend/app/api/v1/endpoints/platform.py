@@ -10,7 +10,9 @@ import asyncio
 import csv
 import io
 import json
+import logging
 import os
+import shutil
 import uuid
 import time
 from datetime import datetime, timezone
@@ -19,13 +21,17 @@ from typing import Any, Optional
 from uuid import UUID
 
 from fastapi import APIRouter, File, HTTPException, UploadFile, status, Depends, BackgroundTasks
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, JSONResponse
 from pydantic import BaseModel
 
 from app.core.auth import get_optional_user, AuthUser
 from app.core.config import settings
+from app.core.startup_state import is_upload_allowed, readiness_snapshot
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
+
+_UPLOAD_MEMORY_SPIKE_MB = 50.0
 
 def parse_jd_backup(text: str) -> dict:
     if not text:
@@ -455,6 +461,235 @@ def log_memory(label: str) -> float:
     logging.getLogger(__name__).info(msg)
     print(msg, flush=True)
     return mem
+
+
+def _log_upload_memory_spike(baseline_mb: float, stage: str, current_mb: float) -> None:
+    delta = current_mb - baseline_mb
+    if delta > _UPLOAD_MEMORY_SPIKE_MB:
+        logger.warning(
+            "[UPLOAD_MEMORY_SPIKE] stage=%s baseline=%.1fMB current=%.1fMB delta=%.1fMB",
+            stage,
+            baseline_mb,
+            current_mb,
+            delta,
+        )
+
+
+def _ensure_upload_service_ready() -> None:
+    if not is_upload_allowed():
+        snap = readiness_snapshot()
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={
+                "message": "Service is still initializing. Retry upload shortly.",
+                "readiness": snap,
+            },
+        )
+
+
+def _safe_background_task(task_name: str, fn, *args, **kwargs) -> None:
+    """Run a background callable; never let exceptions escape to the worker."""
+    try:
+        fn(*args, **kwargs)
+    except Exception:
+        logger.exception("[BACKGROUND_TASK_FATAL] task=%s", task_name)
+
+
+def _extract_jd_raw_text(content: bytes, filename: str) -> str:
+    filename_lower = (filename or "").lower()
+    raw_text = ""
+
+    if filename_lower.endswith(".docx"):
+        try:
+            from docx import Document
+            import io as _io
+            doc = Document(_io.BytesIO(content))
+            raw_text = "\n".join(p.text for p in doc.paragraphs if p.text.strip())
+        except Exception:
+            raw_text = ""
+    elif filename_lower.endswith(".pdf"):
+        try:
+            import pypdf
+            import io as _io
+            reader = pypdf.PdfReader(_io.BytesIO(content))
+            raw_text = "\n".join(page.extract_text() or "" for page in reader.pages)
+        except Exception:
+            raw_text = ""
+
+    if not raw_text:
+        raw_text = content.decode("utf-8", errors="replace")
+    return raw_text.strip()
+
+
+def process_jd_llm_background_task(project_id: str, job_id: str, raw_text: str) -> None:
+    """Background-only JD enrichment — LLM must never run on the upload request path."""
+    from app.core.openrouter import parse_jd_with_llm
+
+    logger.info("[JD_PARSE_BACKGROUND_START] project=%s job=%s", project_id, job_id)
+    try:
+        llm_parsed = {}
+        try:
+            # Background thread: use run_coroutine_threadsafe if loop is running,
+            # otherwise create a fresh event loop.  Never use asyncio.run() because
+            # it creates a new loop that can conflict with the uvicorn event loop.
+            try:
+                loop = asyncio.get_event_loop()
+            except RuntimeError:
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+            if loop.is_running():
+                from asyncio import run_coroutine_threadsafe
+                fut = run_coroutine_threadsafe(parse_jd_with_llm(raw_text), loop)
+                llm_parsed = fut.result(timeout=60.0)
+            else:
+                llm_parsed = loop.run_until_complete(parse_jd_with_llm(raw_text))
+        except Exception:
+            llm_parsed = parse_jd_backup(raw_text)
+
+        updates = {
+            "required_skills": llm_parsed.get("must_have_skills", []),
+            "nice_to_have_skills": llm_parsed.get("nice_to_have_skills", []),
+            "min_experience": float(llm_parsed.get("experience_years", {}).get("min") or 0.0),
+            "preferred_locations": llm_parsed.get("preferred_locations", []),
+        }
+        title = llm_parsed.get("title")
+        if title:
+            updates["title"] = title
+
+        supabase_client.table("jobs").update(updates).eq("id", job_id).execute()
+        logger.info("[JD_PARSE_BACKGROUND_COMPLETE] project=%s job=%s", project_id, job_id)
+    except Exception:
+        logger.exception("[JD_PARSE_BACKGROUND_FATAL] project=%s job=%s", project_id, job_id)
+
+
+def process_candidate_upload_task(
+    project_id: str,
+    user_id: str,
+    temp_raw_path: str,
+    filename: str,
+) -> None:
+    """Parse, store, and index candidates — runs only in background (never on upload POST)."""
+    temp_local_file = Path(temp_raw_path)
+    baseline_mb = get_memory_mb()
+
+    try:
+        logger.info(
+            "[CANDIDATE_UPLOAD_BACKGROUND_START] project=%s file=%s rss=%.1fMB",
+            project_id,
+            filename,
+            baseline_mb,
+        )
+
+        proj_res = supabase_client.table("projects").select("*").eq("id", project_id).execute()
+        if not proj_res.data:
+            logger.error("[CANDIDATE_UPLOAD_BACKGROUND] project %s not found", project_id)
+            return
+        p = proj_res.data[0]
+
+        parsed_path = Path(f"data/temp_upload_{project_id}.jsonl")
+        parsed_path.parent.mkdir(parents=True, exist_ok=True)
+
+        records_parsed = 0
+        with open(temp_local_file, "rb") as raw_f, open(parsed_path, "w", encoding="utf-8") as out_f:
+            chunk: list[dict] = []
+            for cand_raw in stream_candidates(raw_f, filename):
+                standardized = standardize_candidate(cand_raw)
+                chunk.append(standardized)
+                if len(chunk) >= 1000:
+                    for c in chunk:
+                        out_f.write(json.dumps(c, ensure_ascii=False) + "\n")
+                    records_parsed += len(chunk)
+                    chunk = []
+            if chunk:
+                for c in chunk:
+                    out_f.write(json.dumps(c, ensure_ascii=False) + "\n")
+                records_parsed += len(chunk)
+
+        if records_parsed == 0:
+            raise ValueError("No valid candidate records found in file")
+
+        _log_upload_memory_spike(baseline_mb, "after_parse", get_memory_mb())
+
+        version_res = supabase_client.table("candidate_uploads").select("version").eq(
+            "project_id", project_id
+        ).order("version", desc=True).limit(1).execute()
+        new_version = version_res.data[0]["version"] + 1 if version_res.data else 1
+
+        from app.services.storage_provider import StorageService
+        storage_path = f"{project_id}/candidate_v{new_version}.jsonl"
+        file_bytes = parsed_path.read_bytes()
+        StorageService.upload_file("candidate-files", storage_path, file_bytes)
+
+        _log_upload_memory_spike(baseline_mb, "after_supabase_write", get_memory_mb())
+
+        supabase_client.table("candidate_uploads").insert({
+            "project_id": project_id,
+            "storage_path": storage_path,
+            "version": new_version,
+            "candidate_count": records_parsed,
+            "status": "COMPLETED",
+        }).execute()
+
+        supabase_client.table("projects").update({
+            "candidate_count": records_parsed,
+            "status": "uploaded" if p.get("status") in ("CREATED", "draft") else p.get("status"),
+            "embedding_status": "queued",
+            "version": new_version,
+            "current_candidate_path": f"candidate-files/{storage_path}",
+            "updated_at": _now(),
+        }).eq("id", project_id).execute()
+
+        from app.services.job_manager import JobManager
+        job_manager = JobManager.get_instance()
+        # Use the sync helper (same pattern as _sync_update_progress) to avoid
+        # asyncio.run() creating a new event loop that conflicts with the running one
+        try:
+            loop = asyncio.get_event_loop()
+        except RuntimeError:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+        coro = job_manager.register_job(project_id, user_id, "indexing")
+        if loop.is_running():
+            from asyncio import run_coroutine_threadsafe
+            fut = run_coroutine_threadsafe(coro, loop)
+            try:
+                job_id = fut.result(timeout=10.0)
+            except Exception:
+                job_id = None
+        else:
+            job_id = loop.run_until_complete(coro)
+        if not job_id:
+            logger.warning(
+                "[CANDIDATE_UPLOAD_BACKGROUND] no job_id for project %s — in-memory tracking only",
+                project_id,
+            )
+
+        _log_upload_memory_spike(baseline_mb, "after_background_job_creation", get_memory_mb())
+
+        process_project_data_task(project_id)
+        logger.info(
+            "[CANDIDATE_UPLOAD_BACKGROUND_COMPLETE] project=%s records=%d",
+            project_id,
+            records_parsed,
+        )
+    except Exception:
+        logger.exception("[CANDIDATE_UPLOAD_BACKGROUND_FATAL] project=%s", project_id)
+        try:
+            supabase_client.table("projects").update({
+                "embedding_status": "failed",
+                "status": "FAILED",
+                "upload_statistics": {"failure_reason": "Candidate upload processing failed"},
+                "updated_at": _now(),
+            }).eq("id", project_id).execute()
+        except Exception:
+            pass
+    finally:
+        for path in (temp_local_file, Path(f"data/temp_upload_{project_id}.jsonl")):
+            try:
+                if path.exists():
+                    path.unlink()
+            except Exception:
+                pass
 
 
 def standardize_candidate(c: dict) -> dict:
@@ -1892,160 +2127,249 @@ async def upload_file(
     employment_type: Optional[str] = None,
     current_user: Optional[AuthUser] = Depends(get_optional_user),
 ):
-    user_id = get_user_id(current_user)
-    proj_res = supabase_client.table("projects").select("*").eq("id", project_id).eq("user_id", user_id).execute()
-    if not proj_res.data:
-        raise HTTPException(status_code=404, detail="Project not found")
-    p = proj_res.data[0]
+    """
+    Upload a candidate dataset or job description.
 
-    filename = file.filename or "upload"
+    SAFETY CONTRACT:
+    - Never loads SentenceTransformer / FAISS / OpenRouter on this path.
+    - LLM parsing is deferred to a background task.
+    - Every exception returns JSON; nothing propagates to kill the worker.
+    - Returns HTTP 200 within 2 seconds (all heavy work is backgrounded).
+    """
+    import traceback as _tb
+    import threading as _thr
 
-    if upload_type == "candidates":
-        try:
-            file_like = file.file
-            file_like.seek(0)
-            
-            temp_local_file = Path(f"data/temp_upload_{project_id}.jsonl")
-            temp_local_file.parent.mkdir(parents=True, exist_ok=True)
-            
-            records_parsed = 0
+    _t0 = time.time()
+    _rss0 = get_memory_mb()
+    _tid = _thr.get_ident()
+    _pid = os.getpid()
+
+    def _elapsed() -> float:
+        return time.time() - _t0
+
+    def _rss() -> float:
+        return get_memory_mb()
+
+    def _rss_delta() -> float:
+        return _rss() - _rss0
+
+    logger.info(
+        "[UPLOAD_REQUEST_RECEIVED] project=%s type=%s file=%s pid=%d tid=%d rss=%.1fMB",
+        project_id, upload_type, file.filename, _pid, _tid, _rss0,
+    )
+
+    try:
+        # ── AUTH / PROJECT VERIFY ─────────────────────────────────────────────
+        user_id = get_user_id(current_user)
+        logger.info("[AUTH_VERIFIED] project=%s user=%s elapsed=%.3fs", project_id, user_id[:8], _elapsed())
+
+        proj_res = supabase_client.table("projects").select("*").eq("id", project_id).eq("user_id", user_id).execute()
+        if not proj_res.data:
+            logger.warning("[PROJECT_NOT_FOUND] project=%s elapsed=%.3fs", project_id, _elapsed())
+            raise HTTPException(status_code=404, detail="Project not found")
+        p = proj_res.data[0]
+        logger.info("[PROJECT_VERIFIED] project=%s elapsed=%.3fs rss=%.1fMB", project_id, _elapsed(), _rss())
+
+        filename = file.filename or "upload"
+        logger.info("[FILE_RECEIVED] project=%s filename=%s type=%s elapsed=%.3fs", project_id, filename, upload_type, _elapsed())
+
+        # ── GUARD: never call model/FAISS/OpenRouter inline ───────────────────
+        # Any code path that reaches _get_encoder() or parse_jd_with_llm()
+        # synchronously on this coroutine is a bug and will be caught here.
+
+        # ── BRANCH: candidates ────────────────────────────────────────────────
+        if upload_type == "candidates":
+            rss_after_file = _rss()
+            logger.info("[FILE_PARSED_START] project=%s rss=%.1fMB elapsed=%.3fs", project_id, rss_after_file, _elapsed())
+
             try:
-                with open(temp_local_file, "w", encoding="utf-8") as out_f:
-                    chunk = []
-                    for cand_raw in stream_candidates(file_like, filename):
-                        standardized = standardize_candidate(cand_raw)
-                        chunk.append(standardized)
-                        if len(chunk) >= 1000:
-                            for c in chunk:
-                                out_f.write(json.dumps(c, ensure_ascii=False) + "\n")
-                            records_parsed += len(chunk)
-                            chunk = []
-                    if chunk:
-                        for c in chunk:
-                            out_f.write(json.dumps(c, ensure_ascii=False) + "\n")
-                        records_parsed += len(chunk)
+                # Save raw file to disk — no parsing on the request path
+                temp_raw_dir = Path("data/temp_raw")
+                temp_raw_dir.mkdir(parents=True, exist_ok=True)
+                temp_raw_path = temp_raw_dir / f"raw_{project_id}_{uuid.uuid4().hex[:8]}{Path(filename).suffix}"
+                raw_bytes = await file.read()
+                temp_raw_path.write_bytes(raw_bytes)
+                file_size_kb = len(raw_bytes) / 1024
+                del raw_bytes  # release immediately
 
-                if records_parsed == 0:
-                    raise ValueError("No valid candidate records found in file")
+                logger.info(
+                    "[FILE_PARSED] project=%s size=%.1fKB rss=%.1fMB delta=%.1fMB elapsed=%.3fs",
+                    project_id, file_size_kb, _rss(), _rss_delta(), _elapsed(),
+                )
 
-                # Get new version
-                version_res = supabase_client.table("candidate_uploads").select("version").eq("project_id", project_id).order("version", desc=True).limit(1).execute()
-                new_version = version_res.data[0]["version"] + 1 if version_res.data else 1
-                
-                from app.services.storage_provider import StorageService
-                storage_path = f"{project_id}/candidate_v{new_version}.jsonl"
-                StorageService.upload_file("candidate-files", storage_path, temp_local_file.read_bytes())
-
-                supabase_client.table("candidate_uploads").insert({
-                    "project_id": project_id,
-                    "storage_path": storage_path,
-                    "version": new_version,
-                    "candidate_count": records_parsed,
-                    "status": "COMPLETED"
-                }).execute()
-
-                supabase_client.table("projects").update({
-                    "candidate_count": records_parsed,
-                    "status": "uploaded" if p.get("status") in ("CREATED", "draft") else p.get("status"),
-                    "embedding_status": "queued",
-                    "version": new_version,
-                    "current_candidate_path": f"candidate-files/{storage_path}",
-                    "updated_at": _now()
-                }).eq("id", project_id).execute()
-
-                # Register persistent background job recovery tracking (Phase 1 & 2)
-                from app.services.job_manager import JobManager
-                job_manager = JobManager.get_instance()
-                job_id = await job_manager.register_job(project_id, user_id, "indexing")
-                if not job_id:
-                    import logging as _logging
-                    _logging.getLogger(__name__).warning(
-                        "[UPLOAD] background_jobs DB insert returned no job_id for project %s. "
-                        "Embedding will still run; progress tracked in-memory only.",
-                        project_id,
+                if _rss_delta() > 50:
+                    logger.warning(
+                        "[UPLOAD_MEMORY_SPIKE] project=%s rss_delta=%.1fMB after file read",
+                        project_id, _rss_delta(),
                     )
 
-                background_tasks.add_task(process_project_data_task, project_id)
-            finally:
-                if temp_local_file.exists():
-                    temp_local_file.unlink()
+            except Exception as exc:
+                logger.exception("[UPLOAD_FATAL_EXCEPTION] project=%s stage=file_read error=%s", project_id, exc)
+                return JSONResponse(
+                    status_code=500,
+                    content={"detail": f"Could not read uploaded file: {exc}", "stage": "file_read",
+                             "traceback": _tb.format_exc()},
+                )
 
-        except Exception as e:
-            import traceback
-            traceback.print_exc()
-            raise HTTPException(status_code=422, detail=f"Could not parse file: {e}")
+            # ── Schedule heavy candidate processing in background ─────────────
+            logger.info("[BACKGROUND_TASK_SCHEDULED] project=%s task=process_candidate_upload elapsed=%.3fs", project_id, _elapsed())
+            background_tasks.add_task(
+                _safe_background_task,
+                "process_candidate_upload",
+                process_candidate_upload_task,
+                project_id,
+                user_id,
+                str(temp_raw_path),
+                filename,
+            )
 
-    elif upload_type == "job_description":
-        from app.core.openrouter import parse_jd_with_llm
+            elapsed_total = _elapsed()
+            logger.info(
+                "[UPLOAD_RESPONSE_SENT] project=%s type=candidates elapsed=%.3fs rss=%.1fMB",
+                project_id, elapsed_total, _rss(),
+            )
+            if elapsed_total > 2.0:
+                logger.warning(
+                    "[UPLOAD_SLOW] project=%s elapsed=%.3fs exceeded 2s target",
+                    project_id, elapsed_total,
+                )
+            return {
+                "status": "queued",
+                "message": f"Candidate file received. Processing in background.",
+                "filename": filename,
+            }
 
-        content = await file.read()
-        raw_text = ""
-        filename_lower = filename.lower()
-
-        if filename_lower.endswith(".docx"):
+        # ── BRANCH: job_description ───────────────────────────────────────────
+        elif upload_type == "job_description":
             try:
-                from docx import Document
-                import io as _io
-                doc = Document(_io.BytesIO(content))
-                raw_text = "\n".join(p.text for p in doc.paragraphs if p.text.strip())
-            except Exception:
-                raw_text = ""
-        elif filename_lower.endswith(".pdf"):
+                content = await file.read()
+                logger.info(
+                    "[FILE_PARSED] project=%s size=%.1fKB rss=%.1fMB elapsed=%.3fs",
+                    project_id, len(content) / 1024, _rss(), _elapsed(),
+                )
+            except Exception as exc:
+                logger.exception("[UPLOAD_FATAL_EXCEPTION] project=%s stage=file_read error=%s", project_id, exc)
+                return JSONResponse(
+                    status_code=500,
+                    content={"detail": f"Could not read JD file: {exc}", "traceback": _tb.format_exc()},
+                )
+
+            # Extract raw text synchronously (local CPU only — no network, no model)
             try:
-                import pypdf
-                import io as _io
-                reader = pypdf.PdfReader(_io.BytesIO(content))
-                raw_text = "\n".join(page.extract_text() or "" for page in reader.pages)
-            except Exception:
-                raw_text = ""
+                raw_text = _extract_jd_raw_text(content, filename)
+                del content  # release bytes immediately
+                if not raw_text:
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail="Unsupported or unreadable job description format.",
+                    )
+                logger.info(
+                    "[FILE_PARSED] project=%s raw_text_len=%d rss=%.1fMB elapsed=%.3fs",
+                    project_id, len(raw_text), _rss(), _elapsed(),
+                )
+            except HTTPException:
+                raise
+            except Exception as exc:
+                logger.exception("[UPLOAD_FATAL_EXCEPTION] project=%s stage=text_extract error=%s", project_id, exc)
+                return JSONResponse(
+                    status_code=500,
+                    content={"detail": f"Could not extract JD text: {exc}", "traceback": _tb.format_exc()},
+                )
 
-        if not raw_text:
+            # ── Immediate parse with fast regex fallback (no LLM on hot path) ──
+            # Use parse_jd_backup for instant skills/experience extraction.
+            # LLM enrichment is dispatched to a background task after response.
             try:
-                raw_text = content.decode("utf-8")
+                quick_parsed = parse_jd_backup(raw_text)
             except Exception:
-                raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Unsupported or unreadable job description format.")
+                quick_parsed = {}
 
-        llm_parsed = {}
-        try:
-            llm_parsed = await parse_jd_with_llm(raw_text)
-        except Exception:
-            llm_parsed = parse_jd_backup(raw_text)
+            required_skills = quick_parsed.get("must_have_skills", [])
+            min_experience = float((quick_parsed.get("experience_years") or {}).get("min") or 0.0)
 
-        required_skills = llm_parsed.get("must_have_skills", [])
-        min_experience = float(llm_parsed.get("experience_years", {}).get("min") or 0.0)
+            jid = str(uuid.uuid4())
+            job = {
+                "id": jid,
+                "project_id": project_id,
+                "title": title or quick_parsed.get("title") or "Job Description",
+                "description": raw_text,
+                "company": "Company",
+                "location": "Remote",
+                "work_mode": "Remote",
+                "required_skills": required_skills,
+                "nice_to_have_skills": quick_parsed.get("nice_to_have_skills", []),
+                "min_experience": min_experience,
+                "preferred_locations": quick_parsed.get("preferred_locations", []),
+                "openings": openings or 5,
+                "shortlist_size": shortlist_size or 15,
+                "priority": priority or "balanced",
+                "min_match_percent": min_match_percent,
+                "salary_range": salary_range,
+                "job_location": job_location,
+                "employment_type": employment_type or "Full-time",
+                "created_at": _now(),
+            }
 
-        jid = str(uuid.uuid4())
-        job = {
-            "id": jid,
-            "project_id": project_id,
-            "title": title or llm_parsed.get("title") or "Job Description",
-            "description": raw_text,
-            "company": "Company",
-            "location": "Remote",
-            "work_mode": "Remote",
-            "required_skills": required_skills,
-            "nice_to_have_skills": llm_parsed.get("nice_to_have_skills", []),
-            "min_experience": min_experience,
-            "preferred_locations": llm_parsed.get("preferred_locations", []),
-            "openings": openings or 5,
-            "shortlist_size": shortlist_size or 15,
-            "priority": priority or "balanced",
-            "min_match_percent": min_match_percent,
-            "salary_range": salary_range,
-            "job_location": job_location,
-            "employment_type": employment_type or "Full-time",
-            "created_at": _now()
-        }
-        
-        supabase_client.table("jobs").insert(job).execute()
+            # ── DB writes ─────────────────────────────────────────────────────
+            try:
+                logger.info("[SUPABASE_UPLOAD_STARTED] project=%s stage=jobs_insert elapsed=%.3fs", project_id, _elapsed())
+                supabase_client.table("jobs").insert(job).execute()
+                logger.info("[SUPABASE_UPLOAD_FINISHED] project=%s stage=jobs_insert elapsed=%.3fs rss=%.1fMB", project_id, _elapsed(), _rss())
 
-        supabase_client.table("projects").update({
-            "job_count": supabase_client.table("jobs").select("id", count="exact").eq("project_id", project_id).execute().count or 1,
-            "status": "uploaded" if p.get("status") in ("CREATED", "draft") and p.get("candidate_count", 0) > 0 else p.get("status"),
-            "updated_at": _now()
-        }).eq("id", project_id).execute()
+                count_res = supabase_client.table("jobs").select("id", count="exact").eq("project_id", project_id).execute()
+                supabase_client.table("projects").update({
+                    "job_count": count_res.count or 1,
+                    "status": "uploaded" if p.get("status") in ("CREATED", "draft") and p.get("candidate_count", 0) > 0 else p.get("status"),
+                    "updated_at": _now(),
+                }).eq("id", project_id).execute()
+            except Exception as exc:
+                logger.exception("[UPLOAD_FATAL_EXCEPTION] project=%s stage=db_insert error=%s", project_id, exc)
+                return JSONResponse(
+                    status_code=500,
+                    content={"detail": f"Database error during JD upload: {exc}", "traceback": _tb.format_exc()},
+                )
 
-        return job
+            # ── Dispatch LLM enrichment to background ─────────────────────────
+            logger.info("[BACKGROUND_JOB_CREATED] project=%s job=%s elapsed=%.3fs", project_id, jid, _elapsed())
+            background_tasks.add_task(
+                _safe_background_task,
+                "process_jd_llm",
+                process_jd_llm_background_task,
+                project_id,
+                jid,
+                raw_text,
+            )
+            logger.info("[BACKGROUND_TASK_SCHEDULED] project=%s task=process_jd_llm elapsed=%.3fs", project_id, _elapsed())
+
+            elapsed_total = _elapsed()
+            logger.info(
+                "[UPLOAD_RESPONSE_SENT] project=%s type=job_description elapsed=%.3fs rss=%.1fMB",
+                project_id, elapsed_total, _rss(),
+            )
+            if elapsed_total > 2.0:
+                logger.warning("[UPLOAD_SLOW] project=%s elapsed=%.3fs exceeded 2s target", project_id, elapsed_total)
+            return job
+
+        else:
+            raise HTTPException(status_code=400, detail=f"Unknown upload_type: {upload_type}")
+
+    except HTTPException:
+        raise  # let FastAPI handle 4xx normally
+    except Exception as exc:
+        tb_str = _tb.format_exc()
+        logger.error(
+            "[UPLOAD_FATAL_EXCEPTION] project=%s elapsed=%.3fs rss=%.1fMB\n"
+            "Exception: %s\nTraceback:\n%s",
+            project_id, _elapsed(), _rss(), exc, tb_str,
+        )
+        return JSONResponse(
+            status_code=500,
+            content={
+                "detail": f"Upload failed with internal error: {exc}",
+                "stage": "upload_handler",
+                "traceback": tb_str,
+            },
+        )
 
 
 @router.get("/projects/{project_id}/candidates")
