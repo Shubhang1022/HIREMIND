@@ -27,6 +27,7 @@ from pydantic import BaseModel
 from app.core.auth import get_optional_user, AuthUser
 from app.core.config import settings
 from app.core.startup_state import is_upload_allowed, readiness_snapshot
+from app.core.diag import log_call, log_stage, diag_snapshot
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -488,11 +489,61 @@ def _ensure_upload_service_ready() -> None:
 
 
 def _safe_background_task(task_name: str, fn, *args, **kwargs) -> None:
-    """Run a background callable; never let exceptions escape to the worker."""
+    """Run a background callable; never let exceptions escape to the worker.
+
+    On any unhandled exception:
+    1. Logs full traceback + RSS + CPU + thread count
+    2. Attempts to mark the associated job as FAILED (best-effort)
+    3. Logs top tracemalloc allocations if available
+    """
+    import traceback as _tb
     try:
         fn(*args, **kwargs)
-    except Exception:
-        logger.exception("[BACKGROUND_TASK_FATAL] task=%s", task_name)
+    except Exception as exc:
+        tb_str = _tb.format_exc()
+        _rss = _cpu = _nth = 0.0
+        try:
+            import psutil as _ps
+            _proc = _ps.Process(os.getpid())
+            _rss = _proc.memory_info().rss / (1024 * 1024)
+            _cpu = _proc.cpu_percent(interval=None)
+            _nth = _proc.num_threads()
+        except Exception:
+            pass
+
+        logger.exception(
+            "[BACKGROUND_TASK_FATAL] task=%s exception_type=%s exception=%s "
+            "rss=%.1fMB cpu=%.1f%% threads=%d\n%s",
+            task_name, type(exc).__name__, exc, _rss, _cpu, _nth, tb_str,
+        )
+
+        # Log top tracemalloc allocations if available
+        try:
+            import tracemalloc as _tm
+            if _tm.is_tracing():
+                snap = _tm.take_snapshot()
+                top = snap.statistics("lineno")[:5]
+                alloc_str = "\n".join(str(s) for s in top)
+                logger.error("[TRACEMALLOC_TOP5] task=%s\n%s", task_name, alloc_str)
+        except Exception:
+            pass
+
+        # Best-effort: mark the job as FAILED so SSE stops and UI updates
+        # Extract project_id from args if present (first positional after task_name)
+        _project_id = args[0] if args and isinstance(args[0], str) else None
+        if _project_id:
+            try:
+                _sync_fail_job(_project_id, f"BACKGROUND_TASK_FATAL:{task_name}:{type(exc).__name__}:{exc}")
+                supabase_client.table("projects").update({
+                    "embedding_status": "failed",
+                    "status": "FAILED",
+                    "upload_statistics": {"failure_reason": f"{task_name} crashed: {exc}"},
+                    "updated_at": _now(),
+                }).eq("id", _project_id).execute()
+                logger.info("[BACKGROUND_TASK_FATAL] project=%s marked as FAILED in DB", _project_id)
+            except Exception as cleanup_exc:
+                logger.error("[BACKGROUND_TASK_FATAL] cleanup failed for project=%s: %s",
+                             _project_id, cleanup_exc)
 
 
 def _extract_jd_raw_text(content: bytes, filename: str) -> str:
@@ -1220,15 +1271,18 @@ Elapsed: {elapsed_str}
                         for cat in role_files.keys():
                             cat_path = Path(temp_dir) / f"role_{cat.upper()}.jsonl"
                             content = cat_path.read_bytes()
-                            StorageService.upload_file("role-indexes", f"{project_id}/role_{cat.upper()}_v{version}.jsonl", content)
+                            with log_call("storage", f"upload_role_index_{cat}", project_id=project_id, stage="upload_indexes"):
+                                StorageService.upload_file("role-indexes", f"{project_id}/role_{cat.upper()}_v{version}.jsonl", content)
                             logger.info("[STAGE_PROGRESS] project=%s stage=upload_indexes uploaded role-%s", project_id, cat)
 
                         skill_content = json.dumps(skill_index, ensure_ascii=False)
-                        StorageService.upload_file("skill-indexes", f"{project_id}/skill_index_v{version}.json", skill_content.encode("utf-8"))
+                        with log_call("storage", "upload_skill_index", project_id=project_id, stage="upload_indexes"):
+                            StorageService.upload_file("skill-indexes", f"{project_id}/skill_index_v{version}.json", skill_content.encode("utf-8"))
                         logger.info("[STAGE_PROGRESS] project=%s stage=upload_indexes uploaded skill_index", project_id)
 
                         ids_content = json.dumps(candidate_ids, ensure_ascii=False)
-                        StorageService.upload_file("embeddings", f"{project_id}/ids_v{version}.json", ids_content.encode("utf-8"))
+                        with log_call("storage", "upload_ids_json", project_id=project_id, stage="upload_indexes"):
+                            StorageService.upload_file("embeddings", f"{project_id}/ids_v{version}.json", ids_content.encode("utf-8"))
                         logger.info("[STAGE_PROGRESS] project=%s stage=upload_indexes uploaded ids_v%d.json", project_id, version)
                     except Exception as stage_exc:
                         logger.exception("[STAGE_FAIL] project=%s stage=upload_indexes elapsed=%.2fs error=%s",
@@ -1602,17 +1656,20 @@ Elapsed: {elapsed_str}
                 logger.info("[STAGE_START] project=%s stage=upload_artifacts ram=%.1fMB", project_id, get_memory_mb())
                 try:
                     enriched_content = enriched_jsonl_path.read_bytes()
-                    StorageService.upload_file("candidate-files", path, enriched_content)
+                    with log_call("storage", "upload_enriched_candidates", project_id=project_id, stage="upload_artifacts"):
+                        StorageService.upload_file("candidate-files", path, enriched_content)
                     logger.info("[STAGE_PROGRESS] project=%s stage=upload_artifacts uploaded enriched_candidates", project_id)
                     del enriched_content
 
                     npy_content = npy_path.read_bytes()
-                    StorageService.upload_file("embeddings", f"{project_id}/embeddings_v{version}.npy", npy_content)
+                    with log_call("storage", "upload_embeddings_npy", project_id=project_id, stage="upload_artifacts"):
+                        StorageService.upload_file("embeddings", f"{project_id}/embeddings_v{version}.npy", npy_content)
                     logger.info("[STAGE_PROGRESS] project=%s stage=upload_artifacts uploaded embeddings_v%d.npy size=%.2fMB",
                                 project_id, version, len(npy_content) / (1024 * 1024))
                     del npy_content
 
-                    StorageService.upload_file("faiss-indexes", f"{project_id}/faiss_v{version}.index", faiss_content)
+                    with log_call("storage", "upload_faiss_index", project_id=project_id, stage="upload_artifacts"):
+                        StorageService.upload_file("faiss-indexes", f"{project_id}/faiss_v{version}.index", faiss_content)
                     logger.info("[STAGE_PROGRESS] project=%s stage=upload_artifacts uploaded faiss_v%d.index size=%.1fKB",
                                 project_id, version, len(faiss_content) / 1024)
                     del faiss_content
@@ -1763,7 +1820,41 @@ def _run_integrity_check() -> str:
 # ── Projects ──────────────────────────────────────────────────────────────────
 
 # ── Sync Helpers for JobManager (Thread compatibility) ───────────────────────
-def _sync_update_progress(project_id: str, stage: str, progress: int, status: str = None, processed: int = 0, total: int = 0, eta: str = "", retry_count: int = None):
+
+def _sync_update_progress(
+    project_id: str,
+    stage: str,
+    progress: int,
+    status: str = None,
+    # Legacy positional-style params kept for backwards compatibility
+    processed: int = 0,
+    total: int = 0,
+    eta: str = "",
+    retry_count: int = None,
+    # Extended params used by newer callers — keyword-only aliases
+    processed_candidates: int = None,
+    total_candidates: int = None,
+    batch: int = None,
+    total_batches: int = None,
+    elapsed_seconds: float = None,
+    eta_seconds: float = None,
+    memory_usage: float = None,
+    speed: float = None,
+    **_ignored_kwargs,          # absorb any future fields without breaking
+):
+    """Thread-safe wrapper around JobManager.update_job_progress().
+
+    Accepts both the old positional-style 'processed' / 'total' AND the newer
+    keyword-style 'processed_candidates' / 'total_candidates'.  The keyword
+    form takes precedence when both are supplied.
+
+    Any unrecognised kwargs are silently ignored so future callers can add
+    new fields without causing TypeErrors here.
+    """
+    # Resolve aliases: keyword form overrides legacy positional form
+    resolved_processed = processed_candidates if processed_candidates is not None else processed
+    resolved_total     = total_candidates     if total_candidates     is not None else total
+
     import asyncio
     from app.services.job_manager import JobManager
     manager = JobManager.get_instance()
@@ -1772,16 +1863,24 @@ def _sync_update_progress(project_id: str, stage: str, progress: int, status: st
     except RuntimeError:
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
-    coro = manager.update_job_progress(project_id, stage, progress, status, processed, total, eta, retry_count)
+
+    coro = manager.update_job_progress(
+        project_id,
+        stage,
+        progress,
+        status,
+        resolved_processed,
+        resolved_total,
+        eta,
+        retry_count,
+    )
     if loop.is_running():
-        # Schedule on the running loop without blocking the calling thread
-        # Using run_coroutine_threadsafe without .result() prevents deadlocks in background threads
         from asyncio import run_coroutine_threadsafe
         future = run_coroutine_threadsafe(coro, loop)
         try:
             future.result(timeout=5.0)
         except Exception:
-            pass  # Non-critical: progress update failure should not abort indexing
+            pass  # Non-critical: progress update failure must never abort indexing
     else:
         loop.run_until_complete(coro)
 
@@ -2342,15 +2441,18 @@ async def upload_file(
             # ── DB writes ─────────────────────────────────────────────────────
             try:
                 logger.info("[SUPABASE_UPLOAD_STARTED] project=%s stage=jobs_insert elapsed=%.3fs", project_id, _elapsed())
-                supabase_client.table("jobs").insert(job).execute()
+                with log_call("supabase", "jobs.insert", project_id=project_id):
+                    supabase_client.table("jobs").insert(job).execute()
                 logger.info("[SUPABASE_UPLOAD_FINISHED] project=%s stage=jobs_insert elapsed=%.3fs rss=%.1fMB", project_id, _elapsed(), _rss())
 
-                count_res = supabase_client.table("jobs").select("id", count="exact").eq("project_id", project_id).execute()
-                supabase_client.table("projects").update({
-                    "job_count": count_res.count or 1,
-                    "status": "uploaded" if p.get("status") in ("CREATED", "draft") and p.get("candidate_count", 0) > 0 else p.get("status"),
-                    "updated_at": _now(),
-                }).eq("id", project_id).execute()
+                with log_call("supabase", "jobs.count", project_id=project_id):
+                    count_res = supabase_client.table("jobs").select("id", count="exact").eq("project_id", project_id).execute()
+                with log_call("supabase", "projects.update_job_count", project_id=project_id):
+                    supabase_client.table("projects").update({
+                        "job_count": count_res.count or 1,
+                        "status": "uploaded" if p.get("status") in ("CREATED", "draft") and p.get("candidate_count", 0) > 0 else p.get("status"),
+                        "updated_at": _now(),
+                    }).eq("id", project_id).execute()
             except Exception as exc:
                 logger.exception("[UPLOAD_FATAL_EXCEPTION] project=%s stage=db_insert error=%s", project_id, exc)
                 return JSONResponse(
@@ -2576,14 +2678,28 @@ async def create_job(
         "created_at": _now(),
     }
 
-    supabase_client.table("jobs").insert(job).execute()
+    try:
+        with log_call("supabase", "jobs.insert", project_id=project_id):
+            supabase_client.table("jobs").insert(job).execute()
 
-    # Update project job count
-    job_count_res = supabase_client.table("jobs").select("id", count="exact").eq("project_id", project_id).execute()
-    supabase_client.table("projects").update({
-        "job_count": job_count_res.count or 1,
-        "updated_at": _now(),
-    }).eq("id", project_id).execute()
+        # Update project job count
+        with log_call("supabase", "jobs.count", project_id=project_id):
+            job_count_res = supabase_client.table("jobs").select("id", count="exact").eq("project_id", project_id).execute()
+        with log_call("supabase", "projects.update_job_count", project_id=project_id):
+            supabase_client.table("projects").update({
+                "job_count": job_count_res.count or 1,
+                "updated_at": _now(),
+            }).eq("id", project_id).execute()
+    except Exception as exc:
+        import traceback as _tb
+        logger.exception(
+            "[UPLOAD_FATAL_EXCEPTION] project=%s stage=create_job_db exception_type=%s exception=%s\n%s",
+            project_id, type(exc).__name__, exc, _tb.format_exc(),
+        )
+        return JSONResponse(
+            status_code=500,
+            content={"detail": f"Database error creating job: {exc}", "traceback": _tb.format_exc()},
+        )
 
     logger.info("Created job %s for project %s via text input", jid, project_id)
     return job

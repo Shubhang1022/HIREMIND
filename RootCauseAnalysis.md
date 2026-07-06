@@ -1,84 +1,68 @@
 # RootCauseAnalysis.md
 
-## Executive Summary
+## Primary Blocker: `TypeError: _sync_update_progress() got an unexpected keyword argument 'processed_candidates'`
 
-`GET /api/v1/platform/projects` returns HTTP 502. The browser reports a CORS error. **The CORS infrastructure is working correctly.** The 502 is caused by the backend crashing or timing out before sending a response. The browser misreads the TCP-level failure as a CORS rejection.
+### Exact crash location
 
----
+```
+backend/app/api/v1/endpoints/platform.py
+process_project_data_task()  →  line ~1316
 
-## Root Cause 1 — Blocking synchronous Supabase calls on every GET /projects request (PRIMARY CRASH)
-
-**File**: `backend/app/api/v1/endpoints/platform.py`  
-**Functions**: `_enforce_analysis_timeouts()`, `_enforce_embedding_timeouts()`  
-**Called from**: `list_projects()` lines 1997–1998, `get_project()` lines 2042–2043
-
-```python
-@router.get("/projects")
-async def list_projects(current_user: ...):
-    _enforce_analysis_timeouts()    # ← Supabase SELECT on every request
-    _enforce_embedding_timeouts()   # ← Supabase SELECT on every request
-    ...
+_sync_update_progress(project_id, "Loading Embedding Model", 20, status="embedding",
+                      processed_candidates=0, total_candidates=total_candidates,
+                      retry_count=attempt - 1)
 ```
 
-**What happens**:
-1. Every `GET /projects` call executes TWO synchronous Supabase queries before the main query.
-2. These functions call `supabase_client.table("projects").select(...)` synchronously on the async event loop via the blocking Supabase client.
-3. If Supabase is slow (cold connection, network hiccup, query planner timeout), these calls can take 5–30+ seconds.
-4. Render's request proxy has a 30-second timeout. If the two enforcement queries + main query exceed 30s total, Render kills the connection → 502.
-5. The browser receives no response → incorrectly reports CORS failure.
+### Root cause: parameter name mismatch between the definition and its callers
 
-**Proof from code**: Both functions make `supabase_client.table(...).execute()` calls inside synchronous functions called from an async route handler. These are blocking I/O calls on the uvicorn event loop.
-
----
-
-## Root Cause 2 — `is_upload_allowed()` permanently returns False (UPLOAD BLOCKED)
-
-**File**: `backend/app/core/startup_state.py`  
-**Never called**: `mark_api_ready()`, `mark_startup_check_complete()`, `mark_initialization_complete()`
-
-`startup_state.py` defines three flags. `is_upload_allowed()` requires all three to be `True`. `main.py`'s `lifespan()` calls `run_startup_check()` but **never calls any of the mark functions**. All flags stay `False` forever. `_ensure_upload_service_ready()` in `platform.py` calls `is_upload_allowed()` and raises HTTP 503 on every upload attempt.
-
-**Effect**: All `POST /upload` requests return 503 permanently after deployment.
-
----
-
-## Root Cause 3 — No per-stage logging or crash-safe wrapper on list_projects
-
-**File**: `backend/app/api/v1/endpoints/platform.py`  
-**Function**: `list_projects()`
-
-The original endpoint had no try/except, no stage logging, and no per-request ID. When an exception occurred (Supabase timeout, serialization error), it propagated through FastAPI's global exception handler which returned HTTP 500 — but with no trace of which stage failed.
-
----
-
-## Why the Browser Reports CORS
-
-The browser sees one of:
-- TCP connection reset (Render killed the worker → no HTTP response → browser reports CORS)
-- HTTP 502 with no CORS headers (Render's proxy responds without forwarding backend headers)
-- HTTP 503 from `_ensure_upload_service_ready()` — the 503 response itself doesn't include CORS headers
-
-In all three cases, the `Access-Control-Allow-Origin` header is missing — not because CORS is misconfigured, but because the backend never sent a proper response.
-
----
-
-## Module-level Supabase Client Initialization
-
-**File**: `backend/app/api/v1/endpoints/platform.py` line ~131
-
+**Definition of `_sync_update_progress`** (line 1766, before fix):
 ```python
-supabase_client = create_supabase_client(settings.supabase_url, settings.supabase_service_key)
+def _sync_update_progress(
+    project_id, stage, progress,
+    status=None,
+    processed=0,         # ← old name
+    total=0,             # ← old name
+    eta="",
+    retry_count=None
+):
 ```
 
-This runs at import time. If Supabase credentials are missing or the client constructor raises, the entire `platform.py` module fails to import and ALL platform endpoints return 500. This is a latent risk — not the primary crash cause (since the module compiles and credentials exist in `.env`).
+**Callers added in recent edits** (throughout embedding stage):
+```python
+_sync_update_progress(project_id, stage_label, progress_pct,
+                      status="embedding",
+                      processed_candidates=global_idx,    # ← new name
+                      total_candidates=total_candidates,  # ← new name
+                      retry_count=attempt - 1)
+```
+
+The callers use `processed_candidates=` and `total_candidates=` — the same names that `update_job_progress` (the async coroutine in `job_manager.py`) accepts. But `_sync_update_progress` (the sync wrapper) only accepted `processed=` and `total=`. Python raises `TypeError: got an unexpected keyword argument 'processed_candidates'` before even calling the coroutine.
+
+### Timeline of divergence
+
+1. `job_manager.update_job_progress` was always defined with `processed_candidates` and `total_candidates` (correct)
+2. `_sync_update_progress` was originally written with short names `processed` and `total` and passed them positionally to `update_job_progress`
+3. Multiple rounds of edits added new `_sync_update_progress` call sites using the keyword forms `processed_candidates=` and `total_candidates=` — matching the coroutine's parameter names
+4. The wrapper was never updated → TypeError on every call that uses the new keyword style
+
+### Secondary issue: FSM illegal transition `embedding → processing`
+
+On retry attempt 2+, the job cache may already be in `"embedding"` state. The old code always called:
+```python
+_sync_update_progress(project_id, "Starting Indexing", 5, status="processing", ...)
+```
+This tried to transition `embedding → processing` — rejected by the FSM's `validate_transition`. The fix:
+```python
+_target_status = "processing" if _current_job_status in ("queued", "retrying") else _current_job_status
+```
+On retry from `embedding` state, the status stays `embedding` (idempotent, valid).
 
 ---
 
-## Summary Table
+## Fix Applied
 
-| # | Severity | Root Cause | File | Status |
-|---|----------|-----------|------|--------|
-| 1 | 🔴 PRIMARY | Blocking Supabase queries on every GET /projects | `platform.py` | ✅ Fixed |
-| 2 | 🔴 HIGH | `is_upload_allowed()` always False — uploads blocked | `main.py`, `startup_state.py` | ✅ Fixed |
-| 3 | 🟠 MEDIUM | No instrumentation/crash-safe wrapper on list_projects | `platform.py` | ✅ Fixed |
-| 4 | 🟡 LOW | Module-level supabase_client init at import time | `platform.py` | Documented (no change needed) |
+`_sync_update_progress` was rewritten to:
+1. Accept both the old-style `processed` / `total` AND the new-style `processed_candidates` / `total_candidates`
+2. New-style kwargs take precedence when both are provided
+3. Accept `**_ignored_kwargs` to silently absorb any future fields — callers can add new parameters without ever causing another TypeError here
+4. All call sites continue working unchanged

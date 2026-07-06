@@ -499,6 +499,22 @@ async def lifespan(app: FastAPI):
 
     print(f"[WORKER_STARTED] pid={os.getpid()} uptime=0s", flush=True)
 
+    # ── faulthandler: dumps C-level tracebacks on SIGSEGV / SIGABRT ──────────
+    try:
+        import faulthandler
+        faulthandler.enable()
+        logger.info("[DIAGNOSTIC] faulthandler enabled — C-level stack traces will print on SIGSEGV")
+    except Exception as exc:
+        logger.warning("[DIAGNOSTIC] faulthandler.enable() failed: %s", exc)
+
+    # ── tracemalloc: available for on-demand memory profiling ─────────────────
+    try:
+        import tracemalloc
+        tracemalloc.start(25)  # keep 25-frame traceback
+        logger.info("[DIAGNOSTIC] tracemalloc started (25-frame depth)")
+    except Exception as exc:
+        logger.warning("[DIAGNOSTIC] tracemalloc.start() failed: %s", exc)
+
     # ── Start heartbeat thread ────────────────────────────────────────────────
     _start_heartbeat(interval_seconds=30.0)
 
@@ -694,42 +710,69 @@ app.add_middleware(
 # 3. Request logging middleware — logs every request with timing, status, and exceptions
 @app.middleware("http")
 async def request_logging_middleware(request: Request, call_next):
+    import uuid as _uuid
     _t0 = time.time()
     _pid = os.getpid()
     _method = request.method
     _path = request.url.path
     _content_length = request.headers.get("content-length", "?")
+    _rid = request.headers.get("x-request-id") or _uuid.uuid4().hex[:12]
 
+    def _diag():
+        try:
+            proc = psutil.Process(_pid)
+            rss = proc.memory_info().rss / (1024 * 1024)
+            cpu = proc.cpu_percent(interval=None)
+            nth = proc.num_threads()
+            return rss, cpu, nth
+        except Exception:
+            return 0.0, 0.0, 0
+
+    rss0, cpu0, nth0 = _diag()
     logger.info(
-        "[REQUEST_START] method=%s path=%s content_length=%s pid=%d",
-        _method, _path, _content_length, _pid,
+        "[REQUEST_START] rid=%s method=%s path=%s content_length=%s pid=%d rss=%.1fMB cpu=%.1f%% threads=%d",
+        _rid, _method, _path, _content_length, _pid, rss0, cpu0, nth0,
     )
 
-    exc_info = None
     try:
         response = await call_next(request)
         elapsed = time.time() - _t0
+        rss1, cpu1, nth1 = _diag()
         logger.info(
-            "[REQUEST_END] method=%s path=%s status=%d elapsed=%.3fs",
-            _method, _path, response.status_code, elapsed,
+            "[REQUEST_END] rid=%s method=%s path=%s status=%d elapsed=%.3fs "
+            "rss=%.1fMB cpu=%.1f%% threads=%d",
+            _rid, _method, _path, response.status_code, elapsed, rss1, cpu1, nth1,
         )
         if response.status_code >= 500:
             logger.error(
-                "[REQUEST_ERROR] method=%s path=%s status=%d elapsed=%.3fs — server error returned",
-                _method, _path, response.status_code, elapsed,
+                "[REQUEST_FAILED] rid=%s method=%s path=%s status=%d elapsed=%.3fs "
+                "rss=%.1fMB — server error",
+                _rid, _method, _path, response.status_code, elapsed, rss1,
             )
         return response
     except Exception as exc:
         elapsed = time.time() - _t0
-        import traceback as _tb
+        rss1, cpu1, nth1 = _diag()
+        tb_str = traceback.format_exc()
         logger.error(
-            "[REQUEST_EXCEPTION] method=%s path=%s elapsed=%.3fs error=%s\n%s",
-            _method, _path, elapsed, exc, _tb.format_exc(),
+            "[REQUEST_FAILED] rid=%s method=%s path=%s elapsed=%.3fs rss=%.1fMB "
+            "exception=%s\n%s",
+            _rid, _method, _path, elapsed, rss1, exc, tb_str,
         )
+        # Log top memory allocations if tracemalloc is running
+        try:
+            import tracemalloc as _tm
+            if _tm.is_tracing():
+                snapshot = _tm.take_snapshot()
+                top = snapshot.statistics("lineno")[:5]
+                alloc_str = "\n".join(str(s) for s in top)
+                logger.error("[TRACEMALLOC_TOP5] rid=%s\n%s", _rid, alloc_str)
+        except Exception:
+            pass
         from fastapi.responses import JSONResponse as _JR
         return _JR(
             status_code=500,
-            content={"detail": f"Unhandled exception: {exc}"},
+            content={"detail": f"Unhandled exception: {exc}", "request_id": _rid},
         )
 
 
@@ -802,7 +845,20 @@ async def http_exception_handler(request: Request, exc: StarletteHTTPException):
 
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
-    logger.error("[UNHANDLED_EXCEPTION] Unhandled exception caught: %s", exc, exc_info=True)
+    tb_str = traceback.format_exc()
+    try:
+        proc = psutil.Process(os.getpid())
+        rss = proc.memory_info().rss / (1024 * 1024)
+        cpu = proc.cpu_percent(interval=None)
+        nth = proc.num_threads()
+    except Exception:
+        rss = cpu = nth = 0
+    logger.error(
+        "[UNHANDLED_EXCEPTION] path=%s method=%s exception=%s "
+        "rss=%.1fMB cpu=%.1f%% threads=%d\n%s",
+        request.url.path, request.method, exc, rss, cpu, nth, tb_str,
+        exc_info=False,
+    )
     return JSONResponse(
         status_code=500,
         content={"detail": "An internal server error occurred.", "error": str(exc)},
