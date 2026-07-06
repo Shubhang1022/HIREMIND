@@ -331,7 +331,8 @@ class JobManager:
         Prints a recovery summary table to logs on completion.
         """
         BACKOFF_SECONDS = {1: 60, 2: 120, 3: 300}
-        NON_RETRYABLE_REASONS = ("MODEL_LOAD_FAILED", "MODEL_LOAD_TIMEOUT", "model_load_failed")
+        NON_RETRYABLE_REASONS = ("MODEL_LOAD_FAILED", "MODEL_LOAD_TIMEOUT", "model_load_failed",
+                                  "INDEX_DIMENSION_MISMATCH")
 
         recovered = 0
         skipped = 0

@@ -4,6 +4,10 @@ EmbeddingEncoder — wraps sentence-transformers for CPU-only batch encoding.
 Designed to be importable even when sentence_transformers is NOT installed.
 The model is loaded lazily: only when encode_batch() or encode_single() is
 first called (or when load_model() is called explicitly).
+
+Production default: BAAI/bge-small-en-v1.5 (384-dim, 90 MB).
+This must match the model pre-downloaded in backend/Dockerfile and the
+embedding_model field in backend/app/core/config.py.
 """
 
 from __future__ import annotations
@@ -13,11 +17,17 @@ import numpy as np
 
 _MODEL_CACHE: dict[str, object] = {}
 
+# Production default — must stay in sync with:
+#   backend/Dockerfile  →  SentenceTransformer('BAAI/bge-small-en-v1.5', ...)
+#   backend/app/core/config.py  →  embedding_model = "BAAI/bge-small-en-v1.5"
+#   backend/app/services/model_service.py  →  _DEFAULT_MODEL = "BAAI/bge-small-en-v1.5"
+_PRODUCTION_DEFAULT_MODEL = "BAAI/bge-small-en-v1.5"
+
 
 class EmbeddingEncoder:
     """Wraps sentence-transformers for CPU-only batch encoding."""
 
-    def __init__(self, model_name: str = "BAAI/bge-base-en-v1.5") -> None:
+    def __init__(self, model_name: str = _PRODUCTION_DEFAULT_MODEL) -> None:
         self.model_name = model_name
         self._model = None  # lazy load
 
@@ -104,7 +114,7 @@ class EmbeddingEncoder:
 
         Notes
         -----
-        If the selected model is a BGE v1.5 model (e.g. ``BAAI/bge-large-en-v1.5``),
+        If the selected model is a BGE v1.5 model (e.g. ``BAAI/bge-small-en-v1.5``),
         you can set ``bge_mode`` to:
           - ``"query"``   → prefixes each text with ``"query: "``
           - ``"passage"`` → prefixes each text with ``"passage: "``
@@ -142,7 +152,12 @@ class EmbeddingEncoder:
 
     @property
     def embedding_dim(self) -> int:
-        """Return the embedding dimension (384 for MiniLM-L6)."""
+        """Return the embedding dimension.
+
+        Value is read dynamically from the loaded model via
+        ``model.get_sentence_embedding_dimension()``.
+        For BAAI/bge-small-en-v1.5 this is 384.
+        """
         self._ensure_loaded()
         return self._model.get_sentence_embedding_dimension()
 

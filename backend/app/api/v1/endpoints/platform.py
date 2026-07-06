@@ -3099,6 +3099,49 @@ Python Traceback:
                         CacheService.set("embeddings", ids_key, candidate_ids_list)
 
                 await asyncio.wait_for(load_index_and_ids(), timeout=120.0) # 2 minute timeout
+
+                # ── INDEX_DIMENSION_CHECK ─────────────────────────────────────
+                # Validate that the stored FAISS index was built with the same
+                # embedding dimension as the current encoder.
+                # Mismatch means the project was indexed with a different model.
+                if index is not None and not metadata_only_fallback:
+                    try:
+                        encoder_for_check = _get_encoder()
+                        enc_dim = encoder_for_check.embedding_dim
+                        idx_dim = index.d
+                        logger.info(
+                            "[INDEX_DIMENSION_CHECK] project=%s "
+                            "index_dimension=%d encoder_dimension=%d",
+                            project_id, idx_dim, enc_dim,
+                        )
+                        if idx_dim != enc_dim:
+                            logger.error(
+                                "[INDEX_DIMENSION_MISMATCH] project=%s "
+                                "index_dimension=%d encoder_dimension=%d "
+                                "failure_reason=INDEX_DIMENSION_MISMATCH",
+                                project_id, idx_dim, enc_dim,
+                            )
+                            raise HTTPException(
+                                status_code=409,
+                                detail=(
+                                    f"INDEX_DIMENSION_MISMATCH: The FAISS index for this project "
+                                    f"has dimension {idx_dim} but the current embedding model "
+                                    f"produces {enc_dim}-dimensional vectors. "
+                                    "This project was indexed using a different embedding model. "
+                                    "Please re-upload candidates to rebuild embeddings."
+                                ),
+                            )
+                        logger.info(
+                            "[INDEX_DIMENSION_OK] project=%s dimension=%d",
+                            project_id, idx_dim,
+                        )
+                    except HTTPException:
+                        raise
+                    except Exception as dim_check_exc:
+                        logger.warning(
+                            "[INDEX_DIMENSION_CHECK] project=%s dimension check failed: %s — continuing",
+                            project_id, dim_check_exc,
+                        )
             except asyncio.TimeoutError:
                 logger.error("FAISS index/IDs loading timed out after 2 minutes.")
                 metadata_only_fallback = True

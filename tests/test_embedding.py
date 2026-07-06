@@ -2,6 +2,9 @@
 Tests for EmbeddingEncoder.
 
 All tests are skipped automatically when sentence_transformers is not installed.
+Dimension assertions are dynamic — they read ``encoder.embedding_dim`` and
+``model.get_sentence_embedding_dimension()`` rather than hardcoding 1024.
+Current production model: BAAI/bge-small-en-v1.5  (384-dim, 90 MB).
 """
 
 import numpy as np
@@ -15,27 +18,39 @@ from src.features.embedding import EmbeddingEncoder  # noqa: E402
 
 @pytest.fixture(scope="module")
 def encoder() -> EmbeddingEncoder:
-    """Shared encoder instance — model loaded once per test session."""
-    enc = EmbeddingEncoder()
+    """Shared encoder instance — model loaded once per test session.
+
+    Uses the production default (BAAI/bge-small-en-v1.5) so tests always
+    validate the model that will run on Render.
+    """
+    enc = EmbeddingEncoder()          # uses _PRODUCTION_DEFAULT_MODEL
     enc.load_model()
     return enc
 
 
 # ---------------------------------------------------------------------------
-# Shape tests
+# Shape tests — dynamic, not hardcoded to any dimension
 # ---------------------------------------------------------------------------
 
 
 def test_encode_batch_shape(encoder: EmbeddingEncoder) -> None:
-    """encode_batch(['hello', 'world']) should return shape (2, 1024)."""
+    """encode_batch returns shape (n_texts, embedding_dim) for the loaded model."""
     result = encoder.encode_batch(["hello", "world"])
-    assert result.shape == (2, 1024), f"Expected (2, 1024), got {result.shape}"
+    expected_dim = encoder.embedding_dim
+    assert result.shape == (2, expected_dim), (
+        f"Expected shape (2, {expected_dim}), got {result.shape}. "
+        f"Model: {encoder.model_name}"
+    )
 
 
 def test_encode_single_shape(encoder: EmbeddingEncoder) -> None:
-    """encode_single('hello') should return shape (1024,)."""
+    """encode_single returns a 1-D array of length embedding_dim."""
     result = encoder.encode_single("hello")
-    assert result.shape == (1024,), f"Expected (1024,), got {result.shape}"
+    expected_dim = encoder.embedding_dim
+    assert result.shape == (expected_dim,), (
+        f"Expected shape ({expected_dim},), got {result.shape}. "
+        f"Model: {encoder.model_name}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -58,13 +73,41 @@ def test_normalized_norms(encoder: EmbeddingEncoder) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Embedding dimension property
+# Embedding dimension property — dynamic
 # ---------------------------------------------------------------------------
 
 
 def test_embedding_dim_property(encoder: EmbeddingEncoder) -> None:
-    """embedding_dim should equal 1024 for BAAI/bge-large-en-v1.5."""
-    assert encoder.embedding_dim == 1024
+    """embedding_dim property matches model.get_sentence_embedding_dimension()."""
+    # Read the true dim directly from the underlying model
+    true_dim = encoder._model.get_sentence_embedding_dimension()
+    assert encoder.embedding_dim == true_dim, (
+        f"embedding_dim property ({encoder.embedding_dim}) does not match "
+        f"model.get_sentence_embedding_dimension() ({true_dim})"
+    )
+
+
+def test_embedding_dim_is_positive(encoder: EmbeddingEncoder) -> None:
+    """embedding_dim must be a positive integer."""
+    assert isinstance(encoder.embedding_dim, int)
+    assert encoder.embedding_dim > 0, f"Expected positive dim, got {encoder.embedding_dim}"
+
+
+def test_production_model_dimension(encoder: EmbeddingEncoder) -> None:
+    """Production model BAAI/bge-small-en-v1.5 must produce 384-dim vectors.
+
+    This test is the single source of truth for the expected dimension.
+    If this test fails, the Dockerfile and config.py must be re-checked.
+    """
+    if encoder.model_name != "BAAI/bge-small-en-v1.5":
+        pytest.skip(
+            f"Skipping production-dimension check: model is '{encoder.model_name}', "
+            "not the production default 'BAAI/bge-small-en-v1.5'."
+        )
+    assert encoder.embedding_dim == 384, (
+        f"BAAI/bge-small-en-v1.5 must produce 384-dim vectors, "
+        f"got {encoder.embedding_dim}."
+    )
 
 
 # ---------------------------------------------------------------------------

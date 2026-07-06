@@ -21,8 +21,11 @@ from src.ranking.engine import UnifiedRankingEngine, validate_ranking_payload, r
 
 
 class MockEncoder:
-    """Mock encoder to avoid loading sentence_transformers during fast metadata mapping tests."""
-    def __init__(self, dim: int = 1024) -> None:
+    """Mock encoder to avoid loading sentence_transformers during fast metadata mapping tests.
+
+    Default dimension 384 matches the production model BAAI/bge-small-en-v1.5.
+    """
+    def __init__(self, dim: int = 384) -> None:
         self.embedding_dim = dim
 
     def encode_single(self, text: str, normalize: bool = True, bge_mode: str = "query") -> np.ndarray:

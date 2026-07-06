@@ -76,9 +76,11 @@ class Settings(BaseSettings):
     feature_cache_dir: str = "./feature_cache"
     submission_output: str = "./submission.csv"
     ranking_config_path: str = "./config/ranking_config.yaml"
-    # Default to bge-base (438 MB) instead of bge-large (1.34 GB).
-    # Override with EMBEDDING_MODEL_NAME or EMBEDDING_MODEL env var.
-    embedding_model: str = "BAAI/bge-base-en-v1.5"
+    # IMPORTANT: this default MUST match the model pre-downloaded in backend/Dockerfile.
+    # Dockerfile bakes BAAI/bge-small-en-v1.5 (90 MB) into the image.
+    # bge-base (438 MB) and bge-large (1.34 GB) cause OOM kills on Render free tier.
+    # Override with EMBEDDING_MODEL_NAME env var if running on a larger instance.
+    embedding_model: str = "BAAI/bge-small-en-v1.5"
 
     # OpenRouter
     openrouter_api_key: str = ""

@@ -27,7 +27,10 @@ logger = logging.getLogger(__name__)
 # Tunables
 # ---------------------------------------------------------------------------
 MODEL_LOAD_TIMEOUT_SECONDS = int(os.environ.get("MODEL_LOAD_TIMEOUT", "120"))
-_DEFAULT_MODEL = "BAAI/bge-base-en-v1.5"
+# MUST match the model pre-downloaded in backend/Dockerfile.
+# Dockerfile bakes bge-small-en-v1.5 (90 MB) — if this mismatches, the container
+# will try to download the model at runtime, risking OOM on Render free tier.
+_DEFAULT_MODEL = "BAAI/bge-small-en-v1.5"
 
 
 class ModelLoadTimeout(RuntimeError):

@@ -3,10 +3,12 @@
 import asyncio
 import logging
 import os
+import signal
 import sys
 import time
 import gc
 import threading
+import traceback
 from contextlib import asynccontextmanager
 from datetime import datetime
 
@@ -73,6 +75,122 @@ def setup_json_logging():
 
 setup_json_logging()
 logger = logging.getLogger(__name__)
+
+_startup_time = time.time()
+
+# ── Global exception handlers — catch every unhandled exception before the worker dies ──
+
+def _sys_excepthook(exc_type, exc_value, exc_tb):
+    """Catch unhandled exceptions in the main thread."""
+    tb_str = "".join(traceback.format_exception(exc_type, exc_value, exc_tb))
+    logger.critical(
+        "[WORKER_CRASH] Unhandled exception in main thread — worker will exit\n"
+        "Type: %s\nValue: %s\nTraceback:\n%s",
+        exc_type.__name__, exc_value, tb_str,
+    )
+    print(f"[WORKER_CRASH] {exc_type.__name__}: {exc_value}", flush=True)
+    # Call the original excepthook to preserve default behaviour
+    sys.__excepthook__(exc_type, exc_value, exc_tb)
+
+sys.excepthook = _sys_excepthook
+
+
+def _threading_excepthook(args):
+    """Catch unhandled exceptions in daemon/worker threads."""
+    tb_str = "".join(traceback.format_exception(args.exc_type, args.exc_value, args.exc_traceback))
+    thread_name = args.thread.name if args.thread else "unknown"
+    logger.critical(
+        "[THREAD_EXCEPTION] Unhandled exception in thread=%s\n"
+        "Type: %s\nValue: %s\nTraceback:\n%s",
+        thread_name, args.exc_type.__name__, args.exc_value, tb_str,
+    )
+    print(f"[THREAD_EXCEPTION] thread={thread_name} {args.exc_type.__name__}: {args.exc_value}", flush=True)
+
+threading.excepthook = _threading_excepthook
+
+
+def _asyncio_exception_handler(loop, context):
+    """Catch unhandled exceptions in asyncio tasks."""
+    exc = context.get("exception")
+    msg = context.get("message", "unknown")
+    future = context.get("future")
+    task = context.get("task")
+    task_name = getattr(task, "get_name", lambda: "?")() if task else "?"
+    tb_str = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__)) if exc else msg
+    logger.critical(
+        "[ASYNC_EXCEPTION] Unhandled exception in asyncio task=%s message=%s\n%s",
+        task_name, msg, tb_str,
+    )
+    print(f"[ASYNC_EXCEPTION] task={task_name} {type(exc).__name__ if exc else msg}", flush=True)
+
+# Applied to the event loop after it is created (see lifespan)
+
+
+# ── Signal handlers ──────────────────────────────────────────────────────────
+
+def _make_signal_handler(sig_name: str):
+    def _handler(signum, frame):
+        rss = 0.0
+        try:
+            rss = psutil.Process(os.getpid()).memory_info().rss / (1024 * 1024)
+        except Exception:
+            pass
+        logger.info(
+            "[SIGNAL_RECEIVED] signal=%s pid=%d rss=%.1fMB uptime=%.1fs",
+            sig_name, os.getpid(), rss, time.time() - _startup_time,
+        )
+        print(f"[SIGNAL_RECEIVED] signal={sig_name} pid={os.getpid()}", flush=True)
+        # Re-raise as KeyboardInterrupt so uvicorn's shutdown sequence runs
+        raise KeyboardInterrupt(f"Signal {sig_name} received")
+    return _handler
+
+
+for _sig, _name in [(signal.SIGTERM, "SIGTERM"), (signal.SIGINT, "SIGINT")]:
+    try:
+        signal.signal(_sig, _make_signal_handler(_name))
+    except (OSError, ValueError):
+        pass  # Some signals can't be caught in all contexts
+
+# SIGQUIT (Linux only)
+try:
+    signal.signal(signal.SIGQUIT, _make_signal_handler("SIGQUIT"))
+except (AttributeError, OSError, ValueError):
+    pass
+
+
+# ── Process heartbeat ─────────────────────────────────────────────────────────
+
+def _start_heartbeat(interval_seconds: float = 30.0) -> threading.Thread:
+    """Daemon thread that logs RSS/CPU/threads every N seconds."""
+    def _heartbeat():
+        while True:
+            try:
+                time.sleep(interval_seconds)
+                proc = psutil.Process(os.getpid())
+                rss   = proc.memory_info().rss / (1024 * 1024)
+                cpu   = proc.cpu_percent(interval=None)
+                nthrd = proc.num_threads()
+                loop  = None
+                pending_tasks = 0
+                loop_state = "unknown"
+                try:
+                    loop = asyncio.get_event_loop()
+                    loop_state = "running" if loop.is_running() else "stopped"
+                    pending_tasks = len([t for t in asyncio.all_tasks(loop) if not t.done()])
+                except Exception:
+                    pass
+                logger.info(
+                    "[WORKER_HEARTBEAT] pid=%d rss=%.1fMB cpu=%.1f%% threads=%d "
+                    "pending_tasks=%d loop=%s uptime=%.0fs",
+                    os.getpid(), rss, cpu, nthrd, pending_tasks, loop_state,
+                    time.time() - _startup_time,
+                )
+            except Exception as hb_exc:
+                logger.warning("[WORKER_HEARTBEAT_ERROR] %s", hb_exc)
+
+    t = threading.Thread(target=_heartbeat, name="worker-heartbeat", daemon=True)
+    t.start()
+    return t
 
 # Normalize and validate origins (Task 3 & 6)
 allowed_origins = list(set([
@@ -168,8 +286,6 @@ def log_startup_summary(missing_vars: list[str]) -> None:
                 missing_vars or "none")
 
 
-
-_startup_time = time.time()
 
 def log_deployment_diagnostics(label: str):
     try:
@@ -373,6 +489,19 @@ def run_startup_check() -> bool:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # ── Install asyncio exception handler on the running event loop ──────────
+    try:
+        _loop = asyncio.get_event_loop()
+        _loop.set_exception_handler(_asyncio_exception_handler)
+        logger.info("[WORKER_STARTED] pid=%d loop=%s", os.getpid(), _loop)
+    except Exception as exc:
+        logger.warning("[WORKER_STARTED] Could not install asyncio exception handler: %s", exc)
+
+    print(f"[WORKER_STARTED] pid={os.getpid()} uptime=0s", flush=True)
+
+    # ── Start heartbeat thread ────────────────────────────────────────────────
+    _start_heartbeat(interval_seconds=30.0)
+
     # ── Step 1: Validate env vars — fast, no I/O ─────────────────────────────
     missing_vars = validate_required_env()
     log_startup_summary(missing_vars)
@@ -475,9 +604,22 @@ async def lifespan(app: FastAPI):
         except Exception as exc:
             logger.warning("[STARTUP] model diagnostics error: %s", exc)
 
-        log_deployment_diagnostics("STARTUP_COMPLETE")
+        try:
+            log_deployment_diagnostics("STARTUP_COMPLETE")
+        except Exception as exc:
+            logger.warning("[STARTUP] log_deployment_diagnostics error: %s", exc)
 
-    asyncio.create_task(_deferred_startup())
+    async def _run_deferred_startup_safe():
+        """Outer safety wrapper — no exception from _deferred_startup can escape to the event loop."""
+        try:
+            await _deferred_startup()
+        except Exception as exc:
+            logger.critical(
+                "[WORKER_CRASH] _deferred_startup raised unhandled exception: %s\n%s",
+                exc, traceback.format_exc(),
+            )
+
+    asyncio.create_task(_run_deferred_startup_safe())
 
     # Log CORS config
     logger.info("[CORS_STARTUP] Allowed Origins: %s", allowed_origins)
@@ -486,7 +628,13 @@ async def lifespan(app: FastAPI):
         logger.warning("[CORS_STARTUP] Production frontend URL %s missing from allowed origins!", frontend_prod)
 
     # ── Yield: server is now live and accepting requests ─────────────────────
+    logger.info("[WORKER_READY] pid=%d rss=%.1fMB uptime=%.2fs",
+                os.getpid(), psutil.Process(os.getpid()).memory_info().rss / (1024 * 1024),
+                time.time() - _startup_time)
+    print(f"[WORKER_READY] pid={os.getpid()}", flush=True)
     yield
+    logger.info("[WORKER_EXIT] pid=%d uptime=%.1fs", os.getpid(), time.time() - _startup_time)
+    print(f"[WORKER_EXIT] pid={os.getpid()}", flush=True)
 
     # ── Shutdown ──────────────────────────────────────────────────────────────
     async def perform_shutdown_cleanups():

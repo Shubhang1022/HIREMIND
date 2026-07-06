@@ -25,6 +25,14 @@ from app.core.openrouter import recruiter_evaluate_batch
 logger = logging.getLogger(__name__)
 
 
+class DimensionMismatchError(RuntimeError):
+    """Raised when FAISS index dimension does not match the encoder dimension.
+
+    This is a permanent, non-retryable failure.  The project must be
+    re-indexed with the current embedding model before analysis can proceed.
+    """
+
+
 def validate_tuple(t: Any, expected_len: int, caller: str, expected_format: str) -> None:
     if not isinstance(t, tuple):
         raise TypeError(
@@ -407,14 +415,25 @@ class UnifiedRankingEngine:
         # Determine target dimension
         dim = passed_embs.shape[1] if passed_embs is not None else self.encoder.embedding_dim
 
-        # Align encoder model dimension with candidate embedding dimension
-        if self.encoder.embedding_dim != dim:
-            if dim == 384:
-                self.encoder.model_name = "BAAI/bge-small-en-v1.5"
-                self.encoder._model = None  # Force reload
-            elif dim == 1024:
-                self.encoder.model_name = "BAAI/bge-large-en-v1.5"
-                self.encoder._model = None  # Force reload
+        # ── DIMENSION VALIDATION ──────────────────────────────────────────────
+        # The encoder dimension MUST match the candidate embedding dimension.
+        # We never silently switch models — that hides OOM-causing downloads.
+        # If there is a mismatch, raise immediately with a clear error.
+        encoder_dim = self.encoder.embedding_dim
+        if passed_embs is not None and encoder_dim != dim:
+            import logging as _log
+            _log.getLogger(__name__).error(
+                "[INDEX_DIMENSION_MISMATCH] "
+                "encoder_dimension=%d index_dimension=%d "
+                "— candidate embeddings were built with a different model. "
+                "Re-upload candidates to rebuild embeddings.",
+                encoder_dim, dim,
+            )
+            raise DimensionMismatchError(
+                f"INDEX_DIMENSION_MISMATCH: encoder produces {encoder_dim}-dim vectors "
+                f"but candidate embeddings have {dim} dimensions. "
+                "Re-upload candidates to rebuild the index with the current model."
+            )
 
         # JD embedding
         jd_text = (
