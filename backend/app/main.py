@@ -958,17 +958,48 @@ async def detailed_health():
         storage_status = "unhealthy"
         storage_error = str(e)
 
-    # ── 3. OpenRouter connectivity (lightweight key-presence check) ───────────
+    # ── 3. OpenRouter (key-presence check only — no network call) ────────────
     openrouter_status = "configured" if settings.openrouter_api_key else "not_configured"
 
     # ── 4. Model singleton status ─────────────────────────────────────────────
     from app.services import model_service as _ms
-    model_loaded = _ms.is_loaded()
-    model_name = _ms.get_model_name() or settings.embedding_model
-    model_state = _ms.get_load_state()
-    model_error = str(_ms.get_load_error()) if _ms.get_load_error() else None
+    model_loaded   = _ms.is_loaded()
+    model_name     = _ms.get_model_name() or settings.embedding_model
+    model_state    = _ms.get_load_state()
+    model_error    = str(_ms.get_load_error()) if _ms.get_load_error() else None
 
-    # ── 5. FAISS availability ─────────────────────────────────────────────────
+    # Embedding dimension (only available after model is loaded)
+    embedding_dim: int | None = None
+    singleton_active = False
+    try:
+        if model_loaded:
+            raw = _ms.get_model()  # does not block — already loaded
+            embedding_dim = int(raw.get_sentence_embedding_dimension())
+            singleton_active = True
+    except Exception:
+        pass
+
+    # Count SentenceTransformer instances in the process (should always be 1 or 0)
+    # Inspect _MODEL_CACHE from embedding.py + model_service._model
+    st_instance_count = 0
+    try:
+        from src.features.embedding import _MODEL_CACHE as _ec
+        st_instance_count = len(_ec)
+    except Exception:
+        pass
+    # model_service._model counts as 1 additional if loaded
+    # In a healthy process: st_instance_count == 1 (both point to the same object)
+
+    # ── 5. HF cache verification ──────────────────────────────────────────────
+    hf_home         = os.environ.get("HF_HOME", "/app/.cache/huggingface")
+    st_home         = os.environ.get("SENTENCE_TRANSFORMERS_HOME", "/app/.cache/sentence-transformers")
+    hf_cache_found  = os.path.isdir(hf_home)
+    docker_cache_found = os.path.isdir(st_home) and bool(
+        # Non-empty means model files are present (Docker pre-download worked)
+        os.listdir(st_home) if os.path.isdir(st_home) else []
+    )
+
+    # ── 6. FAISS availability ─────────────────────────────────────────────────
     faiss_available = False
     try:
         import faiss as _faiss  # noqa: F401
@@ -976,19 +1007,19 @@ async def detailed_health():
     except ImportError:
         pass
 
-    # ── 6. Memory telemetry ───────────────────────────────────────────────────
-    rss_mb = 0.0
-    cpu_pct = 0.0
+    # ── 7. Memory telemetry ───────────────────────────────────────────────────
+    rss_mb   = 0.0
+    cpu_pct  = 0.0
     avail_mb = 0.0
     try:
-        _proc = psutil.Process(os.getpid())
-        rss_mb = _proc.memory_info().rss / (1024 * 1024)
-        cpu_pct = _proc.cpu_percent(interval=None)
+        _proc    = psutil.Process(os.getpid())
+        rss_mb   = _proc.memory_info().rss / (1024 * 1024)
+        cpu_pct  = _proc.cpu_percent(interval=None)
         avail_mb = psutil.virtual_memory().available / (1024 * 1024)
     except Exception:
         pass
 
-    # ── 7. Background jobs ────────────────────────────────────────────────────
+    # ── 8. Background jobs ────────────────────────────────────────────────────
     active_jobs: list[dict] = []
     failed_recent = 0
     recovering_jobs = 0
@@ -1012,7 +1043,7 @@ async def detailed_health():
     except Exception:
         pass
 
-    # ── 8. In-process ranking cache size ─────────────────────────────────────
+    # ── 9. In-process ranking cache size ─────────────────────────────────────
     cache_size = 0
     try:
         from app.api.v1.endpoints.platform import _backend_ranking_cache
@@ -1020,7 +1051,7 @@ async def detailed_health():
     except Exception:
         pass
 
-    # ── 9. Thread count ───────────────────────────────────────────────────────
+    # ── 10. Thread count ──────────────────────────────────────────────────────
     thread_count = _threading.active_count()
 
     # ── Overall status ────────────────────────────────────────────────────────
@@ -1031,38 +1062,63 @@ async def detailed_health():
         overall = "degraded" if overall == "healthy" else overall
 
     return {
+        # Top-level readiness
         "status": overall,
+        "application_ready": True,           # always True once /health responds
         "timestamp": _time.time(),
         "uptime_seconds": round(_time.time() - _startup_time, 1),
-        "database": {"status": db_status, "error": db_error},
-        "storage": {"status": storage_status, "error": storage_error},
-        "openrouter": {"status": openrouter_status, "ready": openrouter_status == "configured"},
+
+        # Model singleton
         "model": {
             "loaded": model_loaded,
-            "model_state": model_state,
+            "model_state": model_state,      # "unloaded"|"loading"|"loaded"|"failed"
             "cached": model_loaded,
             "name": model_name,
-            "error": model_error,
             "configured_model": settings.embedding_model,
+            "embedding_dim": embedding_dim,  # None until loaded
+            "singleton_active": singleton_active,
+            "sentence_transformer_instances": st_instance_count,
+            "error": model_error,
         },
-        "faiss": {"available": faiss_available, "faiss_loaded": faiss_available},
+
+        # HF / Docker cache
+        "cache": {
+            "hf_home": hf_home,
+            "st_home": st_home,
+            "hf_cache_found": hf_cache_found,
+            "docker_cache_found": docker_cache_found,
+        },
+
+        # External services
+        "database":  {"status": db_status,  "error": db_error},
+        "storage":   {"status": storage_status, "error": storage_error},
+        "openrouter": {"status": openrouter_status, "ready": openrouter_status == "configured"},
+
+        # FAISS
+        "faiss": {"available": faiss_available},
+
+        # Memory & CPU
         "memory": {
-            "rss_mb": round(rss_mb, 1),
-            "available_mb": round(avail_mb, 1),
-            "safety_limit_mb": 450.0,
-            "under_threshold": rss_mb < 450.0,
+            "rss_mb":        round(rss_mb, 1),
+            "available_mb":  round(avail_mb, 1),
+            "safety_limit_mb": 600.0,
+            "under_threshold": rss_mb < 600.0,
         },
         "cpu_percent": round(cpu_pct, 1),
         "threads": thread_count,
+
+        # Background jobs
         "background_jobs": {
-            "active": active_jobs,
-            "active_count": len(active_jobs),
-            "failed_jobs": failed_recent,
+            "active":          active_jobs,
+            "active_count":    len(active_jobs),
+            "failed_jobs":     failed_recent,
             "recovering_jobs": recovering_jobs,
         },
+
+        # Convenience flat fields (for quick scripted checks)
         "ranking_cache_size": cache_size,
-        "supabase_ready": db_status == "healthy",
-        "storage_ready": storage_status == "healthy",
+        "supabase_ready":   db_status == "healthy",
+        "storage_ready":    storage_status == "healthy",
         "openrouter_ready": openrouter_status == "configured",
-        "model_loaded": model_loaded,
+        "model_loaded":     model_loaded,
     }

@@ -1,23 +1,36 @@
 fastapi==0.115.0
 uvicorn[standard]==0.30.6
-sqlalchemy==2.0.36
-asyncpg==0.30.0
-alembic==1.14.0
 pydantic-settings==2.6.1
 python-dotenv==1.0.1
 python-multipart==0.0.12
 PyJWT==2.9.0
 httpx==0.27.2
 
-# AI / Ingestion (shared with root pipeline)
+# ── AI / ML ────────────────────────────────────────────────────────────────────
 numpy>=1.24.0
 sentence-transformers>=2.2.0
+faiss-cpu>=1.7.4
+
+# ── Data / Document parsing ────────────────────────────────────────────────────
 PyYAML>=6.0
 openpyxl>=3.1.0
 pypdf>=4.0.0
 python-docx>=1.1.0
-supabase==2.5.1
-reportlab==4.1.0
-psutil==5.9.8
-faiss-cpu>=1.7.4
 
+# ── Supabase (primary database) ────────────────────────────────────────────────
+supabase==2.5.1
+
+# ── Output / Export ────────────────────────────────────────────────────────────
+reportlab==4.1.0
+
+# ── Observability ─────────────────────────────────────────────────────────────
+psutil==5.9.8
+
+# ── Legacy SQLAlchemy stack ────────────────────────────────────────────────────
+# NOTE: The backend uses Supabase exclusively. These packages are kept because
+# config.py still declares a `database_url` field that references asyncpg in its
+# default value string. Remove them only after removing `database_url` from config.py.
+# They are NOT imported or used anywhere in the backend application code.
+sqlalchemy==2.0.36
+asyncpg==0.30.0
+alembic==1.14.0

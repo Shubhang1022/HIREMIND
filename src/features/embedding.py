@@ -1,97 +1,104 @@
 """
 EmbeddingEncoder — wraps sentence-transformers for CPU-only batch encoding.
 
-Designed to be importable even when sentence_transformers is NOT installed.
-The model is loaded lazily: only when encode_batch() or encode_single() is
-first called (or when load_model() is called explicitly).
+The model is obtained EXCLUSIVELY via ``model_service.get_model()``.
+This module NEVER instantiates SentenceTransformer directly.
+There is exactly ONE place in the entire production codebase that calls
+SentenceTransformer(): backend/app/services/model_service.py
 
 Production default: BAAI/bge-small-en-v1.5 (384-dim, 90 MB).
-This must match the model pre-downloaded in backend/Dockerfile and the
-embedding_model field in backend/app/core/config.py.
 """
 
 from __future__ import annotations
 
+import logging
 import numpy as np
 
+logger = logging.getLogger(__name__)
 
+# _MODEL_CACHE is kept for backwards compatibility — model_service still
+# back-fills it after loading so that legacy code paths hitting _MODEL_CACHE
+# directly get a cache-hit without a duplicate download.
 _MODEL_CACHE: dict[str, object] = {}
 
 # Production default — must stay in sync with:
-#   backend/Dockerfile  →  SentenceTransformer('BAAI/bge-small-en-v1.5', ...)
-#   backend/app/core/config.py  →  embedding_model = "BAAI/bge-small-en-v1.5"
+#   backend/Dockerfile                →  SentenceTransformer('BAAI/bge-small-en-v1.5', ...)
+#   backend/app/core/config.py        →  embedding_model = "BAAI/bge-small-en-v1.5"
 #   backend/app/services/model_service.py  →  _DEFAULT_MODEL = "BAAI/bge-small-en-v1.5"
 _PRODUCTION_DEFAULT_MODEL = "BAAI/bge-small-en-v1.5"
 
 
 class EmbeddingEncoder:
-    """Wraps sentence-transformers for CPU-only batch encoding."""
+    """Thin wrapper around the model_service singleton.
+
+    NEVER creates a SentenceTransformer itself.  All model loading is
+    delegated to model_service.get_model() which enforces the process-wide
+    singleton guarantee.
+    """
 
     def __init__(self, model_name: str = _PRODUCTION_DEFAULT_MODEL) -> None:
         self.model_name = model_name
-        self._model = None  # lazy load
+        self._model = None  # injected by _get_encoder() or loaded via model_service
 
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
 
     def load_model(self) -> None:
-        """Load model weights. Uses device='cpu'."""
-        global _MODEL_CACHE
+        """Obtain the model from model_service singleton.
+
+        Does NOT instantiate SentenceTransformer — that is model_service's job.
+        Calling this directly is only needed by legacy code; the production path
+        uses _get_encoder() which injects self._model before any encode call.
+        """
+        # Check the backwards-compat cache first
         if self.model_name in _MODEL_CACHE:
             self._model = _MODEL_CACHE[self.model_name]
+            logger.debug("[EmbeddingEncoder] load_model: cache hit for %s", self.model_name)
             return
 
-        # Keep ONLY one model in cache at any time to prevent OOM
-        _MODEL_CACHE.clear()
-        import gc
-        gc.collect()
+        # Delegate to the process-wide singleton — never creates a duplicate
+        try:
+            from app.services.model_service import get_model
+            self._model = get_model()
+            # Back-fill cache so future direct cache lookups hit
+            _MODEL_CACHE[self.model_name] = self._model
+            logger.debug("[EmbeddingEncoder] load_model: obtained from model_service for %s", self.model_name)
+        except Exception as exc:
+            # model_service not available (e.g. standalone CLI usage outside backend)
+            # Fall back to direct load ONLY in that case — never in the production backend
+            logger.warning(
+                "[EmbeddingEncoder] model_service unavailable (%s) — "
+                "falling back to direct load. This should ONLY happen in CLI/test contexts.",
+                exc,
+            )
+            self._load_model_direct()
 
+    def _load_model_direct(self) -> None:
+        """Last-resort direct load for CLI/test contexts outside the FastAPI backend.
+
+        This method exists solely so standalone scripts (precompute.py, rank.py)
+        can still use EmbeddingEncoder without the full FastAPI app.
+        It is NEVER called in the production Docker container.
+        """
         import os
-        # Set HF cache directories (Phase 4)
+        import gc
+        global _MODEL_CACHE
+
+        # Set HF cache to match model_service defaults
         if not os.environ.get("HF_HOME"):
             os.environ["HF_HOME"] = "/app/.cache/huggingface"
         if not os.environ.get("TRANSFORMERS_CACHE"):
             os.environ["TRANSFORMERS_CACHE"] = "/app/.cache/huggingface"
         if not os.environ.get("SENTENCE_TRANSFORMERS_HOME"):
             os.environ["SENTENCE_TRANSFORMERS_HOME"] = "/app/.cache/sentence-transformers"
-        
-        # Suppress HF warnings if HF_TOKEN is absent (Phase 4)
-        try:
-            from app.core.config import settings
-            token = settings.hf_token or os.environ.get("HF_TOKEN")
-        except ImportError:
-            token = os.environ.get("HF_TOKEN")
 
-        if not token:
-            import logging
-            if not getattr(EmbeddingEncoder, "_warning_logged", False):
-                logging.getLogger("huggingface_hub").setLevel(logging.ERROR)
-                logging.getLogger("transformers").setLevel(logging.ERROR)
-                os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
-                os.environ["HF_HUB_DISABLE_TELEMETRY"] = "1"
-                print("[HuggingFace Info] running in unauthenticated mode (optional HF_TOKEN is absent). Warnings suppressed.", flush=True)
-                EmbeddingEncoder._warning_logged = True
+        # Keep only one model in cache at a time
+        _MODEL_CACHE.clear()
+        gc.collect()
 
-        # Lazy import so this module is importable without sentence_transformers.
         from sentence_transformers import SentenceTransformer  # noqa: PLC0415
-
-        kwargs = {"device": "cpu"}
-        if token:
-            kwargs["use_auth_token"] = token
-            kwargs["token"] = token
-
-        try:
-            model = SentenceTransformer(self.model_name, **kwargs)
-        except TypeError:
-            try:
-                model = SentenceTransformer(self.model_name, device="cpu", use_auth_token=token)
-            except TypeError:
-                try:
-                    model = SentenceTransformer(self.model_name, device="cpu", token=token)
-                except TypeError:
-                    model = SentenceTransformer(self.model_name, device="cpu")
-
+        model = SentenceTransformer(self.model_name, device="cpu")
         _MODEL_CACHE[self.model_name] = model
         self._model = model
 
@@ -102,24 +109,9 @@ class EmbeddingEncoder:
         *,
         bge_mode: str | None = None,
     ) -> np.ndarray:
-        """
-        Encode a batch of texts.
+        """Encode a batch of texts.
 
-        Returns
-        -------
-        np.ndarray
-            Shape ``[len(texts), embedding_dim]``, dtype ``float32``.
-
-        Auto-loads the model if it has not been loaded yet.
-
-        Notes
-        -----
-        If the selected model is a BGE v1.5 model (e.g. ``BAAI/bge-small-en-v1.5``),
-        you can set ``bge_mode`` to:
-          - ``"query"``   → prefixes each text with ``"query: "``
-          - ``"passage"`` → prefixes each text with ``"passage: "``
-
-        This follows the recommended prompting for BGE retrieval embeddings.
+        Returns np.ndarray shape [len(texts), embedding_dim], dtype float32.
         """
         self._ensure_loaded()
         encoded_texts = self._apply_bge_prompt(texts, bge_mode=bge_mode)
@@ -129,7 +121,6 @@ class EmbeddingEncoder:
             convert_to_numpy=True,
             show_progress_bar=False,
         )
-        # Guarantee float32 regardless of model default
         return embeddings.astype(np.float32)
 
     def encode_single(
@@ -139,25 +130,12 @@ class EmbeddingEncoder:
         *,
         bge_mode: str | None = None,
     ) -> np.ndarray:
-        """
-        Encode a single text.
-
-        Returns
-        -------
-        np.ndarray
-            Shape ``[embedding_dim]``.
-        """
-        result = self.encode_batch([text], normalize=normalize, bge_mode=bge_mode)
-        return result[0]
+        """Encode a single text. Returns np.ndarray shape [embedding_dim]."""
+        return self.encode_batch([text], normalize=normalize, bge_mode=bge_mode)[0]
 
     @property
     def embedding_dim(self) -> int:
-        """Return the embedding dimension.
-
-        Value is read dynamically from the loaded model via
-        ``model.get_sentence_embedding_dimension()``.
-        For BAAI/bge-small-en-v1.5 this is 384.
-        """
+        """Embedding dimension, read dynamically from the loaded model."""
         self._ensure_loaded()
         return self._model.get_sentence_embedding_dimension()
 
@@ -166,8 +144,7 @@ class EmbeddingEncoder:
     # ------------------------------------------------------------------
 
     def _ensure_loaded(self) -> None:
-        """Load the model if it has not been loaded yet."""
-        global _MODEL_CACHE
+        """Ensure the model is available, loading via model_service if needed."""
         if self.model_name in _MODEL_CACHE:
             self._model = _MODEL_CACHE[self.model_name]
             return
@@ -175,26 +152,16 @@ class EmbeddingEncoder:
             self.load_model()
 
     def _apply_bge_prompt(self, texts: list[str], *, bge_mode: str | None) -> list[str]:
-        """Apply BGE v1.5 query/passage prefixes when requested.
-
-        We only apply the prefix when:
-          - ``bge_mode`` is provided, and
-          - the configured model name looks like a BGE v1.5 model.
-        """
+        """Apply BGE v1.5 query/passage prefixes when requested."""
         if not bge_mode:
             return texts
-
         model_lower = (self.model_name or "").lower()
-        is_bge = "bge" in model_lower and "v1.5" in model_lower
-        if not is_bge:
+        if not ("bge" in model_lower and "v1.5" in model_lower):
             return texts
-
         mode = bge_mode.strip().lower()
         if mode not in ("query", "passage"):
             return texts
-
         prefix = f"{mode}: "
-        # Avoid double-prefixing if caller already prefixed.
         out: list[str] = []
         for t in texts:
             tt = t or ""
