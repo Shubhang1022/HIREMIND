@@ -113,9 +113,17 @@ def _asyncio_exception_handler(loop, context):
     """Catch unhandled exceptions in asyncio tasks."""
     exc = context.get("exception")
     msg = context.get("message", "unknown")
-    future = context.get("future")
     task = context.get("task")
     task_name = getattr(task, "get_name", lambda: "?")() if task else "?"
+
+    # CancelledError during shutdown is expected — do not log as crash
+    if isinstance(exc, asyncio.CancelledError):
+        logger.debug(
+            "[ASYNC_CANCELLED] Task=%s cancelled (expected during shutdown)",
+            task_name,
+        )
+        return
+
     tb_str = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__)) if exc else msg
     logger.critical(
         "[ASYNC_EXCEPTION] Unhandled exception in asyncio task=%s message=%s\n%s",
@@ -127,6 +135,12 @@ def _asyncio_exception_handler(loop, context):
 
 
 # ── Signal handlers ──────────────────────────────────────────────────────────
+# IMPORTANT: Do NOT raise KeyboardInterrupt from signal handlers.
+# Raising KeyboardInterrupt from a C-level signal handler interrupts any
+# running coroutine mid-execution, corrupts asyncio state, and causes
+# "Task exception was never retrieved" for the deferred startup task.
+# Instead: log the signal and let uvicorn's built-in SIGTERM handling do its job.
+# Uvicorn already listens for SIGTERM/SIGINT and performs graceful shutdown.
 
 def _make_signal_handler(sig_name: str):
     def _handler(signum, frame):
@@ -136,12 +150,18 @@ def _make_signal_handler(sig_name: str):
         except Exception:
             pass
         logger.info(
-            "[SIGNAL_RECEIVED] signal=%s pid=%d rss=%.1fMB uptime=%.1fs",
+            "[SIGNAL_RECEIVED] signal=%s pid=%d rss=%.1fMB uptime=%.1fs — "
+            "delegating to uvicorn shutdown",
             sig_name, os.getpid(), rss, time.time() - _startup_time,
         )
         print(f"[SIGNAL_RECEIVED] signal={sig_name} pid={os.getpid()}", flush=True)
-        # Re-raise as KeyboardInterrupt so uvicorn's shutdown sequence runs
-        raise KeyboardInterrupt(f"Signal {sig_name} received")
+        # Do NOT raise KeyboardInterrupt here.
+        # Uvicorn already handles SIGTERM/SIGINT and will trigger the lifespan
+        # shutdown path cleanly. Raising KeyboardInterrupt from inside an asyncio
+        # event loop corrupts coroutine state and produces unhandled task exceptions.
+        # For SIGQUIT (Linux debug), we re-raise as a last resort only.
+        if sig_name == "SIGQUIT":
+            raise KeyboardInterrupt(f"SIGQUIT received — forcing shutdown")
     return _handler
 
 
@@ -151,7 +171,7 @@ for _sig, _name in [(signal.SIGTERM, "SIGTERM"), (signal.SIGINT, "SIGINT")]:
     except (OSError, ValueError):
         pass  # Some signals can't be caught in all contexts
 
-# SIGQUIT (Linux only)
+# SIGQUIT (Linux only) — only this one forces an immediate stop
 try:
     signal.signal(signal.SIGQUIT, _make_signal_handler("SIGQUIT"))
 except (AttributeError, OSError, ValueError):
@@ -550,6 +570,13 @@ async def lifespan(app: FastAPI):
     # Scheduling it as a background task means the server yields and becomes
     # ready immediately; the check runs after the first event-loop iteration.
     async def _deferred_startup():
+        """Run deferred startup tasks after the server is live.
+
+        All awaits inside this function can raise asyncio.CancelledError when the
+        server shuts down.  We let CancelledError propagate up to
+        _run_deferred_startup_safe() which swallows it cleanly.
+        Any other exception is also allowed to propagate for the same reason.
+        """
         # Small yield so uvicorn finishes binding and starts accepting connections
         await asyncio.sleep(0.5)
 
@@ -626,9 +653,24 @@ async def lifespan(app: FastAPI):
             logger.warning("[STARTUP] log_deployment_diagnostics error: %s", exc)
 
     async def _run_deferred_startup_safe():
-        """Outer safety wrapper — no exception from _deferred_startup can escape to the event loop."""
+        """Outer safety wrapper — no exception from _deferred_startup can escape to the event loop.
+
+        Handles three cases:
+        1. Normal completion — no action needed
+        2. asyncio.CancelledError — server is shutting down; log and exit cleanly (no re-raise)
+        3. Any other exception — log as WORKER_CRASH but do not propagate
+        """
         try:
             await _deferred_startup()
+        except asyncio.CancelledError:
+            # The event loop was shut down (SIGTERM/restart) while the startup
+            # task was still running. This is expected and safe — just log it.
+            logger.info(
+                "[STARTUP_CANCELLED] Deferred startup task was cancelled — "
+                "server is shutting down cleanly. This is not an error."
+            )
+            # Do NOT re-raise: swallowing CancelledError here is intentional so
+            # that asyncio does not log "Task exception was never retrieved".
         except Exception as exc:
             logger.critical(
                 "[WORKER_CRASH] _deferred_startup raised unhandled exception: %s\n%s",
