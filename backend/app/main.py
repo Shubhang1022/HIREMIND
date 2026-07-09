@@ -410,7 +410,11 @@ def run_startup_check() -> bool:
     checks: list[tuple[str, bool, str]] = []   # (label, passed, detail)
 
     # ── Imports ───────────────────────────────────────────────────────────────
-    for pkg in ("fastapi", "pydantic", "supabase", "sentence_transformers", "numpy"):
+    # NOTE: sentence_transformers is intentionally NOT imported here.
+    # Importing it at startup check time would trigger torch + CUDA library
+    # loading (~350 MB RSS), defeating the lazy-load / Railway OOM fix.
+    # model_service.get_model() will import it on the first real request.
+    for pkg in ("fastapi", "pydantic", "supabase", "numpy"):
         try:
             importlib.import_module(pkg)
             checks.append((f"Import:{pkg}", True, ""))
@@ -542,28 +546,39 @@ async def lifespan(app: FastAPI):
     missing_vars = validate_required_env()
     log_startup_summary(missing_vars)
 
-    # ── Step 2: Record pre-preload RSS for the performance report ─────────────
-    _rss_before_preload = psutil.Process(os.getpid()).memory_info().rss / (1024 * 1024)
+    # ── Step 2: Record RSS at API-ready point ────────────────────────────────
+    # Model is NOT loaded here. It loads lazily on the first request that needs
+    # embeddings. This keeps startup RSS ~130-150 MB instead of ~950 MB.
+    _rss_at_ready = psutil.Process(os.getpid()).memory_info().rss / (1024 * 1024)
     _api_ready_time = time.time()
     logger.info(
-        "[STARTUP_PERF] API ready in %.2fs | RSS=%.1fMB (before model preload)",
-        _api_ready_time - _startup_time, _rss_before_preload,
+        "[STARTUP_PERF] API ready in %.2fs | RSS=%.1fMB "
+        "(model NOT preloaded — lazy-load on first embedding request)",
+        _api_ready_time - _startup_time, _rss_at_ready,
     )
     print(
         f"[STARTUP_PERF] API accepting requests — "
-        f"elapsed={_api_ready_time - _startup_time:.2f}s RSS={_rss_before_preload:.1f}MB",
+        f"elapsed={_api_ready_time - _startup_time:.2f}s RSS={_rss_at_ready:.1f}MB "
+        f"(model state: unloaded — lazy load enabled)",
         flush=True,
     )
 
-    # ── Step 3: Kick off non-blocking model preload in background thread ──────
-    # preload_model_singleton() returns immediately — model loads in a daemon thread.
-    # The /health endpoint reports model_state=loading until it completes.
-    # NO blocking calls before yield — server starts accepting requests NOW.
-    try:
-        from app.api.v1.endpoints.platform import preload_model_singleton
-        preload_model_singleton()
-    except Exception as exc:
-        logger.warning("[STARTUP] preload_model_singleton failed: %s", exc)
+    # ── Step 3: Model preload INTENTIONALLY REMOVED ───────────────────────────
+    # preload_model_singleton() was removed from startup to eliminate the
+    # ~950 MB RSS spike that caused Railway OOM kills.
+    #
+    # Previous behaviour:  startup → preload in background thread → RSS 946 MB → OOM
+    # New behaviour:       startup → RSS ~150 MB → first indexing/analysis request
+    #                      → lazy load → RSS ~550-600 MB → stays resident
+    #
+    # The model is loaded exactly once (singleton) on the first call to
+    # model_service.get_model(), which is triggered by _get_encoder() in platform.py.
+    # Concurrent requests wait on the same threading.Event — no duplicate loads.
+    logger.info(
+        "[STARTUP] Model preload skipped — lazy load mode active. "
+        "model=%s will load on first embedding request.",
+        settings.embedding_model,
+    )
 
     # ── Step 4: Schedule deferred startup tasks as a background asyncio task ──
     # run_startup_check() makes network calls (Supabase, Storage).
@@ -1058,20 +1073,23 @@ async def detailed_health():
     overall = "healthy"
     if db_status == "unhealthy" or storage_status == "unhealthy":
         overall = "degraded"
-    if not model_loaded:
-        overall = "degraded" if overall == "healthy" else overall
+    # NOTE: model not loaded is expected at startup (lazy-load mode).
+    # Do NOT degrade health status just because model is unloaded.
+    if model_state == "failed":
+        overall = "degraded"
 
     return {
         # Top-level readiness
         "status": overall,
-        "application_ready": True,           # always True once /health responds
+        "application_ready": True,           # always True — model loads lazily on first request
         "timestamp": _time.time(),
         "uptime_seconds": round(_time.time() - _startup_time, 1),
 
-        # Model singleton
+        # Model singleton — "unloaded" is EXPECTED at startup (lazy-load mode)
         "model": {
             "loaded": model_loaded,
             "model_state": model_state,      # "unloaded"|"loading"|"loaded"|"failed"
+            "load_mode": "lazy",             # model loads on first embedding request
             "cached": model_loaded,
             "name": model_name,
             "configured_model": settings.embedding_model,
@@ -1101,8 +1119,9 @@ async def detailed_health():
         "memory": {
             "rss_mb":        round(rss_mb, 1),
             "available_mb":  round(avail_mb, 1),
-            "safety_limit_mb": 600.0,
-            "under_threshold": rss_mb < 600.0,
+            "safety_limit_mb": 900.0,     # ~950 MB was the old OOM threshold
+            "under_threshold": rss_mb < 900.0,
+            "model_load_mode": "lazy",    # model loads on first embedding request
         },
         "cpu_percent": round(cpu_pct, 1),
         "threads": thread_count,
