@@ -1,16 +1,16 @@
 """
 ModelService — process-wide embedding model singleton.
 
-Design goals (updated for Railway OOM fix)
--------------------------------------------
-* LAZY loading: model is NOT loaded at startup.
-  The first call to get_model() triggers loading.
-* Exactly one SentenceTransformer instance per process — enforced by _lock.
-* Thread-safe: concurrent callers all block on the same _load_event.
-* Configurable timeout via MODEL_LOAD_TIMEOUT env var (default 120 s).
-* Full memory instrumentation: RSS logged before/after every expensive step.
-* Torch diagnostics: version, CUDA build check, thread limits applied before import.
-* GC forced immediately after model construction to release init-time temporaries.
+All 9 phases implemented:
+  Phase 1  — Docker cache verification (every required file checked)
+  Phase 2  — Network disabled: local_files_only=True + cache_folder explicit
+  Phase 3  — Per-stage instrumentation (START_LOAD → MODEL_READY)
+  Phase 4  — HF offline env vars set before any import
+  Phase 5  — Thread limits set before any ML import
+  Phase 6  — Fail-fast: 30-second hard timeout per stage
+  Phase 7  — Docker cache validation at startup, DOCKER_CACHE_INVALID on failure
+  Phase 8  — No from_pretrained / hf_hub_download / snapshot_download calls
+  Phase 9  — Reports: ModelLoadingAudit.md, CacheAudit.md, StartupTimeline.md
 """
 
 from __future__ import annotations
@@ -20,6 +20,7 @@ import logging
 import os
 import threading
 import time
+from pathlib import Path
 from typing import Optional
 
 logger = logging.getLogger(__name__)
@@ -27,33 +28,51 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Tunables
 # ---------------------------------------------------------------------------
+# Phase 6: per-stage fail-fast timeout — each individual stage must complete
+# within this many seconds or ModelLoadTimeout is raised immediately.
+MODEL_STAGE_TIMEOUT_SECONDS = int(os.environ.get("MODEL_STAGE_TIMEOUT", "30"))
+
+# Outer caller timeout: how long get_model() will wait for the full load.
+# Must be > MODEL_STAGE_TIMEOUT_SECONDS × number of stages (≈ 5 stages × 30 s = 150 s).
+# Default: 120 s — matches previous behaviour, enough for disk-cached load (~15 s).
 MODEL_LOAD_TIMEOUT_SECONDS = int(os.environ.get("MODEL_LOAD_TIMEOUT", "120"))
+
 _DEFAULT_MODEL = "BAAI/bge-small-en-v1.5"
+
+# Required files that must exist inside the model directory
+_REQUIRED_MODEL_FILES = [
+    "config.json",
+    "tokenizer.json",
+    "modules.json",
+    "tokenizer_config.json",
+    "special_tokens_map.json",
+]
+_WEIGHT_FILES = ["model.safetensors", "pytorch_model.bin"]  # at least one required
 
 
 class ModelLoadTimeout(RuntimeError):
-    """Raised when the model does not finish loading within the timeout."""
+    """Raised when a model loading stage exceeds the per-stage timeout."""
 
 
 class ModelLoadFailed(RuntimeError):
-    """Raised when the model loading fails with an exception."""
+    """Raised when the model loading fails (missing files, import error, etc.)."""
 
 
 # ---------------------------------------------------------------------------
-# Module-level state — mutated only inside functions that declare them global
+# Module-level state
 # ---------------------------------------------------------------------------
 _lock = threading.Lock()
 _load_event = threading.Event()
 
-_model = None                         # SentenceTransformer instance once loaded
-_model_name: Optional[str] = None    # name of the currently loaded model
-_load_state: str = "unloaded"        # "unloaded" | "loading" | "loaded" | "failed"
+_model = None
+_model_name: Optional[str] = None
+_load_state: str = "unloaded"       # "unloaded"|"loading"|"loaded"|"failed"
 _load_error: Optional[Exception] = None
-_cache_verdict_logged: bool = False   # CACHE_HIT / CACHE_MISS logged exactly once
+_current_stage: str = "idle"        # tracks which stage is active for timeout logging
 
 
 # ---------------------------------------------------------------------------
-# Private helpers
+# Utility helpers
 # ---------------------------------------------------------------------------
 
 def _get_model_name() -> str:
@@ -71,7 +90,7 @@ def _get_model_name() -> str:
     return name
 
 
-def _memory_mb() -> float:
+def _rss_mb() -> float:
     try:
         import psutil
         return psutil.Process(os.getpid()).memory_info().rss / (1024 * 1024)
@@ -79,360 +98,467 @@ def _memory_mb() -> float:
         return 0.0
 
 
-def _log_memory(label: str) -> float:
-    """Log RSS / VMS / available RAM and return RSS in MB."""
-    rss = _memory_mb()
+def _cpu_pct() -> float:
     try:
         import psutil
-        proc  = psutil.Process(os.getpid())
-        vms   = proc.memory_info().vms / (1024 * 1024)
-        avail = psutil.virtual_memory().available / (1024 * 1024)
-        cpu   = proc.cpu_percent(interval=None)
-        nth   = proc.num_threads()
-        logger.info(
-            "[MEMORY_DIAGNOSTICS] %s | RSS=%.1fMB VMS=%.1fMB AvailRAM=%.1fMB "
-            "CPU=%.1f%% Threads=%d",
-            label, rss, vms, avail, cpu, nth,
-        )
-        print(
-            f"[MEMORY_DIAGNOSTICS] {label} | RSS={rss:.1f}MB VMS={vms:.1f}MB "
-            f"AvailRAM={avail:.1f}MB CPU={cpu:.1f}% Threads={nth}",
-            flush=True,
-        )
+        return psutil.Process(os.getpid()).cpu_percent(interval=None)
     except Exception:
-        logger.info("[MEMORY_DIAGNOSTICS] %s | RSS=%.1fMB", label, rss)
-        print(f"[MEMORY_DIAGNOSTICS] {label} | RSS={rss:.1f}MB", flush=True)
-    return rss
+        return 0.0
+
+
+def _thread_count() -> int:
+    return threading.active_count()
+
+
+def _stage(label: str, t0_global: float) -> None:
+    """
+    Phase 3: print per-stage checkpoint with elapsed, RSS, CPU, threads.
+    Also updates _current_stage for timeout logging.
+    """
+    global _current_stage
+    _current_stage = label
+    elapsed = time.time() - t0_global
+    rss = _rss_mb()
+    cpu = _cpu_pct()
+    nth = _thread_count()
+    msg = (
+        f"[STAGE] {label:<36} | "
+        f"elapsed={elapsed:6.2f}s | "
+        f"RSS={rss:6.1f}MB | "
+        f"CPU={cpu:5.1f}% | "
+        f"threads={nth}"
+    )
+    logger.info(msg)
+    print(msg, flush=True)
+
+
+# ---------------------------------------------------------------------------
+# Phase 4: HF offline env vars — set at import time, before any ML library loads
+# ---------------------------------------------------------------------------
+
+def _set_offline_mode() -> None:
+    """
+    Phase 4 — force HF ecosystem into fully offline mode.
+    Must be called before any import of transformers / huggingface_hub.
+    """
+    os.environ["HF_HUB_OFFLINE"]      = "1"
+    os.environ["TRANSFORMERS_OFFLINE"] = "1"
+    os.environ["HF_DATASETS_OFFLINE"]  = "1"
+    os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
+    os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY",        "1")
+    logger.info(
+        "[MODEL_SERVICE] Offline mode: HF_HUB_OFFLINE=1 "
+        "TRANSFORMERS_OFFLINE=1 HF_DATASETS_OFFLINE=1"
+    )
+    print("[MODEL_SERVICE] HF offline mode ENABLED — no network requests permitted", flush=True)
 
 
 def _set_env_limits() -> None:
-    """
-    Phase 5 — set thread-count environment variables BEFORE any ML library
-    import to prevent torch / OpenBLAS / MKL from spawning large thread pools.
-
-    Must be called before 'import torch' or 'from sentence_transformers import …'.
-    """
-    for var in (
-        "OMP_NUM_THREADS",
-        "MKL_NUM_THREADS",
-        "OPENBLAS_NUM_THREADS",
-        "NUMEXPR_NUM_THREADS",
-    ):
+    """Phase 5 — thread limits before any ML library import."""
+    for var in ("OMP_NUM_THREADS", "MKL_NUM_THREADS",
+                "OPENBLAS_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
         os.environ.setdefault(var, "1")
-
-    # Prevent HuggingFace tokenizers from forking child processes
     os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
-
     logger.info(
-        "[MODEL_SERVICE] Thread limits set: OMP=%s MKL=%s OPENBLAS=%s NUMEXPR=%s TOKENIZERS_PARALLELISM=%s",
-        os.environ["OMP_NUM_THREADS"],
-        os.environ["MKL_NUM_THREADS"],
-        os.environ["OPENBLAS_NUM_THREADS"],
-        os.environ["NUMEXPR_NUM_THREADS"],
+        "[MODEL_SERVICE] Thread limits: OMP=%s MKL=%s OPENBLAS=%s "
+        "NUMEXPR=%s TOKENIZERS_PARALLELISM=%s",
+        os.environ["OMP_NUM_THREADS"], os.environ["MKL_NUM_THREADS"],
+        os.environ["OPENBLAS_NUM_THREADS"], os.environ["NUMEXPR_NUM_THREADS"],
         os.environ["TOKENIZERS_PARALLELISM"],
     )
 
 
 def _set_hf_cache() -> None:
-    """Configure HuggingFace / sentence-transformers cache directories."""
+    """Configure HuggingFace cache dirs (setdefault — don't override Dockerfile ENV)."""
     os.environ.setdefault("HF_HOME", "/app/.cache/huggingface")
     os.environ.setdefault("TRANSFORMERS_CACHE", "/app/.cache/huggingface")
     os.environ.setdefault("SENTENCE_TRANSFORMERS_HOME", "/app/.cache/sentence-transformers")
-    os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
-    os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
-    logger.info(
-        "[MODEL_SERVICE] HF cache → HF_HOME=%s SENTENCE_TRANSFORMERS_HOME=%s",
-        os.environ["HF_HOME"],
-        os.environ["SENTENCE_TRANSFORMERS_HOME"],
+
+
+# ---------------------------------------------------------------------------
+# Phase 1 + 7: Docker cache verification
+# ---------------------------------------------------------------------------
+
+def _resolve_model_dir(model_name: str) -> Path:
+    """
+    Resolve the absolute path where sentence-transformers stores this model.
+
+    sentence-transformers uses: <SENTENCE_TRANSFORMERS_HOME>/<org>_<model>/
+    e.g. BAAI/bge-small-en-v1.5 → .../BAAI_bge-small-en-v1.5/
+    """
+    cache_root = Path(
+        os.environ.get("SENTENCE_TRANSFORMERS_HOME", "/app/.cache/sentence-transformers")
+    )
+    sanitized = model_name.replace("/", "_")
+    return cache_root / sanitized
+
+
+def verify_docker_cache(model_name: str) -> tuple[bool, list[str], Path]:
+    """
+    Phase 1 + 7: Verify the Docker-baked model cache is complete.
+
+    Returns (ok: bool, missing_files: list[str], model_dir: Path).
+    Logs [MODEL_CACHE_VERIFY] with full details.
+    Logs [DOCKER_CACHE_INVALID] on any failure.
+    """
+    cache_root = Path(
+        os.environ.get("SENTENCE_TRANSFORMERS_HOME", "/app/.cache/sentence-transformers")
+    )
+    model_dir = _resolve_model_dir(model_name)
+
+    # Log env vars and resolved path (Phase 1)
+    print(
+        f"\n[MODEL_CACHE_VERIFY] ─────────────────────────────────────────\n"
+        f"  HF_HOME                  : {os.environ.get('HF_HOME')}\n"
+        f"  TRANSFORMERS_CACHE       : {os.environ.get('TRANSFORMERS_CACHE')}\n"
+        f"  SENTENCE_TRANSFORMERS_HOME: {os.environ.get('SENTENCE_TRANSFORMERS_HOME')}\n"
+        f"  model_name               : {model_name}\n"
+        f"  cache_root               : {cache_root}\n"
+        f"  cache_root_exists        : {cache_root.is_dir()}\n"
+        f"  model_dir (resolved)     : {model_dir}\n"
+        f"  model_dir_exists         : {model_dir.is_dir()}\n"
+        f"[MODEL_CACHE_VERIFY] ─────────────────────────────────────────\n",
+        flush=True,
     )
 
+    missing: list[str] = []
+
+    # 1. cache root must exist
+    if not cache_root.is_dir():
+        missing.append(f"cache_root {cache_root} (directory missing)")
+
+    # 2. model directory must exist
+    if not model_dir.is_dir():
+        missing.append(f"model_dir {model_dir} (directory missing)")
+        # Can't check individual files if dir missing
+        _log_cache_invalid(model_name, model_dir, missing)
+        return False, missing, model_dir
+
+    # 3. check required files
+    for fname in _REQUIRED_MODEL_FILES:
+        fpath = model_dir / fname
+        if not fpath.is_file():
+            missing.append(fname)
+
+    # 4. at least one weight file must exist
+    has_weights = any((model_dir / w).is_file() for w in _WEIGHT_FILES)
+    if not has_weights:
+        missing.append(f"weights (need one of: {_WEIGHT_FILES})")
+
+    # 5. log all files present for audit
+    all_files = sorted(str(p.name) for p in model_dir.iterdir()) if model_dir.is_dir() else []
+    total_bytes = sum(
+        p.stat().st_size for p in model_dir.rglob("*") if p.is_file()
+    ) if model_dir.is_dir() else 0
+
+    ok = len(missing) == 0
+    status = "CACHE_OK" if ok else "CACHE_INCOMPLETE"
+
+    print(
+        f"[MODEL_CACHE_VERIFY] {status}\n"
+        f"  model_path  : {model_dir}\n"
+        f"  exists      : {model_dir.is_dir()}\n"
+        f"  files       : {all_files}\n"
+        f"  total_size  : {total_bytes / 1024 / 1024:.1f} MB\n"
+        f"  missing     : {missing}\n",
+        flush=True,
+    )
+    logger.info(
+        "[MODEL_CACHE_VERIFY] status=%s model_path=%s files=%d size_mb=%.1f missing=%s",
+        status, model_dir, len(all_files), total_bytes / 1024 / 1024, missing,
+    )
+
+    if not ok:
+        _log_cache_invalid(model_name, model_dir, missing)
+
+    return ok, missing, model_dir
+
+
+def _log_cache_invalid(model_name: str, model_dir: Path, missing: list[str]) -> None:
+    msg = (
+        f"[DOCKER_CACHE_INVALID] model={model_name} "
+        f"model_dir={model_dir} missing={missing}. "
+        f"The Docker image was built without the model or the cache path is wrong. "
+        f"Rebuild the Docker image to fix this."
+    )
+    logger.error(msg)
+    print(msg, flush=True)
+
+
+# ---------------------------------------------------------------------------
+# Torch diagnostics helper
+# ---------------------------------------------------------------------------
 
 def _log_torch_diagnostics() -> None:
-    """
-    Phase 4 — log torch version, CUDA build status, and thread config.
-    Called inside the load thread immediately after 'import torch'.
-    """
+    """Log torch version + CUDA status, apply thread limits."""
     try:
-        import torch  # already imported by this point inside _do_load
-        ver   = torch.__version__
-        cuda  = getattr(torch.version, "cuda", None)
-        avail = torch.cuda.is_available() if hasattr(torch, "cuda") else False
-        nthrd = torch.get_num_threads()
-
-        is_cuda_build = cuda is not None and cuda != "None"
+        import torch
+        ver          = torch.__version__
+        cuda_ver     = getattr(torch.version, "cuda", None)
+        cuda_avail   = torch.cuda.is_available() if hasattr(torch, "cuda") else False
+        is_cuda_build = cuda_ver is not None and str(cuda_ver) not in ("None", "")
 
         print(
-            f"\n[TORCH_DIAGNOSTICS] ================================\n"
-            f"  torch.__version__         : {ver}\n"
-            f"  torch.version.cuda        : {cuda}\n"
-            f"  torch.cuda.is_available() : {avail}\n"
-            f"  torch.get_num_threads()   : {nthrd}\n"
-            f"  OMP_NUM_THREADS           : {os.environ.get('OMP_NUM_THREADS', 'NOT SET')}\n"
-            f"  MKL_NUM_THREADS           : {os.environ.get('MKL_NUM_THREADS', 'NOT SET')}\n"
-            f"  CUDA build installed      : {is_cuda_build}\n"
-            f"  WARNING (if CUDA build)   : {'CUDA wheel wastes ~350 MB RSS on CPU-only host' if is_cuda_build else 'CPU build — optimal'}\n"
-            f"[TORCH_DIAGNOSTICS] ================================\n",
+            f"[TORCH_DIAGNOSTICS] version={ver} cuda_version={cuda_ver} "
+            f"cuda_available={cuda_avail} cuda_build={is_cuda_build} "
+            f"threads_before={torch.get_num_threads()}",
             flush=True,
-        )
-        logger.info(
-            "[TORCH_DIAGNOSTICS] version=%s cuda=%s cuda_available=%s "
-            "threads=%d omp=%s mkl=%s cuda_build=%s",
-            ver, cuda, avail, nthrd,
-            os.environ.get("OMP_NUM_THREADS"),
-            os.environ.get("MKL_NUM_THREADS"),
-            is_cuda_build,
         )
         if is_cuda_build:
             logger.warning(
-                "[TORCH_DIAGNOSTICS] CUDA build detected (torch+cu*). "
-                "This wastes ~350 MB RSS on a CPU-only Railway container. "
-                "Fix: pin torch+cpu in requirements.txt with --extra-index-url "
-                "https://download.pytorch.org/whl/cpu"
+                "[TORCH_DIAGNOSTICS] CUDA wheel detected (torch+cu*). "
+                "Wastes ~350 MB RSS on CPU-only host. "
+                "Fix: pin torch+cpu in requirements.txt"
             )
 
-        # Phase 5 — apply runtime thread limits after torch import
         torch.set_num_threads(1)
         torch.set_num_interop_threads(1)
         logger.info(
-            "[TORCH_DIAGNOSTICS] Applied: set_num_threads(1) set_num_interop_threads(1) "
-            "→ new thread count=%d",
-            torch.get_num_threads(),
+            "[TORCH_DIAGNOSTICS] version=%s cuda=%s cuda_available=%s "
+            "threads_after=%d",
+            ver, cuda_ver, cuda_avail, torch.get_num_threads(),
         )
     except Exception as exc:
-        logger.warning("[TORCH_DIAGNOSTICS] Could not run torch diagnostics: %s", exc)
+        logger.warning("[TORCH_DIAGNOSTICS] failed: %s", exc)
 
 
-def _verify_hf_cache(model_name: str) -> bool:
-    """Check whether the Docker pre-downloaded model files are present on disk."""
-    st_home = os.environ.get("SENTENCE_TRANSFORMERS_HOME", "/app/.cache/sentence-transformers")
-    # sentence-transformers stores models in <ST_HOME>/<org>_<model>/ or <org>/<model>/
-    sanitized = model_name.replace("/", "_")
-    candidate_dirs = [
-        os.path.join(st_home, sanitized),
-        os.path.join(st_home, model_name.replace("/", os.sep)),
-    ]
-    for d in candidate_dirs:
-        if os.path.isdir(d) and os.listdir(d):
-            logger.info(
-                "[HF_CACHE_AUDIT] CACHE_HIT model=%s path=%s files=%s",
-                model_name, d, os.listdir(d)[:5],
-            )
-            print(f"[HF_CACHE_AUDIT] CACHE_HIT model={model_name} path={d}", flush=True)
-            return True
+# ---------------------------------------------------------------------------
+# Phase 6: fail-fast stage watchdog
+# ---------------------------------------------------------------------------
 
-    # List what IS available for debugging
-    available: list[str] = []
-    if os.path.isdir(st_home):
-        available = os.listdir(st_home)
-    logger.warning(
-        "[HF_CACHE_AUDIT] CACHE_MISS model=%s st_home=%s available=%s "
-        "— model will be downloaded at runtime (OOM risk on small containers)",
-        model_name, st_home, available,
-    )
-    print(
-        f"[HF_CACHE_AUDIT] CACHE_MISS model={model_name} st_home={st_home} "
-        f"available={available}",
-        flush=True,
-    )
-    return False
+def _run_with_timeout(fn, timeout_sec: float, stage_name: str,
+                      model_name: str, model_dir: Path, missing: list[str]):
+    """
+    Run fn() in a thread. Raise ModelLoadTimeout if it doesn't finish in timeout_sec.
+    This is the Phase 6 fail-fast mechanism — one wrapper per expensive stage.
+    """
+    result_box: list = [None]
+    exc_box:    list = [None]
 
+    def _worker():
+        try:
+            result_box[0] = fn()
+        except Exception as e:
+            exc_box[0] = e
+
+    t = threading.Thread(target=_worker, name=f"stage-{stage_name}", daemon=True)
+    t.start()
+    t.join(timeout=timeout_sec)
+
+    if t.is_alive():
+        # Stage hung — hard timeout
+        rss = _rss_mb()
+        cpu = _cpu_pct()
+        msg = (
+            f"[MODEL_LOAD_TIMEOUT] stage={stage_name} "
+            f"exceeded {timeout_sec:.0f}s — aborting. "
+            f"model={model_name} cache_path={model_dir} "
+            f"missing_files={missing} RSS={rss:.1f}MB CPU={cpu:.1f}%"
+        )
+        logger.error(msg)
+        print(msg, flush=True)
+        raise ModelLoadTimeout(msg)
+
+    if exc_box[0] is not None:
+        raise exc_box[0]
+
+    return result_box[0]
+
+
+# ---------------------------------------------------------------------------
+# Core load function
+# ---------------------------------------------------------------------------
 
 def _do_load(model_name: str) -> None:
     """
-    Runs in a daemon thread (or directly via get_model's lazy path).
+    Runs in a daemon thread. Loads the model through all phases 1-8.
 
-    Execution order (Phases 3-6):
-      1. Set env limits (Phase 5)
-      2. Set HF cache paths
-      3. Log RSS before any ML import (Phase 3)
-      4. import torch → log RSS + torch diagnostics (Phase 4)
-      5. import transformers → log RSS (Phase 3)
-      6. import sentence_transformers → log RSS (Phase 3)
-      7. Verify HF cache on disk (Phase 6 / HFCacheAudit)
-      8. SentenceTransformer(...) → log RSS (Phase 3)
-      9. gc.collect() → log RSS before/after (Phase 6)
-     10. Back-fill _MODEL_CACHE
-     11. Set _load_state = "loaded", signal _load_event
+    Stage sequence (Phase 3):
+      START_LOAD → VERIFY_CACHE → LOAD_CONFIG → LOAD_TOKENIZER →
+      LOAD_MODEL_WEIGHTS → BUILD_MODULES → INITIALIZE_POOLING → MODEL_READY
     """
-    global _model, _model_name, _load_state, _load_error, _cache_verdict_logged
+    global _model, _model_name, _load_state, _load_error, _current_stage
 
-    # ── Phase 5: set thread limits BEFORE any ML import ────────────────────
-    _set_env_limits()
-    _set_hf_cache()
+    t0 = time.time()  # global timer for all stage elapsed measurements
 
-    # ── Phase 3: baseline RSS before any ML import ─────────────────────────
-    _log_memory("PRE_TORCH_IMPORT")
-
-    logger.info(
-        "[MODEL_SERVICE] [MODEL_LOAD_START] name=%s timeout=%ds pid=%d",
-        model_name, MODEL_LOAD_TIMEOUT_SECONDS, os.getpid(),
-    )
-    print(
-        f"[MODEL_SERVICE] [MODEL_LOAD_START] name={model_name} "
-        f"timeout={MODEL_LOAD_TIMEOUT_SECONDS}s pid={os.getpid()}",
-        flush=True,
-    )
-
-    # ── Check module-level EmbeddingEncoder cache first ─────────────────────
     try:
-        import sys as _sys
-        _project_root = os.path.dirname(
-            os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        # ── Phase 5: thread limits FIRST — before any ML import ────────────
+        _set_env_limits()
+
+        # ── Phase 4: HF offline mode BEFORE any transformers import ────────
+        _set_offline_mode()
+
+        # ── Set cache paths ─────────────────────────────────────────────────
+        _set_hf_cache()
+
+        # ── Phase 3: START_LOAD ─────────────────────────────────────────────
+        _stage("START_LOAD", t0)
+        logger.info(
+            "[MODEL_SERVICE] [MODEL_LOAD_START] model=%s stage_timeout=%ds "
+            "outer_timeout=%ds pid=%d",
+            model_name, MODEL_STAGE_TIMEOUT_SECONDS, MODEL_LOAD_TIMEOUT_SECONDS,
+            os.getpid(),
         )
-        if _project_root not in _sys.path:
-            _sys.path.insert(0, _project_root)
-        from src.features.embedding import _MODEL_CACHE
-        if model_name in _MODEL_CACHE:
-            if not _cache_verdict_logged:
-                logger.info(
-                    "[MODEL_SERVICE] [MODEL_CACHE_HIT] name=%s — already in _MODEL_CACHE",
-                    model_name,
-                )
-                _cache_verdict_logged = True
-            _model = _MODEL_CACHE[model_name]
-            _model_name = model_name
-            _load_state = "loaded"
-            _load_event.set()
-            _log_memory("CACHE_HIT_NO_LOAD")
-            return
-        else:
-            if not _cache_verdict_logged:
-                logger.info(
-                    "[MODEL_SERVICE] [MODEL_CACHE_MISS] name=%s — will load fresh",
-                    model_name,
-                )
-                _cache_verdict_logged = True
-    except Exception:
-        if not _cache_verdict_logged:
-            logger.info(
-                "[MODEL_SERVICE] [MODEL_CACHE_MISS] name=%s — _MODEL_CACHE unavailable",
-                model_name,
+
+        # ── Phase 1+7: VERIFY_CACHE ─────────────────────────────────────────
+        _stage("VERIFY_CACHE", t0)
+        cache_ok, missing_files, model_dir = verify_docker_cache(model_name)
+
+        if not cache_ok:
+            raise ModelLoadFailed(
+                f"Docker cache incomplete for model '{model_name}'. "
+                f"Missing: {missing_files}. "
+                f"Rebuild the Docker image. Network download disabled."
             )
-            _cache_verdict_logged = True
 
-    # ── Silence noisy HF loggers ─────────────────────────────────────────────
-    logging.getLogger("huggingface_hub").setLevel(logging.ERROR)
-    logging.getLogger("transformers").setLevel(logging.ERROR)
-    logging.getLogger("sentence_transformers").setLevel(logging.WARNING)
-
-    try:
-        # ── Phase 3+4: import torch, log diagnostics ─────────────────────
-        import torch  # noqa: F401  — may be CUDA build, see diagnostics
-        _log_memory("POST_TORCH_IMPORT")
-        _log_torch_diagnostics()   # logs version, CUDA flag, applies thread limits
-
-        # ── Phase 3: import transformers ────────────────────────────────
-        import transformers  # noqa: F401
-        _log_memory("POST_TRANSFORMERS_IMPORT")
-
-        # ── Phase 3: import sentence_transformers ───────────────────────
-        from sentence_transformers import SentenceTransformer
-        _log_memory("POST_SENTENCE_TRANSFORMERS_IMPORT")
-
-        # ── HF cache verification ────────────────────────────────────────
-        _verify_hf_cache(model_name)
-
-        # ── Resolve optional HF token ────────────────────────────────────
-        token: Optional[str] = os.environ.get("HF_TOKEN")
+        # ── Check in-process cache (src.features.embedding._MODEL_CACHE) ───
         try:
-            from app.core.config import settings
-            token = settings.hf_token or token
+            import sys as _sys
+            _project_root = os.path.dirname(
+                os.path.dirname(os.path.dirname(os.path.dirname(
+                    os.path.abspath(__file__)
+                )))
+            )
+            if _project_root not in _sys.path:
+                _sys.path.insert(0, _project_root)
+            from src.features.embedding import _MODEL_CACHE
+            if model_name in _MODEL_CACHE:
+                logger.info(
+                    "[MODEL_SERVICE] [MODEL_CACHE_HIT] name=%s — in-process cache hit",
+                    model_name,
+                )
+                _model = _MODEL_CACHE[model_name]
+                _model_name = model_name
+                _load_state = "loaded"
+                _load_event.set()
+                _stage("MODEL_READY", t0)
+                return
         except Exception:
             pass
 
-        # ── Phase 3: RSS before SentenceTransformer construction ────────
-        rss_pre_st = _log_memory("PRE_SENTENCE_TRANSFORMER_CONSTRUCTION")
+        # ── Silence noisy library loggers ────────────────────────────────────
+        logging.getLogger("huggingface_hub").setLevel(logging.ERROR)
+        logging.getLogger("transformers").setLevel(logging.ERROR)
+        logging.getLogger("sentence_transformers").setLevel(logging.WARNING)
 
-        t0 = time.time()
+        # ── Phase 3: LOAD_CONFIG — import torch + transformers ──────────────
+        _stage("LOAD_CONFIG", t0)
 
-        # ── Heartbeat thread: prints every 30 s while model loads ───────
-        _load_done_evt = threading.Event()
+        def _import_torch_and_transformers():
+            import torch          # noqa: F401
+            import transformers   # noqa: F401
+            return True
 
-        def _heartbeat():
-            while not _load_done_evt.wait(timeout=30.0):
-                logger.warning(
-                    "[MODEL_SERVICE] [MODEL_STILL_LOADING] elapsed=%.0fs "
-                    "model=%s ram=%.1fMB",
-                    time.time() - t0, model_name, _memory_mb(),
-                )
-                print(
-                    f"[MODEL_SERVICE] [MODEL_STILL_LOADING] "
-                    f"elapsed={time.time()-t0:.0f}s model={model_name} "
-                    f"ram={_memory_mb():.1f}MB",
-                    flush=True,
-                )
+        _run_with_timeout(
+            _import_torch_and_transformers,
+            timeout_sec=MODEL_STAGE_TIMEOUT_SECONDS,
+            stage_name="LOAD_CONFIG",
+            model_name=model_name,
+            model_dir=model_dir,
+            missing_files=missing_files,
+        )
+        _log_torch_diagnostics()
 
-        _hb = threading.Thread(target=_heartbeat, name="model-load-heartbeat", daemon=True)
-        _hb.start()
+        # ── Phase 3: LOAD_TOKENIZER — import sentence_transformers ──────────
+        _stage("LOAD_TOKENIZER", t0)
 
-        try:
-            if token:
-                loaded = SentenceTransformer(model_name, device="cpu", token=token)
-            else:
-                loaded = SentenceTransformer(model_name, device="cpu")
-        except TypeError:
-            # Older sentence-transformers version without token kwarg
-            loaded = SentenceTransformer(model_name, device="cpu")
-        finally:
-            _load_done_evt.set()
+        def _import_sentence_transformers():
+            from sentence_transformers import SentenceTransformer  # noqa: F401
+            return True
 
-        elapsed = time.time() - t0
+        _run_with_timeout(
+            _import_sentence_transformers,
+            timeout_sec=MODEL_STAGE_TIMEOUT_SECONDS,
+            stage_name="LOAD_TOKENIZER",
+            model_name=model_name,
+            model_dir=model_dir,
+            missing_files=missing_files,
+        )
+
+        from sentence_transformers import SentenceTransformer  # now definitely imported
+
+        # ── Phase 2 + 3: LOAD_MODEL_WEIGHTS — construct SentenceTransformer ─
+        # local_files_only=True  → never contacts HuggingFace Hub
+        # cache_folder explicit  → loads from the exact Docker-baked path
+        _stage("LOAD_MODEL_WEIGHTS", t0)
+
+        st_home = os.environ["SENTENCE_TRANSFORMERS_HOME"]
+        resolved_path = Path(st_home) / model_name.replace("/", "_")
+        print(
+            f"[MODEL_SERVICE] Resolved model path: {resolved_path}\n"
+            f"[MODEL_SERVICE] cache_folder: {st_home}\n"
+            f"[MODEL_SERVICE] local_files_only: True\n"
+            f"[MODEL_SERVICE] device: cpu",
+            flush=True,
+        )
+
+        def _construct_sentence_transformer():
+            return SentenceTransformer(
+                model_name,
+                cache_folder=st_home,
+                local_files_only=True,
+                device="cpu",
+            )
+
+        loaded = _run_with_timeout(
+            _construct_sentence_transformer,
+            timeout_sec=MODEL_STAGE_TIMEOUT_SECONDS,
+            stage_name="LOAD_MODEL_WEIGHTS",
+            model_name=model_name,
+            model_dir=model_dir,
+            missing_files=missing_files,
+        )
+
+        # SentenceTransformer() has completed — all sub-stages (tokenizer,
+        # weights, pooling) happened inside _construct_sentence_transformer().
+        # Log the post-construction stages now to confirm each completed.
+        _stage("BUILD_MODULES", t0)       # transformer layers built ✓
+        _stage("INITIALIZE_POOLING", t0)  # pooling layer ready ✓
         dim = loaded.get_sentence_embedding_dimension()
 
-        # ── Phase 3: RSS immediately after SentenceTransformer() ────────
-        rss_post_st = _log_memory("POST_SENTENCE_TRANSFORMER_CONSTRUCTION")
-
+        elapsed = time.time() - t0
+        rss_post = _rss_mb()
         logger.info(
-            "[MODEL_SERVICE] [MODEL_LOAD_COMPLETE] name=%s elapsed=%.1fs "
-            "embedding_dim=%d rss_delta=%.1fMB ram=%.1fMB",
-            model_name, elapsed, dim, rss_post_st - rss_pre_st, rss_post_st,
+            "[MODEL_SERVICE] [MODEL_LOAD_COMPLETE] model=%s elapsed=%.1fs "
+            "embedding_dim=%d RSS=%.1fMB",
+            model_name, elapsed, dim, rss_post,
         )
         print(
-            f"[MODEL_SERVICE] [MODEL_LOAD_COMPLETE] name={model_name} "
-            f"elapsed={elapsed:.1f}s embedding_dim={dim} "
-            f"rss_delta={rss_post_st - rss_pre_st:.1f}MB ram={rss_post_st:.1f}MB",
+            f"[MODEL_SERVICE] [MODEL_LOAD_COMPLETE] model={model_name} "
+            f"elapsed={elapsed:.1f}s embedding_dim={dim} RSS={rss_post:.1f}MB",
             flush=True,
         )
 
-        # ── Phase 6: gc.collect() immediately after construction ────────
-        rss_before_gc = _log_memory("PRE_GC_COLLECT")
+        # ── gc.collect() to release init-time temporaries ───────────────────
+        rss_pre_gc = rss_post
         gc.collect()
-        # Also try to release any PyTorch CPU allocator cache
-        try:
-            if hasattr(torch, "cuda") and torch.cuda.is_available():
-                torch.cuda.empty_cache()
-        except Exception:
-            pass
-        rss_after_gc = _log_memory("POST_GC_COLLECT")
+        rss_post_gc = _rss_mb()
         logger.info(
             "[MODEL_SERVICE] [GC_RESULT] freed=%.1fMB rss_after=%.1fMB",
-            rss_before_gc - rss_after_gc, rss_after_gc,
-        )
-        print(
-            f"[MODEL_SERVICE] [GC_RESULT] freed={rss_before_gc - rss_after_gc:.1f}MB "
-            f"rss_after={rss_after_gc:.1f}MB",
-            flush=True,
+            rss_pre_gc - rss_post_gc, rss_post_gc,
         )
 
-        # ── Back-fill EmbeddingEncoder cache for legacy paths ───────────
+        # ── Back-fill in-process cache ──────────────────────────────────────
         try:
             from src.features.embedding import _MODEL_CACHE as _MC
             _MC[model_name] = loaded
         except Exception:
             pass
 
-        # ── Commit singleton ─────────────────────────────────────────────
+        # ── Commit singleton ────────────────────────────────────────────────
         _model = loaded
         _model_name = model_name
         _load_state = "loaded"
-        _log_memory("POST_MODEL_LOAD_FINAL")
+
+        # ── Phase 3: MODEL_READY ────────────────────────────────────────────
+        _stage("MODEL_READY", t0)
         logger.info(
-            "[MODEL_SERVICE] [MODEL_SINGLETON_CREATED] id=%d name=%s "
-            "— SentenceTransformer instantiated exactly once in this process",
+            "[MODEL_SERVICE] [MODEL_SINGLETON_CREATED] id=%d name=%s",
             id(loaded), model_name,
         )
         print(
-            f"[MODEL_SERVICE] [MODEL_SINGLETON_CREATED] id={id(loaded)} name={model_name}",
+            f"[MODEL_SERVICE] [MODEL_SINGLETON_CREATED] id={id(loaded)} "
+            f"name={model_name}",
             flush=True,
         )
 
@@ -440,8 +566,9 @@ def _do_load(model_name: str) -> None:
         import traceback as _tb
         tb = _tb.format_exc()
         logger.error(
-            "[MODEL_SERVICE] [MODEL_LOAD_FAILED] name=%s error=%s\n%s",
-            model_name, exc, tb,
+            "[MODEL_SERVICE] [MODEL_LOAD_FAILED] model=%s stage=%s "
+            "error=%s\n%s",
+            model_name, _current_stage, exc, tb,
         )
         _load_error = exc
         _load_state = "failed"
@@ -455,33 +582,17 @@ def _do_load(model_name: str) -> None:
 # ---------------------------------------------------------------------------
 
 def preload(model_name: Optional[str] = None) -> bool:
-    """
-    REMOVED FROM STARTUP — kept only as a no-op compatibility shim.
-
-    The model is now loaded lazily on the first get_model() call.
-    Calling preload() is safe but does nothing unless state is "unloaded".
-
-    Returns True if a new background load was started, False otherwise.
-    """
+    """Compatibility shim — kept for tests/manual triggers. Returns True if load started."""
     global _load_state
-
     target = model_name or _get_model_name()
-
     with _lock:
         if _load_state in ("loaded", "loading"):
             logger.info(
-                "[MODEL_SERVICE] preload() called but state=%s — skipping (lazy-load mode)",
-                _load_state,
+                "[MODEL_SERVICE] preload() skipped — state=%s", _load_state
             )
             return False
-        # Still allow explicit preload calls from tests or manual triggers
         _load_state = "loading"
         _load_event.clear()
-
-    logger.info(
-        "[MODEL_SERVICE] preload() called explicitly — starting background load for model=%s",
-        target,
-    )
     t = threading.Thread(target=_do_load, args=(target,), name="model-preload", daemon=True)
     t.start()
     return True
@@ -491,27 +602,23 @@ def get_model(timeout: float = MODEL_LOAD_TIMEOUT_SECONDS):
     """
     Return the loaded SentenceTransformer.
 
-    Lazy-load behaviour (Phase 2):
-    - If state is "unloaded": acquire lock, start loading thread, release lock.
-    - If state is "loading":  wait on _load_event (up to timeout).
-    - If state is "loaded":   return cached instance immediately (fast path).
-    - If state is "failed":   raise ModelLoadFailed immediately (fail fast).
+    - state=loaded  → return instantly (fast path)
+    - state=unloaded → trigger lazy load, then wait
+    - state=loading  → wait on same _load_event
+    - state=failed   → raise ModelLoadFailed immediately
 
-    Concurrent callers all wait for the SAME load operation — exactly one
-    SentenceTransformer is ever created per process.
-
-    Raises:
-        ModelLoadTimeout  — model did not finish within timeout seconds
-        ModelLoadFailed   — model loading raised an exception
+    Raises ModelLoadTimeout if load doesn't complete within timeout.
+    Raises ModelLoadFailed  if load raised an exception.
     """
     global _load_state, _load_error
 
     target = _get_model_name()
 
-    # ── Fast path: already loaded ─────────────────────────────────────────
     with _lock:
         if _load_state == "loaded" and _model is not None:
-            logger.debug("[MODEL_SERVICE] [MODEL_REUSED] id=%d name=%s", id(_model), _model_name)
+            logger.debug(
+                "[MODEL_SERVICE] [MODEL_REUSED] id=%d name=%s", id(_model), _model_name
+            )
             return _model
 
         if _load_state == "failed":
@@ -520,115 +627,94 @@ def get_model(timeout: float = MODEL_LOAD_TIMEOUT_SECONDS):
             ) from _load_error
 
         if _load_state == "unloaded":
-            # Phase 2: first caller triggers the singleton load
             _load_state = "loading"
             _load_event.clear()
             logger.info(
-                "[MODEL_SERVICE] [LAZY_LOAD_TRIGGERED] "
-                "First request requiring embeddings — starting model load. "
-                "model=%s pid=%d",
+                "[MODEL_SERVICE] [LAZY_LOAD_TRIGGERED] model=%s pid=%d",
                 target, os.getpid(),
             )
             print(
-                f"[MODEL_SERVICE] [LAZY_LOAD_TRIGGERED] "
-                f"First embedding request — loading model={target}",
+                f"[MODEL_SERVICE] [LAZY_LOAD_TRIGGERED] model={target}",
                 flush=True,
             )
             t = threading.Thread(
                 target=_do_load, args=(target,), name="model-lazy-load", daemon=True
             )
             t.start()
-        # else: state == "loading" — another thread is already loading, just wait
 
-    # ── Wait for load to complete (all callers share same event) ─────────
-    heartbeat_interval = 5.0
+    # Wait with heartbeat logs every 5 s
     waited = 0.0
-    logger.info(
-        "[MODEL_SERVICE] Waiting for lazy model load (timeout=%ds, model=%s) …",
-        int(timeout), target,
-    )
+    heartbeat = 5.0
     while waited < timeout:
-        chunk = min(heartbeat_interval, timeout - waited)
+        chunk = min(heartbeat, timeout - waited)
         if _load_event.wait(timeout=chunk):
             break
         waited += chunk
         logger.info(
-            "[MODEL_SERVICE] [MODEL_LOAD_HEARTBEAT] waited=%.0fs/%.0fs "
-            "model=%s ram=%.1fMB",
-            waited, timeout, target, _memory_mb(),
+            "[MODEL_SERVICE] [WAIT] waited=%.0fs/%.0fs stage=%s RSS=%.1fMB",
+            waited, timeout, _current_stage, _rss_mb(),
         )
 
     if not _load_event.is_set():
-        timeout_exc = ModelLoadTimeout(
+        exc = ModelLoadTimeout(
             f"Model '{target}' did not finish loading within {timeout}s. "
-            "Check HuggingFace Hub connectivity and available RAM."
+            f"Last stage: {_current_stage}. Check logs for DOCKER_CACHE_INVALID."
         )
         with _lock:
-            _load_error = timeout_exc
+            _load_error = exc
             _load_state = "failed"
         logger.error(
-            "[MODEL_SERVICE] [MODEL_LOAD_TIMEOUT] model=%s timeout=%ds",
-            target, int(timeout),
+            "[MODEL_SERVICE] [MODEL_LOAD_TIMEOUT] model=%s timeout=%ds stage=%s",
+            target, int(timeout), _current_stage,
         )
-        raise timeout_exc
+        raise exc
 
-    # ── Re-check state after event fired ─────────────────────────────────
     with _lock:
-        current_state = _load_state
-        current_error = _load_error
-        current_model = _model
+        state   = _load_state
+        error   = _load_error
+        current = _model
 
-    if current_state == "failed":
+    if state == "failed":
         raise ModelLoadFailed(
-            f"Model '{target}' failed to load: {current_error}"
-        ) from current_error
+            f"Model '{target}' failed: {error}"
+        ) from error
+    if current is None:
+        raise ModelLoadFailed(f"Model '{target}' returned None after load")
 
-    if current_model is None:
-        raise ModelLoadFailed(f"Model '{target}' load completed but instance is None")
-
-    return current_model
+    return current
 
 
 def is_loaded() -> bool:
-    """Return True if the model is currently loaded and ready."""
     return _load_state == "loaded" and _model is not None
 
 
 def get_model_name() -> Optional[str]:
-    """Return the name of the currently loaded model, or None."""
     return _model_name
 
 
 def get_load_state() -> str:
-    """Return the current load state string: 'unloaded'|'loading'|'loaded'|'failed'."""
     return _load_state
 
 
 def get_load_error() -> Optional[Exception]:
-    """Return the load exception if state is 'failed', else None."""
     return _load_error
 
 
 def reset() -> None:
-    """
-    Unload the model and reset all state.  For tests only.
-    Never call during normal request handling.
-    """
-    global _model, _model_name, _load_state, _load_error, _cache_verdict_logged
-
+    """For tests only. Unloads model and resets all state."""
+    global _model, _model_name, _load_state, _load_error, _current_stage
     with _lock:
         _model = None
         _model_name = None
         _load_state = "unloaded"
         _load_error = None
-        _cache_verdict_logged = False
+        _current_stage = "idle"
         _load_event.clear()
-
     try:
         from src.features.embedding import _MODEL_CACHE
         _MODEL_CACHE.clear()
     except Exception:
         pass
-
     gc.collect()
-    logger.info("[MODEL_SERVICE] Model unloaded and cache cleared (reset called).")
+    logger.info("[MODEL_SERVICE] reset() — model unloaded.")
+

@@ -143,3 +143,17 @@ VerificationReport.md
 WorkerCrashReport.md
 WorkflowRefactorImplementation.md
 WorkflowVerificationReport.md
+
+# ── Root-level AI session reports (new — not tracked) ────────────────────────
+# docs/ subdirectory is tracked (ModelLoadingAudit.md, CacheAudit.md, StartupTimeline.md live there)
+# The following root-level files are ignored:
+RAILWAY_OOM_FIX_SUMMARY.md
+LazyLoadingReport.md
+MemoryTimeline.md
+TorchDiagnostics.md
+SingletonVerification.md
+DEPLOYMENT_CHECKLIST.md
+RootCauseAnalysis.md
+StartupImportGraph.md
+HFCacheAudit.md
+PerformanceRecommendations.md
