@@ -90,7 +90,7 @@ BackgroundJobsFixPlan.md
 BackgroundJobsSchemaAudit.md
 BackgroundWorkerAudit.md
 CodeDiffSummary.md
-CompatibilityReport.md
+/CompatibilityReport.md
 CrashDiagnostics.md
 DemoScript.md
 DependencyAnalysis.md
@@ -113,7 +113,7 @@ MemoryDiagnostics.md
 MemoryReport.md
 MemoryTimeline.md
 ModelLifecycle.md
-PerformanceComparison.md
+/PerformanceComparison.md
 PerformanceImprovements.md
 PerformanceRecommendations.md
 PerformanceReport.md

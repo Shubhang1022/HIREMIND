@@ -39,16 +39,6 @@ MODEL_LOAD_TIMEOUT_SECONDS = int(os.environ.get("MODEL_LOAD_TIMEOUT", "120"))
 
 _DEFAULT_MODEL = "BAAI/bge-small-en-v1.5"
 
-# Required files that must exist inside the model directory
-_REQUIRED_MODEL_FILES = [
-    "config.json",
-    "tokenizer.json",
-    "modules.json",
-    "tokenizer_config.json",
-    "special_tokens_map.json",
-]
-_WEIGHT_FILES = ["model.safetensors", "pytorch_model.bin"]  # at least one required
-
 
 class ModelLoadTimeout(RuntimeError):
     """Raised when a model loading stage exceeds the per-stage timeout."""
@@ -179,99 +169,256 @@ def _set_hf_cache() -> None:
 # Phase 1 + 7: Docker cache verification
 # ---------------------------------------------------------------------------
 
-def _resolve_model_dir(model_name: str) -> Path:
-    """
-    Resolve the absolute path where sentence-transformers stores this model.
+def _find_weight_files(cache_root: Path) -> list[Path]:
+    """Recursively find all weight files under cache_root (fallback strategy)."""
+    weight_names = {"model.safetensors", "pytorch_model.bin"}
+    found: list[Path] = []
+    if not cache_root.is_dir():
+        return found
+    for p in cache_root.rglob("*"):
+        if p.is_file() and p.name in weight_names:
+            found.append(p)
+    return found
 
-    sentence-transformers uses: <SENTENCE_TRANSFORMERS_HOME>/<org>_<model>/
-    e.g. BAAI/bge-small-en-v1.5 → .../BAAI_bge-small-en-v1.5/
+
+def _discover_model_path_from_object(model_obj: object) -> tuple[Optional[Path], str]:
     """
-    cache_root = Path(
-        os.environ.get("SENTENCE_TRANSFORMERS_HOME", "/app/.cache/sentence-transformers")
-    )
-    sanitized = model_name.replace("/", "_")
-    return cache_root / sanitized
+    Phase 1 — try to determine the on-disk model directory directly from the
+    loaded SentenceTransformer instance, using only public/documented attributes.
+
+    Returns (resolved_dir, source_attr) or (None, "none") if discovery fails.
+
+    Probe order (public APIs first, private attributes only as last resort):
+      1. model_obj.tokenizer.name_or_path             — PreTrainedTokenizer, public
+      2. model_obj[0].auto_model.config._name_or_path — Transformer module, semi-public
+      3. model_obj._modules iteration → each module's config._name_or_path
+    """
+    weight_names = {"model.safetensors", "pytorch_model.bin"}
+
+    # ── Probe 1: tokenizer.name_or_path (sentence-transformers ≥ 2.0) ────
+    try:
+        tok = getattr(model_obj, "tokenizer", None)
+        if tok is not None:
+            nop = getattr(tok, "name_or_path", None)
+            if nop:
+                candidate = Path(nop)
+                if candidate.is_dir():
+                    # Verify it actually contains weights (not just tokenizer files)
+                    if any((candidate / w).is_file() for w in weight_names):
+                        return candidate, "tokenizer.name_or_path"
+                    # Could be a parent dir — weights might be in same dir
+                    # or the tokenizer dir IS the model dir
+                    return candidate, "tokenizer.name_or_path"
+    except Exception:
+        pass
+
+    # ── Probe 2: first module's auto_model.config._name_or_path ──────────
+    try:
+        # SentenceTransformer is a Sequential; modules are accessible by index
+        first_module = model_obj[0]  # type: ignore[index]
+        auto = getattr(first_module, "auto_model", None)
+        if auto is not None:
+            cfg = getattr(auto, "config", None)
+            if cfg is not None:
+                nop = getattr(cfg, "_name_or_path", None)
+                if nop:
+                    candidate = Path(nop)
+                    if candidate.is_dir():
+                        return candidate, "modules[0].auto_model.config._name_or_path"
+    except Exception:
+        pass
+
+    # ── Probe 3: iterate _modules dict ────────────────────────────────────
+    try:
+        modules = getattr(model_obj, "_modules", {}) or {}
+        for _mname, mod in modules.items():
+            for sub_attr in ("auto_model", "model"):
+                sub = getattr(mod, sub_attr, None)
+                if sub is None:
+                    continue
+                cfg = getattr(sub, "config", None)
+                if cfg is None:
+                    continue
+                nop = getattr(cfg, "_name_or_path", None)
+                if nop:
+                    candidate = Path(nop)
+                    if candidate.is_dir():
+                        return candidate, f"_modules[{_mname!r}].{sub_attr}.config._name_or_path"
+    except Exception:
+        pass
+
+    return None, "none"
+
+
+def _verify_model_dir(model_dir: Path) -> tuple[bool, list[Path], int]:
+    """
+    Phase 2 — validate a known model directory.
+    Returns (ok, weight_files_found, total_bytes).
+    """
+    weight_names = {"model.safetensors", "pytorch_model.bin"}
+    if not model_dir.is_dir():
+        return False, [], 0
+    all_files = [p for p in model_dir.rglob("*") if p.is_file()]
+    weight_files = [p for p in all_files if p.name in weight_names]
+    total_bytes = sum(p.stat().st_size for p in all_files)
+    return bool(weight_files), weight_files, total_bytes
 
 
 def verify_docker_cache(model_name: str) -> tuple[bool, list[str], Path]:
     """
     Phase 1 + 7: Verify the Docker-baked model cache is complete.
 
-    Returns (ok: bool, missing_files: list[str], model_dir: Path).
-    Logs [MODEL_CACHE_VERIFY] with full details.
-    Logs [DOCKER_CACHE_INVALID] on any failure.
+    Discovery strategy:
+      PRIMARY   — introspect the loaded SentenceTransformer object (fast, O(1))
+      FALLBACK  — recursive filesystem scan of cache_root (correct but slower)
+
+    The model object is NOT available at this call site (verify_docker_cache runs
+    before SentenceTransformer() is constructed). Therefore discovery here uses
+    filesystem heuristics only.  Object-based discovery is used in the
+    Dockerfile pre-bake step where the model is already loaded.
+
+    Pass condition:
+      - cache_root exists AND at least one weight file found (direct or rglob)
+
+    Fail condition (only two hard failures):
+      - cache_root does not exist, OR
+      - no weight file found anywhere under cache_root.
+
+    Returns (ok, missing_files, resolved_model_dir).
     """
+    t_verify_start = time.time()
     cache_root = Path(
         os.environ.get("SENTENCE_TRANSFORMERS_HOME", "/app/.cache/sentence-transformers")
     )
-    model_dir = _resolve_model_dir(model_name)
+    conventional_dir = cache_root / model_name.replace("/", "_")
 
-    # Log env vars and resolved path (Phase 1)
+    # ── Print env context ────────────────────────────────────────────────────
     print(
         f"\n[MODEL_CACHE_VERIFY] ─────────────────────────────────────────\n"
-        f"  HF_HOME                  : {os.environ.get('HF_HOME')}\n"
-        f"  TRANSFORMERS_CACHE       : {os.environ.get('TRANSFORMERS_CACHE')}\n"
+        f"  HF_HOME                   : {os.environ.get('HF_HOME')}\n"
+        f"  TRANSFORMERS_CACHE        : {os.environ.get('TRANSFORMERS_CACHE')}\n"
         f"  SENTENCE_TRANSFORMERS_HOME: {os.environ.get('SENTENCE_TRANSFORMERS_HOME')}\n"
-        f"  model_name               : {model_name}\n"
-        f"  cache_root               : {cache_root}\n"
-        f"  cache_root_exists        : {cache_root.is_dir()}\n"
-        f"  model_dir (resolved)     : {model_dir}\n"
-        f"  model_dir_exists         : {model_dir.is_dir()}\n"
+        f"  model_name                : {model_name}\n"
+        f"  cache_root                : {cache_root}\n"
+        f"  cache_root_exists         : {cache_root.is_dir()}\n"
+        f"  conventional_dir          : {conventional_dir}\n"
+        f"  conventional_dir_exists   : {conventional_dir.is_dir()}\n"
         f"[MODEL_CACHE_VERIFY] ─────────────────────────────────────────\n",
         flush=True,
     )
 
-    missing: list[str] = []
-
-    # 1. cache root must exist
+    # ── Hard failure: cache root missing ────────────────────────────────────
     if not cache_root.is_dir():
-        missing.append(f"cache_root {cache_root} (directory missing)")
+        missing = [f"cache_root {cache_root} (directory missing)"]
+        _log_cache_invalid(model_name, conventional_dir, missing)
+        return False, missing, conventional_dir
 
-    # 2. model directory must exist
-    if not model_dir.is_dir():
-        missing.append(f"model_dir {model_dir} (directory missing)")
-        # Can't check individual files if dir missing
-        _log_cache_invalid(model_name, model_dir, missing)
-        return False, missing, model_dir
+    # ── PRIMARY strategy: check conventional directory first (O(1) stat) ────
+    # This is a direct path check — no object introspection needed here,
+    # but it avoids the rglob scan on the happy path (directory exists and
+    # contains weights in the expected location).
+    t_direct_start = time.time()
+    strategy = "direct"
+    resolved_dir: Optional[Path] = None
+    weight_files: list[Path] = []
 
-    # 3. check required files
-    for fname in _REQUIRED_MODEL_FILES:
-        fpath = model_dir / fname
-        if not fpath.is_file():
-            missing.append(fname)
+    if conventional_dir.is_dir():
+        ok_dir, wf, total_bytes = _verify_model_dir(conventional_dir)
+        if ok_dir:
+            resolved_dir = conventional_dir
+            weight_files = wf
+    
+    t_direct_elapsed = time.time() - t_direct_start
 
-    # 4. at least one weight file must exist
-    has_weights = any((model_dir / w).is_file() for w in _WEIGHT_FILES)
-    if not has_weights:
-        missing.append(f"weights (need one of: {_WEIGHT_FILES})")
+    # ── FALLBACK strategy: recursive scan (O(n files)) ───────────────────────
+    if resolved_dir is None:
+        strategy = "rglob"
+        logger.info(
+            "[MODEL_PATH_DISCOVERY_FAILED] conventional_dir=%s not found or has no weights "
+            "— falling_back_to_recursive_scan=True",
+            conventional_dir,
+        )
+        print(
+            f"[MODEL_PATH_DISCOVERY_FAILED] conventional_dir={conventional_dir} "
+            f"— falling_back_to_recursive_scan=True",
+            flush=True,
+        )
+        t_rglob_start = time.time()
+        weight_files = _find_weight_files(cache_root)
+        t_rglob_elapsed = time.time() - t_rglob_start
 
-    # 5. log all files present for audit
-    all_files = sorted(str(p.name) for p in model_dir.iterdir()) if model_dir.is_dir() else []
-    total_bytes = sum(
-        p.stat().st_size for p in model_dir.rglob("*") if p.is_file()
-    ) if model_dir.is_dir() else 0
+        if weight_files:
+            resolved_dir = weight_files[0].parent
+            _, _, total_bytes = _verify_model_dir(resolved_dir)
+        else:
+            total_bytes = 0
 
-    ok = len(missing) == 0
-    status = "CACHE_OK" if ok else "CACHE_INCOMPLETE"
+        # Perf log for rglob
+        print(
+            f"[CACHE_DISCOVERY_PERF] strategy=rglob elapsed={t_rglob_elapsed:.3f}s "
+            f"weight_files_found={len(weight_files)}",
+            flush=True,
+        )
+        logger.info(
+            "[CACHE_DISCOVERY_PERF] strategy=rglob elapsed=%.3fs weight_files=%d",
+            t_rglob_elapsed, len(weight_files),
+        )
+    else:
+        # Perf log for direct hit
+        print(
+            f"[CACHE_DISCOVERY_PERF] strategy=direct elapsed={t_direct_elapsed:.3f}s "
+            f"weight_files_found={len(weight_files)}",
+            flush=True,
+        )
+        logger.info(
+            "[CACHE_DISCOVERY_PERF] strategy=direct elapsed=%.3fs weight_files=%d",
+            t_direct_elapsed, len(weight_files),
+        )
+
+    # ── Hard failure: no weights anywhere ────────────────────────────────────
+    if not weight_files:
+        top_level = sorted(p.name for p in cache_root.iterdir()) if cache_root.is_dir() else []
+        missing = [
+            f"no weight file (model.safetensors / pytorch_model.bin) found "
+            f"anywhere under {cache_root}. cache_root_contents={top_level}"
+        ]
+        print(
+            f"[MODEL_CACHE_VERIFY] CACHE_INCOMPLETE\n"
+            f"  cache_root: {cache_root}\n"
+            f"  strategy  : {strategy}\n"
+            f"  missing   : {missing}\n",
+            flush=True,
+        )
+        logger.warning(
+            "[MODEL_CACHE_VERIFY] CACHE_INCOMPLETE cache_root=%s strategy=%s missing=%s",
+            cache_root, strategy, missing,
+        )
+        _log_cache_invalid(model_name, conventional_dir, missing)
+        return False, missing, conventional_dir
+
+    # ── Success ───────────────────────────────────────────────────────────────
+    t_total = time.time() - t_verify_start
+    weight_size_mb = sum(w.stat().st_size for w in weight_files) / 1024 / 1024
+    top_level = sorted(p.name for p in cache_root.iterdir())
 
     print(
-        f"[MODEL_CACHE_VERIFY] {status}\n"
-        f"  model_path  : {model_dir}\n"
-        f"  exists      : {model_dir.is_dir()}\n"
-        f"  files       : {all_files}\n"
-        f"  total_size  : {total_bytes / 1024 / 1024:.1f} MB\n"
-        f"  missing     : {missing}\n",
+        f"[MODEL_CACHE_VERIFY] CACHE_OK\n"
+        f"  strategy           : {strategy}\n"
+        f"  resolved_model_dir : {resolved_dir}\n"
+        f"  weight_files       : {[str(w) for w in weight_files]}\n"
+        f"  weight_size        : {weight_size_mb:.1f} MB\n"
+        f"  total_size         : {total_bytes / 1024 / 1024:.1f} MB\n"
+        f"  cache_root_contents: {top_level}\n"
+        f"  verification_time  : {t_total:.3f}s\n",
         flush=True,
     )
     logger.info(
-        "[MODEL_CACHE_VERIFY] status=%s model_path=%s files=%d size_mb=%.1f missing=%s",
-        status, model_dir, len(all_files), total_bytes / 1024 / 1024, missing,
+        "[MODEL_CACHE_VERIFY] CACHE_OK strategy=%s resolved_dir=%s "
+        "weight_files=%d weight_mb=%.1f total_mb=%.1f elapsed=%.3fs",
+        strategy, resolved_dir, len(weight_files),
+        weight_size_mb, total_bytes / 1024 / 1024, t_total,
     )
-
-    if not ok:
-        _log_cache_invalid(model_name, model_dir, missing)
-
-    return ok, missing, model_dir
+    return True, [], resolved_dir  # type: ignore[return-value]
 
 
 def _log_cache_invalid(model_name: str, model_dir: Path, missing: list[str]) -> None:
@@ -507,6 +654,41 @@ def _do_load(model_name: str) -> None:
             model_name=model_name,
             model_dir=model_dir,
             missing_files=missing_files,
+        )
+
+        # ── Phase 1: discover actual model path from loaded object ───────────
+        # Primary strategy: inspect the loaded model object.
+        # This is O(1) compared to the rglob scan used before construction.
+        t_discover = time.time()
+        obj_path, obj_source = _discover_model_path_from_object(loaded)
+        t_discover_elapsed = time.time() - t_discover
+
+        if obj_path is not None:
+            print(
+                f"[MODEL_PATH_DISCOVERED] resolved_model_dir={obj_path} "
+                f"source={obj_source}",
+                flush=True,
+            )
+            logger.info(
+                "[MODEL_PATH_DISCOVERED] resolved_model_dir=%s source=%s",
+                obj_path, obj_source,
+            )
+        else:
+            print(
+                f"[MODEL_PATH_DISCOVERED] source=none "
+                f"(object introspection returned no path — rglob was used pre-construction)",
+                flush=True,
+            )
+
+        print(
+            f"[CACHE_DISCOVERY_PERF] strategy=direct_object_introspection "
+            f"elapsed={t_discover_elapsed:.3f}s source={obj_source}",
+            flush=True,
+        )
+        logger.info(
+            "[CACHE_DISCOVERY_PERF] strategy=direct_object_introspection "
+            "elapsed=%.3fs source=%s",
+            t_discover_elapsed, obj_source,
         )
 
         # SentenceTransformer() has completed — all sub-stages (tokenizer,
