@@ -474,7 +474,7 @@ def _log_torch_diagnostics() -> None:
 # ---------------------------------------------------------------------------
 
 def _run_with_timeout(fn, timeout_sec: float, stage_name: str,
-                      model_name: str, model_dir: Path, missing: list[str]):
+                      model_name: str, model_dir: Path, missing_files: list[str]):
     """
     Run fn() in a thread. Raise ModelLoadTimeout if it doesn't finish in timeout_sec.
     This is the Phase 6 fail-fast mechanism — one wrapper per expensive stage.
@@ -500,7 +500,7 @@ def _run_with_timeout(fn, timeout_sec: float, stage_name: str,
             f"[MODEL_LOAD_TIMEOUT] stage={stage_name} "
             f"exceeded {timeout_sec:.0f}s — aborting. "
             f"model={model_name} cache_path={model_dir} "
-            f"missing_files={missing} RSS={rss:.1f}MB CPU={cpu:.1f}%"
+            f"missing_files={missing_files} RSS={rss:.1f}MB CPU={cpu:.1f}%"
         )
         logger.error(msg)
         print(msg, flush=True)
