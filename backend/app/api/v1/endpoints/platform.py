@@ -346,11 +346,108 @@ async def run_startup_initialization() -> None:
         # Recover unfinished jobs (Phase 1)
         await _recover_interrupted_jobs()
 
+        # Phase 5: Resume any projects that have candidate files but failed/missing indexes
+        await _resume_indexing_for_eligible_projects()
+
         _enforce_analysis_timeouts()
         _enforce_embedding_timeouts()
         logger.info("Enforced analysis and embedding timeouts on startup.")
     except Exception as exc:
         logger.warning("Startup initialization encountered an error: %s", exc)
+
+
+async def _resume_indexing_for_eligible_projects() -> None:
+    """
+    Phase 5: Resume indexing for projects where:
+    - embedding_status is 'failed' or 'pending'
+    - current_candidate_path exists (file was already uploaded)
+    - No active background job for this project
+    This ensures failed indexing is retried automatically without re-upload.
+    """
+    import logging
+    logger = logging.getLogger(__name__)
+    try:
+        # Find projects with uploaded files but failed/pending indexing
+        res = supabase_client.table("projects").select("id, current_candidate_path, embedding_status, user_id").in_(
+            "embedding_status", ["failed", "pending"]
+        ).not_.is_("current_candidate_path", "null").execute()
+
+        if not res.data:
+            logger.info("[RESUME_INDEXING] No eligible projects found for auto-resume.")
+            return
+
+        logger.info("[RESUME_INDEXING] Found %d projects eligible for auto-resume.", len(res.data))
+
+        # Check which ones have active background jobs already
+        from app.services.job_manager import JobManager
+        manager = JobManager.get_instance()
+
+        for p in res.data:
+            project_id = p["id"]
+            user_id = p.get("user_id", "")
+            
+            # Skip if job is already running in memory
+            in_memory_job = manager.get_job_status(project_id)
+            if in_memory_job and in_memory_job.get("status") in ("queued", "processing", "embedding", "indexing", "retrying"):
+                logger.info("[RESUME_INDEXING] project=%s already has an active in-memory job, skipping.", project_id)
+                continue
+
+            # Check database for active jobs
+            active_res = supabase_client.table("background_jobs").select("id, status").eq(
+                "project_id", project_id
+            ).in_("status", ["queued", "processing", "embedding", "indexing", "retrying"]).execute()
+            if active_res.data:
+                logger.info("[RESUME_INDEXING] project=%s has active DB job, skipping auto-resume.", project_id)
+                continue
+
+            logger.info(
+                "[RESUME_INDEXING] project=%s embedding_status=%s has candidate file — scheduling auto-resume.",
+                project_id, p.get("embedding_status")
+            )
+            # Schedule with a short delay so the server finishes booting first
+            import asyncio as _asyncio
+            _asyncio.create_task(_delayed_resume_indexing(project_id, user_id, delay_seconds=15.0))
+
+    except Exception as exc:
+        logger.warning("[RESUME_INDEXING] Error during auto-resume scan: %s", exc)
+
+
+async def _delayed_resume_indexing(project_id: str, user_id: str, delay_seconds: float = 15.0) -> None:
+    """Wait delay_seconds then kick off a fresh indexing run for the project."""
+    import asyncio as _asyncio
+    import logging
+    logger = logging.getLogger(__name__)
+    await _asyncio.sleep(delay_seconds)
+    try:
+        logger.info("[RESUME_INDEXING] Starting delayed auto-resume for project=%s", project_id)
+        supabase_client.table("projects").update({
+            "embedding_status": "queued",
+            "status": "INDEXING",
+            "updated_at": _now(),
+        }).eq("id", project_id).execute()
+
+        from app.services.job_manager import JobManager
+        manager = JobManager.get_instance()
+        coro = manager.register_job(project_id, user_id or "", "indexing")
+        try:
+            loop = _asyncio.get_event_loop()
+        except RuntimeError:
+            loop = _asyncio.new_event_loop()
+            _asyncio.set_event_loop(loop)
+        if loop.is_running():
+            from asyncio import run_coroutine_threadsafe
+            fut = run_coroutine_threadsafe(coro, loop)
+            try:
+                fut.result(timeout=10.0)
+            except Exception:
+                pass
+        else:
+            loop.run_until_complete(coro)
+
+        _safe_background_task("auto_resume_indexing", process_project_data_task, project_id)
+        logger.info("[RESUME_INDEXING] Auto-resume kicked off for project=%s", project_id)
+    except Exception as exc:
+        logger.error("[RESUME_INDEXING] Auto-resume failed for project=%s: %s", project_id, exc)
 
 
 # ── Embedding model singleton ─────────────────────────────────────────────────
@@ -723,13 +820,24 @@ def process_candidate_upload_task(
             project_id,
             records_parsed,
         )
-    except Exception:
-        logger.exception("[CANDIDATE_UPLOAD_BACKGROUND_FATAL] project=%s", project_id)
+    except Exception as upload_exc:
+        import traceback as _tb
+        tb_str = _tb.format_exc()
+        logger.exception("[CANDIDATE_UPLOAD_BACKGROUND_FATAL] project=%s error=%s\n%s",
+                         project_id, upload_exc, tb_str)
+        # Mark the background job as FAILED so worker-status/SSE reports correctly
+        try:
+            _sync_fail_job(project_id, f"CANDIDATE_UPLOAD_FAILED:{type(upload_exc).__name__}:{upload_exc}")
+        except Exception:
+            pass
         try:
             supabase_client.table("projects").update({
                 "embedding_status": "failed",
                 "status": "FAILED",
-                "upload_statistics": {"failure_reason": "Candidate upload processing failed"},
+                "upload_statistics": {
+                    "failure_reason": f"Candidate upload processing failed: {upload_exc}",
+                    "traceback": tb_str[:500],
+                },
                 "updated_at": _now(),
             }).eq("id", project_id).execute()
         except Exception:
@@ -1951,6 +2059,16 @@ async def get_worker_status(project_id: str, current_user: Optional[AuthUser] = 
         res = supabase_client.table("background_jobs").select("*").eq("project_id", project_id).order("started_at", desc=True).limit(1).execute()
         if res.data:
             job = res.data[0]
+            started_at = job.get("started_at")
+            elapsed_time = 0.0
+            if started_at:
+                try:
+                    import time as _time
+                    from datetime import datetime, timezone
+                    started_dt = datetime.fromisoformat(started_at.replace("Z", "+00:00"))
+                    elapsed_time = (datetime.now(timezone.utc) - started_dt).total_seconds()
+                except Exception:
+                    pass
             status_info = {
                 "job_id": job["id"],
                 "project_id": project_id,
@@ -1958,13 +2076,15 @@ async def get_worker_status(project_id: str, current_user: Optional[AuthUser] = 
                 "current_stage": job["current_stage"],
                 "progress_percentage": job["progress_percentage"],
                 "status": job["status"],
+                "failure_reason": job.get("failure_reason"),
                 "retry_count": job["retry_count"],
                 "last_heartbeat": job["last_heartbeat"],
                 "processed_candidates": 0,
                 "total_candidates": 0,
                 "ram_usage": 0.0,
                 "peak_ram": 0.0,
-                "eta": "00:00:00"
+                "eta": "00:00:00",
+                "elapsed_time": elapsed_time,
             }
         else:
             return {
@@ -1975,8 +2095,22 @@ async def get_worker_status(project_id: str, current_user: Optional[AuthUser] = 
                 "total_candidates": 0,
                 "ram_usage": 0.0,
                 "peak_ram": 0.0,
-                "eta": "00:00:00"
+                "eta": "00:00:00",
+                "failure_reason": None,
+                "retry_count": 0,
+                "elapsed_time": 0.0,
             }
+    # Ensure failure_reason is always present
+    if "failure_reason" not in status_info:
+        status_info["failure_reason"] = status_info.get("failure_reason")
+    # Calculate elapsed_time if missing
+    if "elapsed_time" not in status_info:
+        import time as _time
+        started = status_info.get("started_at")
+        if isinstance(started, float):
+            status_info["elapsed_time"] = round(_time.time() - started, 1)
+        else:
+            status_info["elapsed_time"] = 0.0
     return status_info
 
 
@@ -2089,6 +2223,95 @@ async def cancel_indexing(project_id: str, current_user: Optional[AuthUser] = De
     }).eq("id", project_id).execute()
     
     return {"status": "cancelled", "message": "Indexing cancellation requested."}
+
+
+@router.post("/projects/{project_id}/retry-indexing")
+async def retry_indexing(
+    project_id: str,
+    background_tasks: BackgroundTasks,
+    current_user: Optional[AuthUser] = Depends(get_optional_user),
+):
+    """
+    Retry indexing for a project whose previous indexing run failed.
+
+    - Requires the project to be in embedding_status='failed'.
+    - Reuses the already-uploaded candidate file — no re-upload required.
+    - Resets the project back to embedding_status='queued' and kicks off a
+      fresh indexing background task.
+    - Returns 409 if the project is already indexing or completed.
+    - Returns 400 if no candidate file exists to index.
+    """
+    user_id = get_user_id(current_user)
+    proj_res = supabase_client.table("projects").select("*").eq("id", project_id).eq("user_id", user_id).execute()
+    if not proj_res.data:
+        raise HTTPException(status_code=404, detail="Project not found")
+    p = proj_res.data[0]
+
+    embedding_status = p.get("embedding_status", "pending")
+
+    # Guard: only retry a failed indexing run
+    if embedding_status in ("queued", "processing"):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Indexing is already in progress. Wait for it to complete before retrying.",
+        )
+    if embedding_status == "completed":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Indexing already completed successfully. Run analysis to use the results.",
+        )
+
+    # Guard: must have a candidate file to reindex
+    current_path = p.get("current_candidate_path")
+    if not current_path:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="No candidate file found for this project. Please upload candidates first.",
+        )
+
+    logger.info("[RETRY_INDEXING] project=%s user=%s current_path=%s", project_id, user_id[:8], current_path)
+
+    # Reset project state to queued so the background task can run cleanly
+    supabase_client.table("projects").update({
+        "embedding_status": "queued",
+        "status": "INDEXING",
+        "updated_at": _now(),
+    }).eq("id", project_id).execute()
+
+    # Register a fresh background_jobs row
+    from app.services.job_manager import JobManager
+    manager = JobManager.get_instance()
+    try:
+        loop = asyncio.get_event_loop()
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+    coro = manager.register_job(project_id, user_id, "indexing")
+    if loop.is_running():
+        from asyncio import run_coroutine_threadsafe
+        fut = run_coroutine_threadsafe(coro, loop)
+        try:
+            job_id = fut.result(timeout=10.0)
+        except Exception:
+            job_id = None
+    else:
+        job_id = loop.run_until_complete(coro)
+
+    # Kick off fresh indexing in background — reuses current_candidate_path from DB
+    background_tasks.add_task(
+        _safe_background_task,
+        "retry_indexing",
+        process_project_data_task,
+        project_id,
+    )
+
+    logger.info("[RETRY_INDEXING] project=%s job_id=%s indexing restarted", project_id, job_id)
+    return {
+        "status": "queued",
+        "message": "Indexing restarted using existing candidate file. No re-upload needed.",
+        "job_id": job_id,
+        "project_id": project_id,
+    }
 
 
 @router.get("/projects")
@@ -2833,7 +3056,12 @@ async def run_analysis(
         logger.warning("Analysis attempt rejected: Candidate indexing failed for project %s", project_id)
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
-            detail="Candidate indexing failed. Please re-upload candidate files to retry."
+            detail={
+                "code": "INDEXING_FAILED",
+                "message": "Candidate indexing failed. Use the retry endpoint to restart indexing — no re-upload required.",
+                "retry_endpoint": f"/api/v1/platform/projects/{project_id}/retry-indexing",
+                "action": "retry_indexing",
+            }
         )
 
     # 1. Verify Job exists (Phase 5 Index Integrity Validation)
