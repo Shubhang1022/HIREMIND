@@ -31,9 +31,6 @@ class Settings(BaseSettings):
         # Prioritize dotenv_settings over env_settings to ensure .env takes precedence (Requirement 2)
         return (init_settings, dotenv_settings, env_settings, file_secret_settings)
 
-    # Database
-    database_url: str = "postgresql+asyncpg://postgres:postgres@localhost:5432/postgres"
-
     # Supabase
     supabase_url: str = ""
     supabase_service_key: str = ""

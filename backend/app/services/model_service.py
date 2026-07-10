@@ -7,7 +7,7 @@ All 9 phases implemented:
   Phase 3  — Per-stage instrumentation (START_LOAD → MODEL_READY)
   Phase 4  — HF offline env vars set before any import
   Phase 5  — Thread limits set before any ML import
-  Phase 6  — Fail-fast: 30-second hard timeout per stage
+  Phase 6  — Outer load timeout wrapper (no nested deadlocking thread timers)
   Phase 7  — Docker cache validation at startup, DOCKER_CACHE_INVALID on failure
   Phase 8  — No from_pretrained / hf_hub_download / snapshot_download calls
   Phase 9  — Reports: ModelLoadingAudit.md, CacheAudit.md, StartupTimeline.md
@@ -25,15 +25,7 @@ from typing import Optional
 
 logger = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# Tunables
-# ---------------------------------------------------------------------------
-# Phase 6: per-stage fail-fast timeout — each individual stage must complete
-# within this many seconds or ModelLoadTimeout is raised immediately.
-MODEL_STAGE_TIMEOUT_SECONDS = int(os.environ.get("MODEL_STAGE_TIMEOUT", "30"))
-
 # Outer caller timeout: how long get_model() will wait for the full load.
-# Must be > MODEL_STAGE_TIMEOUT_SECONDS × number of stages (≈ 5 stages × 30 s = 150 s).
 # Default: 120 s — matches previous behaviour, enough for disk-cached load (~15 s).
 MODEL_LOAD_TIMEOUT_SECONDS = int(os.environ.get("MODEL_LOAD_TIMEOUT", "120"))
 
@@ -41,7 +33,7 @@ _DEFAULT_MODEL = "BAAI/bge-small-en-v1.5"
 
 
 class ModelLoadTimeout(RuntimeError):
-    """Raised when a model loading stage exceeds the per-stage timeout."""
+    """Raised when a model loading stage exceeds the timeout."""
 
 
 class ModelLoadFailed(RuntimeError):
@@ -187,11 +179,6 @@ def _discover_model_path_from_object(model_obj: object) -> tuple[Optional[Path],
     loaded SentenceTransformer instance, using only public/documented attributes.
 
     Returns (resolved_dir, source_attr) or (None, "none") if discovery fails.
-
-    Probe order (public APIs first, private attributes only as last resort):
-      1. model_obj.tokenizer.name_or_path             — PreTrainedTokenizer, public
-      2. model_obj[0].auto_model.config._name_or_path — Transformer module, semi-public
-      3. model_obj._modules iteration → each module's config._name_or_path
     """
     weight_names = {"model.safetensors", "pytorch_model.bin"}
 
@@ -203,18 +190,12 @@ def _discover_model_path_from_object(model_obj: object) -> tuple[Optional[Path],
             if nop:
                 candidate = Path(nop)
                 if candidate.is_dir():
-                    # Verify it actually contains weights (not just tokenizer files)
-                    if any((candidate / w).is_file() for w in weight_names):
-                        return candidate, "tokenizer.name_or_path"
-                    # Could be a parent dir — weights might be in same dir
-                    # or the tokenizer dir IS the model dir
                     return candidate, "tokenizer.name_or_path"
     except Exception:
         pass
 
     # ── Probe 2: first module's auto_model.config._name_or_path ──────────
     try:
-        # SentenceTransformer is a Sequential; modules are accessible by index
         first_module = model_obj[0]  # type: ignore[index]
         auto = getattr(first_module, "auto_model", None)
         if auto is not None:
@@ -267,24 +248,6 @@ def _verify_model_dir(model_dir: Path) -> tuple[bool, list[Path], int]:
 def verify_docker_cache(model_name: str) -> tuple[bool, list[str], Path]:
     """
     Phase 1 + 7: Verify the Docker-baked model cache is complete.
-
-    Discovery strategy:
-      PRIMARY   — introspect the loaded SentenceTransformer object (fast, O(1))
-      FALLBACK  — recursive filesystem scan of cache_root (correct but slower)
-
-    The model object is NOT available at this call site (verify_docker_cache runs
-    before SentenceTransformer() is constructed). Therefore discovery here uses
-    filesystem heuristics only.  Object-based discovery is used in the
-    Dockerfile pre-bake step where the model is already loaded.
-
-    Pass condition:
-      - cache_root exists AND at least one weight file found (direct or rglob)
-
-    Fail condition (only two hard failures):
-      - cache_root does not exist, OR
-      - no weight file found anywhere under cache_root.
-
-    Returns (ok, missing_files, resolved_model_dir).
     """
     t_verify_start = time.time()
     cache_root = Path(
@@ -307,16 +270,11 @@ def verify_docker_cache(model_name: str) -> tuple[bool, list[str], Path]:
         flush=True,
     )
 
-    # ── Hard failure: cache root missing ────────────────────────────────────
     if not cache_root.is_dir():
         missing = [f"cache_root {cache_root} (directory missing)"]
         _log_cache_invalid(model_name, conventional_dir, missing)
         return False, missing, conventional_dir
 
-    # ── PRIMARY strategy: check conventional directory first (O(1) stat) ────
-    # This is a direct path check — no object introspection needed here,
-    # but it avoids the rglob scan on the happy path (directory exists and
-    # contains weights in the expected location).
     t_direct_start = time.time()
     strategy = "direct"
     resolved_dir: Optional[Path] = None
@@ -330,14 +288,8 @@ def verify_docker_cache(model_name: str) -> tuple[bool, list[str], Path]:
     
     t_direct_elapsed = time.time() - t_direct_start
 
-    # ── FALLBACK strategy: recursive scan (O(n files)) ───────────────────────
     if resolved_dir is None:
         strategy = "rglob"
-        logger.info(
-            "[MODEL_PATH_DISCOVERY_FAILED] conventional_dir=%s not found or has no weights "
-            "— falling_back_to_recursive_scan=True",
-            conventional_dir,
-        )
         print(
             f"[MODEL_PATH_DISCOVERY_FAILED] conventional_dir={conventional_dir} "
             f"— falling_back_to_recursive_scan=True",
@@ -353,50 +305,27 @@ def verify_docker_cache(model_name: str) -> tuple[bool, list[str], Path]:
         else:
             total_bytes = 0
 
-        # Perf log for rglob
         print(
             f"[CACHE_DISCOVERY_PERF] strategy=rglob elapsed={t_rglob_elapsed:.3f}s "
             f"weight_files_found={len(weight_files)}",
             flush=True,
         )
-        logger.info(
-            "[CACHE_DISCOVERY_PERF] strategy=rglob elapsed=%.3fs weight_files=%d",
-            t_rglob_elapsed, len(weight_files),
-        )
     else:
-        # Perf log for direct hit
         print(
             f"[CACHE_DISCOVERY_PERF] strategy=direct elapsed={t_direct_elapsed:.3f}s "
             f"weight_files_found={len(weight_files)}",
             flush=True,
         )
-        logger.info(
-            "[CACHE_DISCOVERY_PERF] strategy=direct elapsed=%.3fs weight_files=%d",
-            t_direct_elapsed, len(weight_files),
-        )
 
-    # ── Hard failure: no weights anywhere ────────────────────────────────────
     if not weight_files:
         top_level = sorted(p.name for p in cache_root.iterdir()) if cache_root.is_dir() else []
         missing = [
             f"no weight file (model.safetensors / pytorch_model.bin) found "
             f"anywhere under {cache_root}. cache_root_contents={top_level}"
         ]
-        print(
-            f"[MODEL_CACHE_VERIFY] CACHE_INCOMPLETE\n"
-            f"  cache_root: {cache_root}\n"
-            f"  strategy  : {strategy}\n"
-            f"  missing   : {missing}\n",
-            flush=True,
-        )
-        logger.warning(
-            "[MODEL_CACHE_VERIFY] CACHE_INCOMPLETE cache_root=%s strategy=%s missing=%s",
-            cache_root, strategy, missing,
-        )
         _log_cache_invalid(model_name, conventional_dir, missing)
         return False, missing, conventional_dir
 
-    # ── Success ───────────────────────────────────────────────────────────────
     t_total = time.time() - t_verify_start
     weight_size_mb = sum(w.stat().st_size for w in weight_files) / 1024 / 1024
     top_level = sorted(p.name for p in cache_root.iterdir())
@@ -411,12 +340,6 @@ def verify_docker_cache(model_name: str) -> tuple[bool, list[str], Path]:
         f"  cache_root_contents: {top_level}\n"
         f"  verification_time  : {t_total:.3f}s\n",
         flush=True,
-    )
-    logger.info(
-        "[MODEL_CACHE_VERIFY] CACHE_OK strategy=%s resolved_dir=%s "
-        "weight_files=%d weight_mb=%.1f total_mb=%.1f elapsed=%.3fs",
-        strategy, resolved_dir, len(weight_files),
-        weight_size_mb, total_bytes / 1024 / 1024, t_total,
     )
     return True, [], resolved_dir  # type: ignore[return-value]
 
@@ -451,65 +374,21 @@ def _log_torch_diagnostics() -> None:
             f"threads_before={torch.get_num_threads()}",
             flush=True,
         )
-        if is_cuda_build:
-            logger.warning(
-                "[TORCH_DIAGNOSTICS] CUDA wheel detected (torch+cu*). "
-                "Wastes ~350 MB RSS on CPU-only host. "
-                "Fix: pin torch+cpu in requirements.txt"
-            )
 
         torch.set_num_threads(1)
         torch.set_num_interop_threads(1)
-        logger.info(
-            "[TORCH_DIAGNOSTICS] version=%s cuda=%s cuda_available=%s "
-            "threads_after=%d",
-            ver, cuda_ver, cuda_avail, torch.get_num_threads(),
-        )
     except Exception as exc:
         logger.warning("[TORCH_DIAGNOSTICS] failed: %s", exc)
 
 
-# ---------------------------------------------------------------------------
-# Phase 6: fail-fast stage watchdog
-# ---------------------------------------------------------------------------
-
-def _run_with_timeout(fn, timeout_sec: float, stage_name: str,
-                      model_name: str, model_dir: Path, missing_files: list[str]):
-    """
-    Run fn() in a thread. Raise ModelLoadTimeout if it doesn't finish in timeout_sec.
-    This is the Phase 6 fail-fast mechanism — one wrapper per expensive stage.
-    """
-    result_box: list = [None]
-    exc_box:    list = [None]
-
-    def _worker():
-        try:
-            result_box[0] = fn()
-        except Exception as e:
-            exc_box[0] = e
-
-    t = threading.Thread(target=_worker, name=f"stage-{stage_name}", daemon=True)
-    t.start()
-    t.join(timeout=timeout_sec)
-
-    if t.is_alive():
-        # Stage hung — hard timeout
-        rss = _rss_mb()
-        cpu = _cpu_pct()
-        msg = (
-            f"[MODEL_LOAD_TIMEOUT] stage={stage_name} "
-            f"exceeded {timeout_sec:.0f}s — aborting. "
-            f"model={model_name} cache_path={model_dir} "
-            f"missing_files={missing_files} RSS={rss:.1f}MB CPU={cpu:.1f}%"
-        )
-        logger.error(msg)
-        print(msg, flush=True)
-        raise ModelLoadTimeout(msg)
-
-    if exc_box[0] is not None:
-        raise exc_box[0]
-
-    return result_box[0]
+def _import_dependencies_safe() -> None:
+    """Import torch, transformers, and sentence_transformers safely in the calling thread."""
+    import sys
+    if "torch" in sys.modules and "transformers" in sys.modules and "sentence_transformers" in sys.modules:
+        return
+    import torch          # noqa: F401
+    import transformers   # noqa: F401
+    from sentence_transformers import SentenceTransformer  # noqa: F401
 
 
 # ---------------------------------------------------------------------------
@@ -518,243 +397,128 @@ def _run_with_timeout(fn, timeout_sec: float, stage_name: str,
 
 def _do_load(model_name: str) -> None:
     """
-    Runs in a daemon thread. Loads the model through all phases 1-8.
-
-    Stage sequence (Phase 3):
-      START_LOAD → VERIFY_CACHE → LOAD_CONFIG → LOAD_TOKENIZER →
-      LOAD_MODEL_WEIGHTS → BUILD_MODULES → INITIALIZE_POOLING → MODEL_READY
+    Loads the model through all phases. Executed either directly in the
+    calling thread (lazy load path) or in a preload thread (lifespan path).
     """
     global _model, _model_name, _load_state, _load_error, _current_stage
 
-    t0 = time.time()  # global timer for all stage elapsed measurements
+    t0 = time.time()
 
     try:
-        # ── Phase 5: thread limits FIRST — before any ML import ────────────
+        # 1. Set thread limits and offline environment settings
         _set_env_limits()
-
-        # ── Phase 4: HF offline mode BEFORE any transformers import ────────
         _set_offline_mode()
-
-        # ── Set cache paths ─────────────────────────────────────────────────
         _set_hf_cache()
 
-        # ── Phase 3: START_LOAD ─────────────────────────────────────────────
         _stage("START_LOAD", t0)
         logger.info(
-            "[MODEL_SERVICE] [MODEL_LOAD_START] model=%s stage_timeout=%ds "
-            "outer_timeout=%ds pid=%d",
-            model_name, MODEL_STAGE_TIMEOUT_SECONDS, MODEL_LOAD_TIMEOUT_SECONDS,
-            os.getpid(),
+            "[MODEL_SERVICE] [MODEL_LOAD_START] model=%s pid=%d",
+            model_name, os.getpid(),
         )
 
-        # ── Phase 1+7: VERIFY_CACHE ─────────────────────────────────────────
+        # 2. Verify Cache
         _stage("VERIFY_CACHE", t0)
         cache_ok, missing_files, model_dir = verify_docker_cache(model_name)
-
         if not cache_ok:
             raise ModelLoadFailed(
                 f"Docker cache incomplete for model '{model_name}'. "
-                f"Missing: {missing_files}. "
-                f"Rebuild the Docker image. Network download disabled."
+                f"Missing: {missing_files}. Network download disabled."
             )
 
-        # ── Check in-process cache (src.features.embedding._MODEL_CACHE) ───
+        # 3. Check in-process cache
         try:
-            import sys as _sys
-            _project_root = os.path.dirname(
-                os.path.dirname(os.path.dirname(os.path.dirname(
-                    os.path.abspath(__file__)
-                )))
-            )
-            if _project_root not in _sys.path:
-                _sys.path.insert(0, _project_root)
             from src.features.embedding import _MODEL_CACHE
             if model_name in _MODEL_CACHE:
-                logger.info(
-                    "[MODEL_SERVICE] [MODEL_CACHE_HIT] name=%s — in-process cache hit",
-                    model_name,
-                )
+                logger.info("[MODEL_SERVICE] [MODEL_CACHE_HIT] name=%s", model_name)
                 _model = _MODEL_CACHE[model_name]
                 _model_name = model_name
-                _load_state = "loaded"
+                with _lock:
+                    _load_state = "loaded"
                 _load_event.set()
                 _stage("MODEL_READY", t0)
                 return
         except Exception:
             pass
 
-        # ── Silence noisy library loggers ────────────────────────────────────
+        # ── Silence noisy library loggers ──
         logging.getLogger("huggingface_hub").setLevel(logging.ERROR)
         logging.getLogger("transformers").setLevel(logging.ERROR)
         logging.getLogger("sentence_transformers").setLevel(logging.WARNING)
 
-        # ── Phase 3: LOAD_CONFIG — import torch + transformers ──────────────
+        # 4. Load config / imports
         _stage("LOAD_CONFIG", t0)
-
-        def _import_torch_and_transformers():
-            import torch          # noqa: F401
-            import transformers   # noqa: F401
-            return True
-
-        _run_with_timeout(
-            _import_torch_and_transformers,
-            timeout_sec=MODEL_STAGE_TIMEOUT_SECONDS,
-            stage_name="LOAD_CONFIG",
-            model_name=model_name,
-            model_dir=model_dir,
-            missing_files=missing_files,
-        )
+        _import_dependencies_safe()
         _log_torch_diagnostics()
 
-        # ── Phase 3: LOAD_TOKENIZER — import sentence_transformers ──────────
+        # 5. Load tokenizer
         _stage("LOAD_TOKENIZER", t0)
+        from sentence_transformers import SentenceTransformer
 
-        def _import_sentence_transformers():
-            from sentence_transformers import SentenceTransformer  # noqa: F401
-            return True
-
-        _run_with_timeout(
-            _import_sentence_transformers,
-            timeout_sec=MODEL_STAGE_TIMEOUT_SECONDS,
-            stage_name="LOAD_TOKENIZER",
-            model_name=model_name,
-            model_dir=model_dir,
-            missing_files=missing_files,
-        )
-
-        from sentence_transformers import SentenceTransformer  # now definitely imported
-
-        # ── Phase 2 + 3: LOAD_MODEL_WEIGHTS — construct SentenceTransformer ─
-        # local_files_only=True  → never contacts HuggingFace Hub
-        # cache_folder explicit  → loads from the exact Docker-baked path
+        # 6. Load model weights
         _stage("LOAD_MODEL_WEIGHTS", t0)
-
         st_home = os.environ["SENTENCE_TRANSFORMERS_HOME"]
         resolved_path = Path(st_home) / model_name.replace("/", "_")
         print(
             f"[MODEL_SERVICE] Resolved model path: {resolved_path}\n"
             f"[MODEL_SERVICE] cache_folder: {st_home}\n"
-            f"[MODEL_SERVICE] local_files_only: True\n"
             f"[MODEL_SERVICE] device: cpu",
             flush=True,
         )
 
-        def _construct_sentence_transformer():
-            return SentenceTransformer(
-                model_name,
-                cache_folder=st_home,
-                local_files_only=True,
-                device="cpu",
-            )
-
-        loaded = _run_with_timeout(
-            _construct_sentence_transformer,
-            timeout_sec=MODEL_STAGE_TIMEOUT_SECONDS,
-            stage_name="LOAD_MODEL_WEIGHTS",
-            model_name=model_name,
-            model_dir=model_dir,
-            missing_files=missing_files,
+        loaded = SentenceTransformer(
+            model_name,
+            cache_folder=st_home,
+            local_files_only=True,
+            device="cpu",
         )
 
-        # ── Phase 1: discover actual model path from loaded object ───────────
-        # Primary strategy: inspect the loaded model object.
-        # This is O(1) compared to the rglob scan used before construction.
+        # 7. Discover path from object & log modules
         t_discover = time.time()
         obj_path, obj_source = _discover_model_path_from_object(loaded)
         t_discover_elapsed = time.time() - t_discover
-
         if obj_path is not None:
-            print(
-                f"[MODEL_PATH_DISCOVERED] resolved_model_dir={obj_path} "
-                f"source={obj_source}",
-                flush=True,
-            )
-            logger.info(
-                "[MODEL_PATH_DISCOVERED] resolved_model_dir=%s source=%s",
-                obj_path, obj_source,
-            )
-        else:
-            print(
-                f"[MODEL_PATH_DISCOVERED] source=none "
-                f"(object introspection returned no path — rglob was used pre-construction)",
-                flush=True,
-            )
+            print(f"[MODEL_PATH_DISCOVERED] resolved_model_dir={obj_path} source={obj_source}", flush=True)
 
-        print(
-            f"[CACHE_DISCOVERY_PERF] strategy=direct_object_introspection "
-            f"elapsed={t_discover_elapsed:.3f}s source={obj_source}",
-            flush=True,
-        )
-        logger.info(
-            "[CACHE_DISCOVERY_PERF] strategy=direct_object_introspection "
-            "elapsed=%.3fs source=%s",
-            t_discover_elapsed, obj_source,
-        )
-
-        # SentenceTransformer() has completed — all sub-stages (tokenizer,
-        # weights, pooling) happened inside _construct_sentence_transformer().
-        # Log the post-construction stages now to confirm each completed.
-        _stage("BUILD_MODULES", t0)       # transformer layers built ✓
-        _stage("INITIALIZE_POOLING", t0)  # pooling layer ready ✓
+        _stage("BUILD_MODULES", t0)
+        _stage("INITIALIZE_POOLING", t0)
         dim = loaded.get_sentence_embedding_dimension()
 
         elapsed = time.time() - t0
         rss_post = _rss_mb()
-        logger.info(
-            "[MODEL_SERVICE] [MODEL_LOAD_COMPLETE] model=%s elapsed=%.1fs "
-            "embedding_dim=%d RSS=%.1fMB",
-            model_name, elapsed, dim, rss_post,
-        )
         print(
             f"[MODEL_SERVICE] [MODEL_LOAD_COMPLETE] model={model_name} "
             f"elapsed={elapsed:.1f}s embedding_dim={dim} RSS={rss_post:.1f}MB",
             flush=True,
         )
 
-        # ── gc.collect() to release init-time temporaries ───────────────────
-        rss_pre_gc = rss_post
+        # gc.collect to free any load-time temporaries
         gc.collect()
-        rss_post_gc = _rss_mb()
-        logger.info(
-            "[MODEL_SERVICE] [GC_RESULT] freed=%.1fMB rss_after=%.1fMB",
-            rss_pre_gc - rss_post_gc, rss_post_gc,
-        )
 
-        # ── Back-fill in-process cache ──────────────────────────────────────
+        # 8. Cache & Commit singleton
         try:
             from src.features.embedding import _MODEL_CACHE as _MC
             _MC[model_name] = loaded
         except Exception:
             pass
 
-        # ── Commit singleton ────────────────────────────────────────────────
         _model = loaded
         _model_name = model_name
-        _load_state = "loaded"
+        with _lock:
+            _load_state = "loaded"
 
-        # ── Phase 3: MODEL_READY ────────────────────────────────────────────
         _stage("MODEL_READY", t0)
-        logger.info(
-            "[MODEL_SERVICE] [MODEL_SINGLETON_CREATED] id=%d name=%s",
-            id(loaded), model_name,
-        )
-        print(
-            f"[MODEL_SERVICE] [MODEL_SINGLETON_CREATED] id={id(loaded)} "
-            f"name={model_name}",
-            flush=True,
-        )
+        print(f"[MODEL_SERVICE] [MODEL_SINGLETON_CREATED] name={model_name}", flush=True)
 
     except Exception as exc:
-        import traceback as _tb
-        tb = _tb.format_exc()
+        import traceback
+        tb = traceback.format_exc()
         logger.error(
-            "[MODEL_SERVICE] [MODEL_LOAD_FAILED] model=%s stage=%s "
-            "error=%s\n%s",
+            "[MODEL_SERVICE] [MODEL_LOAD_FAILED] model=%s stage=%s error=%s\n%s",
             model_name, _current_stage, exc, tb,
         )
-        _load_error = exc
-        _load_state = "failed"
-
+        with _lock:
+            _load_error = exc
+            _load_state = "failed"
     finally:
         _load_event.set()
 
@@ -764,14 +528,11 @@ def _do_load(model_name: str) -> None:
 # ---------------------------------------------------------------------------
 
 def preload(model_name: Optional[str] = None) -> bool:
-    """Compatibility shim — kept for tests/manual triggers. Returns True if load started."""
+    """Kicks off background model preload (lifespan startup context)."""
     global _load_state
     target = model_name or _get_model_name()
     with _lock:
         if _load_state in ("loaded", "loading"):
-            logger.info(
-                "[MODEL_SERVICE] preload() skipped — state=%s", _load_state
-            )
             return False
         _load_state = "loading"
         _load_event.clear()
@@ -782,74 +543,63 @@ def preload(model_name: Optional[str] = None) -> bool:
 
 def get_model(timeout: float = MODEL_LOAD_TIMEOUT_SECONDS):
     """
-    Return the loaded SentenceTransformer.
-
-    - state=loaded  → return instantly (fast path)
-    - state=unloaded → trigger lazy load, then wait
-    - state=loading  → wait on same _load_event
-    - state=failed   → raise ModelLoadFailed immediately
-
-    Raises ModelLoadTimeout if load doesn't complete within timeout.
-    Raises ModelLoadFailed  if load raised an exception.
+    Returns the loaded SentenceTransformer.
+    Loads directly in the calling thread if currently unloaded to prevent deadlock.
     """
-    global _load_state, _load_error
+    global _load_state, _load_error, _model
 
     target = _get_model_name()
+    trigger_direct_load = False
 
     with _lock:
         if _load_state == "loaded" and _model is not None:
-            logger.debug(
-                "[MODEL_SERVICE] [MODEL_REUSED] id=%d name=%s", id(_model), _model_name
-            )
             return _model
 
         if _load_state == "failed":
-            raise ModelLoadFailed(
-                f"Model '{target}' failed to load: {_load_error}"
-            ) from _load_error
+            raise ModelLoadFailed(f"Model '{target}' failed: {_load_error}") from _load_error
 
         if _load_state == "unloaded":
             _load_state = "loading"
             _load_event.clear()
-            logger.info(
-                "[MODEL_SERVICE] [LAZY_LOAD_TRIGGERED] model=%s pid=%d",
-                target, os.getpid(),
-            )
-            print(
-                f"[MODEL_SERVICE] [LAZY_LOAD_TRIGGERED] model={target}",
-                flush=True,
-            )
-            t = threading.Thread(
-                target=_do_load, args=(target,), name="model-lazy-load", daemon=True
-            )
-            t.start()
+            trigger_direct_load = True
 
-    # Wait with heartbeat logs every 5 s
-    waited = 0.0
-    heartbeat = 5.0
-    while waited < timeout:
-        chunk = min(heartbeat, timeout - waited)
-        if _load_event.wait(timeout=chunk):
-            break
-        waited += chunk
+    if trigger_direct_load:
         logger.info(
-            "[MODEL_SERVICE] [WAIT] waited=%.0fs/%.0fs stage=%s RSS=%.1fMB",
-            waited, timeout, _current_stage, _rss_mb(),
+            "[MODEL_SERVICE] [LAZY_LOAD_TRIGGERED] model=%s pid=%d (loading directly in calling thread)",
+            target, os.getpid(),
         )
+        print(
+            f"[MODEL_SERVICE] [LAZY_LOAD_TRIGGERED] model={target} (direct load)",
+            flush=True,
+        )
+        # Import the heavy packages in the calling thread BEFORE performing construction
+        _import_dependencies_safe()
+        
+        # Load the model directly in the calling thread (avoiding thread join timeouts)
+        _do_load(target)
 
-    if not _load_event.is_set():
-        exc = ModelLoadTimeout(
-            f"Model '{target}' did not finish loading within {timeout}s. "
-            f"Last stage: {_current_stage}. Check logs for DOCKER_CACHE_INVALID."
-        )
-        with _lock:
-            _load_error = exc
-            _load_state = "failed"
-        logger.error(
-            "[MODEL_SERVICE] [MODEL_LOAD_TIMEOUT] model=%s timeout=%ds stage=%s",
-            target, int(timeout), _current_stage,
-        )
-        raise exc
+    # Wait if it was loading concurrently (e.g. from background preloader)
+    if _load_state == "loading":
+        waited = 0.0
+        heartbeat = 5.0
+        while waited < timeout:
+            chunk = min(heartbeat, timeout - waited)
+            if _load_event.wait(timeout=chunk):
+                break
+            waited += chunk
+            logger.info(
+                "[MODEL_SERVICE] [WAIT] waited=%.0fs/%.0fs stage=%s RSS=%.1fMB",
+                waited, timeout, _current_stage, _rss_mb(),
+            )
+
+        if not _load_event.is_set():
+            exc = ModelLoadTimeout(
+                f"Model '{target}' did not finish loading within {timeout}s. Last stage: {_current_stage}."
+            )
+            with _lock:
+                _load_error = exc
+                _load_state = "failed"
+            raise exc
 
     with _lock:
         state   = _load_state
@@ -857,9 +607,7 @@ def get_model(timeout: float = MODEL_LOAD_TIMEOUT_SECONDS):
         current = _model
 
     if state == "failed":
-        raise ModelLoadFailed(
-            f"Model '{target}' failed: {error}"
-        ) from error
+        raise ModelLoadFailed(f"Model '{target}' failed: {error}") from error
     if current is None:
         raise ModelLoadFailed(f"Model '{target}' returned None after load")
 
@@ -883,7 +631,7 @@ def get_load_error() -> Optional[Exception]:
 
 
 def reset() -> None:
-    """For tests only. Unloads model and resets all state."""
+    """For tests only. Unloads model and resets state."""
     global _model, _model_name, _load_state, _load_error, _current_stage
     with _lock:
         _model = None
@@ -899,4 +647,3 @@ def reset() -> None:
         pass
     gc.collect()
     logger.info("[MODEL_SERVICE] reset() — model unloaded.")
-

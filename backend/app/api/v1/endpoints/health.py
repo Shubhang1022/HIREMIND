@@ -53,32 +53,22 @@ async def health_check() -> Dict[str, Any]:
         system_status = "unhealthy"
 
     # 4. Libraries checks
-    faiss_ok = False
-    try:
-        import faiss
-        faiss_ok = True
-    except ImportError:
+    import importlib.util
+
+    faiss_ok = importlib.util.find_spec("faiss") is not None
+    if not faiss_ok:
         system_status = "unhealthy"
 
-    torch_ok = False
-    try:
-        import torch
-        torch_ok = True
-    except ImportError:
+    torch_ok = importlib.util.find_spec("torch") is not None
+    if not torch_ok:
         system_status = "unhealthy"
 
-    transformers_ok = False
-    try:
-        import transformers
-        transformers_ok = True
-    except ImportError:
+    transformers_ok = importlib.util.find_spec("transformers") is not None
+    if not transformers_ok:
         system_status = "unhealthy"
 
-    sentence_transformers_ok = False
-    try:
-        import sentence_transformers
-        sentence_transformers_ok = True
-    except ImportError:
+    sentence_transformers_ok = importlib.util.find_spec("sentence_transformers") is not None
+    if not sentence_transformers_ok:
         system_status = "unhealthy"
 
     # 5. OpenRouter key verification

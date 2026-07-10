@@ -26,11 +26,4 @@ reportlab==4.1.0
 # ── Observability ─────────────────────────────────────────────────────────────
 psutil==5.9.8
 
-# ── Legacy SQLAlchemy stack ────────────────────────────────────────────────────
-# NOTE: The backend uses Supabase exclusively. These packages are kept because
-# config.py still declares a `database_url` field that references asyncpg in its
-# default value string. Remove them only after removing `database_url` from config.py.
-# They are NOT imported or used anywhere in the backend application code.
-sqlalchemy==2.0.36
-asyncpg==0.30.0
-alembic==1.14.0
+
