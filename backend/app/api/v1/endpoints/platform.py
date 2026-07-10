@@ -444,7 +444,18 @@ async def _delayed_resume_indexing(project_id: str, user_id: str, delay_seconds:
         else:
             loop.run_until_complete(coro)
 
-        _safe_background_task("auto_resume_indexing", process_project_data_task, project_id)
+        async def _run_in_thread():
+            try:
+                await _asyncio.to_thread(
+                    _safe_background_task,
+                    "auto_resume_indexing",
+                    process_project_data_task,
+                    project_id,
+                )
+            except Exception as e:
+                logger.error("Background task wrapper failed: %s", e)
+
+        _asyncio.create_task(_run_in_thread())
         logger.info("[RESUME_INDEXING] Auto-resume kicked off for project=%s", project_id)
     except Exception as exc:
         logger.error("[RESUME_INDEXING] Auto-resume failed for project=%s: %s", project_id, exc)
@@ -462,32 +473,43 @@ def _get_encoder():
 
     Raises ModelLoadTimeout / ModelLoadFailed on failure — never hangs forever.
     """
+    logger.info("[ENTER get_encoder()]")
+    print("[ENTER get_encoder()]", flush=True)
     global _encoder
-    from app.services.model_service import get_model, is_loaded, ModelLoadTimeout, ModelLoadFailed
+    try:
+        from app.services.model_service import get_model, is_loaded, ModelLoadTimeout, ModelLoadFailed
 
-    # Fast path: return cached wrapper if already resolved
-    if _encoder is not None:
-        # Verify the underlying model is still the same
+        # Fast path: return cached wrapper if already resolved
+        if _encoder is not None:
+            # Verify the underlying model is still the same
+            from app.core.config import settings as _settings
+            if _encoder.model_name == _settings.embedding_model and _encoder._model is not None:
+                logger.info("[EXIT get_encoder()] (fast path)")
+                print("[EXIT get_encoder()] (fast path)", flush=True)
+                return _encoder
+
+        # Get (or wait for) the singleton model
+        raw_model = get_model()  # raises on timeout/failure; never returns None
+
+        # Wrap in EmbeddingEncoder so encode_batch / encode_single / embedding_dim work
+        import sys, os as _os
+        _project_root = _os.path.dirname(_os.path.dirname(_os.path.dirname(
+            _os.path.dirname(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))))))
+        if _project_root not in sys.path:
+            sys.path.insert(0, _project_root)
+
         from app.core.config import settings as _settings
-        if _encoder.model_name == _settings.embedding_model and _encoder._model is not None:
-            return _encoder
-
-    # Get (or wait for) the singleton model
-    raw_model = get_model()  # raises on timeout/failure; never returns None
-
-    # Wrap in EmbeddingEncoder so encode_batch / encode_single / embedding_dim work
-    import sys, os as _os
-    _project_root = _os.path.dirname(_os.path.dirname(_os.path.dirname(
-        _os.path.dirname(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))))))
-    if _project_root not in sys.path:
-        sys.path.insert(0, _project_root)
-
-    from app.core.config import settings as _settings
-    from src.features.embedding import EmbeddingEncoder
-    enc = EmbeddingEncoder(model_name=_settings.embedding_model)
-    enc._model = raw_model  # inject the already-loaded model — no download
-    _encoder = enc
-    return _encoder
+        from src.features.embedding import EmbeddingEncoder
+        enc = EmbeddingEncoder(model_name=_settings.embedding_model)
+        enc._model = raw_model  # inject the already-loaded model — no download
+        _encoder = enc
+        logger.info("[EXIT get_encoder()] (full path)")
+        print("[EXIT get_encoder()] (full path)", flush=True)
+        return _encoder
+    except Exception as e:
+        logger.error("[EXIT get_encoder()] (exception: %s)", e)
+        print(f"[EXIT get_encoder()] (exception: {e})", flush=True)
+        raise
 
 
 def preload_model_singleton() -> None:

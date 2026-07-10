@@ -12,6 +12,11 @@ import traceback
 from contextlib import asynccontextmanager
 from datetime import datetime
 
+# Setup path to import from project root 'src'
+_project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+if _project_root not in sys.path:
+    sys.path.insert(0, _project_root)
+
 import psutil
 
 from fastapi import FastAPI, Request
@@ -518,6 +523,9 @@ async def lifespan(app: FastAPI):
         _loop = asyncio.get_event_loop()
         _loop.set_exception_handler(_asyncio_exception_handler)
         logger.info("[WORKER_STARTED] pid=%d loop=%s", os.getpid(), _loop)
+
+        from app.services import model_service
+        model_service.set_main_loop(_loop)
     except Exception as exc:
         logger.warning("[WORKER_STARTED] Could not install asyncio exception handler: %s", exc)
 

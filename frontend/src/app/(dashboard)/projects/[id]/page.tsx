@@ -146,7 +146,8 @@ export default function ProjectDetailPage() {
 
   // SSE progress listener (Phase 11)
   useEffect(() => {
-    if (!project || (project.embedding_status !== 'queued' && project.embedding_status !== 'processing')) {
+    const activeStatuses = ['queued', 'processing', 'embedding', 'indexing'];
+    if (!project || !activeStatuses.includes(project.embedding_status ?? '')) {
       setWorkerStatus(null);
       return;
     }
@@ -228,9 +229,44 @@ export default function ProjectDetailPage() {
   const handleCandidateUpload = async (files: File[]) => {
     for (const file of files) {
       await platformApi.upload(projectId, file, 'candidates');
-      toast.success(`${file.name} uploaded successfully`);
+      // Upload accepted — indexing runs in the background.
+      // Do NOT show "success" here; the file is queued for indexing, not complete.
+      toast.info(`${file.name} accepted — indexing started. Analysis will be available once indexing completes.`);
     }
+    // Reload so embedding_status is refreshed and SSE listener activates
     await load();
+  };
+
+  const [retrying, setRetrying] = useState(false);
+
+  const handleRetryIndexing = async () => {
+    setRetrying(true);
+    try {
+      const authHeaders = await (async () => {
+        if (typeof window === 'undefined') return {};
+        const { createClient } = await import('@/lib/supabase/client');
+        const supabase = createClient();
+        const { data: { session } } = await supabase.auth.getSession();
+        if (session?.access_token) return { Authorization: `Bearer ${session.access_token}` };
+        return {};
+      })();
+      const baseUrl = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000';
+      const cleanBase = baseUrl.replace(/\/api\/v1\/?$/, '').replace(/\/$/, '');
+      const res = await fetch(`${cleanBase}/api/v1/platform/projects/${projectId}/retry-indexing`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...authHeaders as HeadersInit },
+      });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({ detail: res.statusText }));
+        throw new Error((err.detail as any)?.message || err.detail || 'Retry failed');
+      }
+      toast.info('Indexing restarted — no re-upload needed. Monitoring progress...');
+      await load();
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : 'Failed to retry indexing');
+    } finally {
+      setRetrying(false);
+    }
   };
 
   const handleJobUpload = async (files: File[]) => {
@@ -689,7 +725,63 @@ export default function ProjectDetailPage() {
             </CardHeader>
             <CardContent className="space-y-4">
               <FileUploadZone onUpload={handleCandidateUpload} uploadType="candidates" />
-              {project.candidate_count > 0 && (
+
+              {/* Indexing in-progress banner */}
+              {project.candidate_count > 0 && ['queued', 'processing', 'embedding', 'indexing'].includes(project.embedding_status ?? '') && (
+                <div className="p-4 rounded-xl border border-amber-500/25 bg-amber-950/20">
+                  <div className="flex items-start gap-3">
+                    <Loader2 className="w-5 h-5 text-amber-400 animate-spin shrink-0 mt-0.5" />
+                    <div className="flex-1 min-w-0">
+                      <p className="text-sm font-semibold text-amber-300">
+                        Indexing in progress — {workerStatus?.current_stage || project.embedding_status}
+                      </p>
+                      <p className="text-xs text-amber-300/70 mt-0.5">
+                        Analysis will be enabled automatically once indexing completes.
+                      </p>
+                      {workerStatus && (
+                        <div className="mt-2 space-y-1.5">
+                          <div className="w-full bg-zinc-800 rounded-full h-1.5 overflow-hidden">
+                            <div
+                              className="bg-amber-500 h-1.5 rounded-full transition-all duration-500"
+                              style={{ width: `${workerStatus.progress_percentage || 0}%` }}
+                            />
+                          </div>
+                          <p className="text-[10px] text-muted-foreground">
+                            {workerStatus.progress_percentage || 0}% — {workerStatus.processed_candidates || 0}/{workerStatus.total_candidates || 0} candidates
+                          </p>
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              {/* Indexing failed banner with retry button */}
+              {project.embedding_status === 'failed' && project.candidate_count > 0 && (
+                <div className="p-4 rounded-xl border border-red-500/25 bg-red-950/20">
+                  <div className="flex items-start gap-3">
+                    <AlertTriangle className="w-5 h-5 text-red-400 shrink-0 mt-0.5" />
+                    <div className="flex-1 min-w-0">
+                      <p className="text-sm font-semibold text-red-300">Indexing failed</p>
+                      <p className="text-xs text-red-300/70 mt-0.5">
+                        Your file is still stored. Click Retry Indexing — no re-upload needed.
+                      </p>
+                      <Button
+                        onClick={handleRetryIndexing}
+                        disabled={retrying}
+                        size="sm"
+                        className="mt-3 bg-red-700 hover:bg-red-600 text-white border-0"
+                      >
+                        {retrying
+                          ? <><Loader2 className="w-3.5 h-3.5 mr-2 animate-spin" />Retrying...</>
+                          : '↺ Retry Indexing — No Re-upload Needed'}
+                      </Button>
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              {project.candidate_count > 0 && project.embedding_status === 'completed' && (
                 <div className="pt-2">
                   <div className="flex items-center gap-3 p-4 rounded-xl bg-green-500/5 border border-green-500/20 mb-4">
                     <CheckCircle2 className="w-5 h-5 text-green-400 shrink-0" />
@@ -750,7 +842,7 @@ export default function ProjectDetailPage() {
                   </div>
                 </div>
 
-                {project?.embedding_status && project.embedding_status !== 'ready' && project.embedding_status !== 'completed' && (
+                    {project?.embedding_status && project.embedding_status !== 'ready' && project.embedding_status !== 'completed' && (
                   <div className={`p-4 rounded-xl border text-left text-sm ${
                     project.embedding_status === 'failed' 
                       ? 'border-red-500/25 bg-red-950/20 text-red-300'
@@ -765,14 +857,28 @@ export default function ProjectDetailPage() {
                       <div className="w-full">
                         <p className="font-semibold text-xs uppercase tracking-wider">
                           {project.embedding_status === 'failed'
-                            ? 'Embedding Generation Failed'
+                            ? 'Indexing Failed'
                             : `Generating Candidate Embeddings (${workerStatus?.current_stage || project.embedding_status})`}
                         </p>
                         <p className="text-xs opacity-80 mt-1">
                           {project.embedding_status === 'failed'
-                            ? 'Indexing failed. Please re-upload candidate files to retry.'
-                            : 'Embeddings are generating in the background. Please wait until indexing completes to run analysis.'}
+                            ? 'Indexing failed. Your candidate file is still stored — click Retry Indexing to restart without re-uploading.'
+                            : 'Embeddings are generating in the background. Analysis will be enabled automatically once indexing completes.'}
                         </p>
+
+                        {/* Retry button for failed state */}
+                        {project.embedding_status === 'failed' && (
+                          <Button
+                            onClick={handleRetryIndexing}
+                            disabled={retrying}
+                            size="sm"
+                            className="mt-3 bg-red-700 hover:bg-red-600 text-white border-0"
+                          >
+                            {retrying
+                              ? <><Loader2 className="w-3.5 h-3.5 mr-2 animate-spin" />Retrying...</>
+                              : '↺ Retry Indexing — No Re-upload Needed'}
+                          </Button>
+                        )}
                         
                         {project.embedding_status !== 'failed' && workerStatus && (
                           <div className="mt-3 space-y-2 w-full">

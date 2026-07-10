@@ -1,20 +1,11 @@
 """
 ModelService — process-wide embedding model singleton.
-
-All 9 phases implemented:
-  Phase 1  — Docker cache verification (every required file checked)
-  Phase 2  — Network disabled: local_files_only=True + cache_folder explicit
-  Phase 3  — Per-stage instrumentation (START_LOAD → MODEL_READY)
-  Phase 4  — HF offline env vars set before any import
-  Phase 5  — Thread limits set before any ML import
-  Phase 6  — Outer load timeout wrapper (no nested deadlocking thread timers)
-  Phase 7  — Docker cache validation at startup, DOCKER_CACHE_INVALID on failure
-  Phase 8  — No from_pretrained / hf_hub_download / snapshot_download calls
-  Phase 9  — Reports: ModelLoadingAudit.md, CacheAudit.md, StartupTimeline.md
+Instrumented with strict concurrency logging.
 """
 
 from __future__ import annotations
 
+import asyncio
 import gc
 import logging
 import os
@@ -26,7 +17,6 @@ from typing import Optional
 logger = logging.getLogger(__name__)
 
 # Outer caller timeout: how long get_model() will wait for the full load.
-# Default: 120 s — matches previous behaviour, enough for disk-cached load (~15 s).
 MODEL_LOAD_TIMEOUT_SECONDS = int(os.environ.get("MODEL_LOAD_TIMEOUT", "120"))
 
 _DEFAULT_MODEL = "BAAI/bge-small-en-v1.5"
@@ -41,16 +31,90 @@ class ModelLoadFailed(RuntimeError):
 
 
 # ---------------------------------------------------------------------------
+# Concurrency Instrumentation Helpers
+# ---------------------------------------------------------------------------
+
+class InstrumentedLock:
+    def __init__(self, name: str):
+        self._real_lock = threading.Lock()
+        self._name = name
+
+    def acquire(self, blocking: bool = True, timeout: float = -1) -> bool:
+        tid = threading.get_ident()
+        tname = threading.current_thread().name
+        print(f"[LOCK_ACQUIRE] lock={self._name} thread={tname} (tid={tid})", flush=True)
+        logger.info(f"[LOCK_ACQUIRE] lock={self._name} thread={tname} (tid={tid})")
+        res = self._real_lock.acquire(blocking=blocking, timeout=timeout)
+        if res:
+            print(f"[LOCK_ACQUIRED] lock={self._name} thread={tname} (tid={tid})", flush=True)
+            logger.info(f"[LOCK_ACQUIRED] lock={self._name} thread={tname} (tid={tid})")
+        return res
+
+    def release(self) -> None:
+        tid = threading.get_ident()
+        tname = threading.current_thread().name
+        print(f"[LOCK_RELEASE] lock={self._name} thread={tname} (tid={tid})", flush=True)
+        logger.info(f"[LOCK_RELEASE] lock={self._name} thread={tname} (tid={tid})")
+        self._real_lock.release()
+
+    def __enter__(self):
+        self.acquire()
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.release()
+
+
+class InstrumentedEvent:
+    def __init__(self, name: str):
+        self._real_event = threading.Event()
+        self._name = name
+
+    def is_set(self) -> bool:
+        return self._real_event.is_set()
+
+    def set(self) -> None:
+        tid = threading.get_ident()
+        tname = threading.current_thread().name
+        print(f"[EVENT_SET] event={self._name} thread={tname} (tid={tid})", flush=True)
+        logger.info(f"[EVENT_SET] event={self._name} thread={tname} (tid={tid})")
+        self._real_event.set()
+
+    def clear(self) -> None:
+        tid = threading.get_ident()
+        tname = threading.current_thread().name
+        print(f"[EVENT_CLEAR] event={self._name} thread={tname} (tid={tid})", flush=True)
+        logger.info(f"[EVENT_CLEAR] event={self._name} thread={tname} (tid={tid})")
+        self._real_event.clear()
+
+    def wait(self, timeout: Optional[float] = None) -> bool:
+        tid = threading.get_ident()
+        tname = threading.current_thread().name
+        print(f"[EVENT_WAIT_START] event={self._name} timeout={timeout} thread={tname} (tid={tid})", flush=True)
+        logger.info(f"[EVENT_WAIT_START] event={self._name} timeout={timeout} thread={tname} (tid={tid})")
+        res = self._real_event.wait(timeout=timeout)
+        print(f"[EVENT_WAIT_END] event={self._name} result={res} thread={tname} (tid={tid})", flush=True)
+        logger.info(f"[EVENT_WAIT_END] event={self._name} result={res} thread={tname} (tid={tid})")
+        return res
+
+
+# ---------------------------------------------------------------------------
 # Module-level state
 # ---------------------------------------------------------------------------
-_lock = threading.Lock()
-_load_event = threading.Event()
+_lock = InstrumentedLock("state_lock")
+_load_event = InstrumentedEvent("load_event")
 
 _model = None
 _model_name: Optional[str] = None
 _load_state: str = "unloaded"       # "unloaded"|"loading"|"loaded"|"failed"
 _load_error: Optional[Exception] = None
 _current_stage: str = "idle"        # tracks which stage is active for timeout logging
+_main_loop: Optional[asyncio.AbstractEventLoop] = None
+
+
+def set_main_loop(loop: asyncio.AbstractEventLoop) -> None:
+    global _main_loop
+    _main_loop = loop
 
 
 # ---------------------------------------------------------------------------
@@ -132,7 +196,7 @@ def _set_offline_mode() -> None:
         "[MODEL_SERVICE] Offline mode: HF_HUB_OFFLINE=1 "
         "TRANSFORMERS_OFFLINE=1 HF_DATASETS_OFFLINE=1"
     )
-    print("[MODEL_SERVICE] HF offline mode ENABLED — no network requests permitted", flush=True)
+    print("[MODEL_SERVICE] HF offline mode ENABLED - no network requests permitted", flush=True)
 
 
 def _set_env_limits() -> None:
@@ -249,99 +313,105 @@ def verify_docker_cache(model_name: str) -> tuple[bool, list[str], Path]:
     """
     Phase 1 + 7: Verify the Docker-baked model cache is complete.
     """
-    t_verify_start = time.time()
-    cache_root = Path(
-        os.environ.get("SENTENCE_TRANSFORMERS_HOME", "/app/.cache/sentence-transformers")
-    )
-    conventional_dir = cache_root / model_name.replace("/", "_")
+    print("[ENTER verify_cache()]", flush=True)
+    logger.info("[ENTER verify_cache()]")
+    try:
+        t_verify_start = time.time()
+        cache_root = Path(
+            os.environ.get("SENTENCE_TRANSFORMERS_HOME", "/app/.cache/sentence-transformers")
+        )
+        conventional_dir = cache_root / model_name.replace("/", "_")
 
-    # ── Print env context ────────────────────────────────────────────────────
-    print(
-        f"\n[MODEL_CACHE_VERIFY] ─────────────────────────────────────────\n"
-        f"  HF_HOME                   : {os.environ.get('HF_HOME')}\n"
-        f"  TRANSFORMERS_CACHE        : {os.environ.get('TRANSFORMERS_CACHE')}\n"
-        f"  SENTENCE_TRANSFORMERS_HOME: {os.environ.get('SENTENCE_TRANSFORMERS_HOME')}\n"
-        f"  model_name                : {model_name}\n"
-        f"  cache_root                : {cache_root}\n"
-        f"  cache_root_exists         : {cache_root.is_dir()}\n"
-        f"  conventional_dir          : {conventional_dir}\n"
-        f"  conventional_dir_exists   : {conventional_dir.is_dir()}\n"
-        f"[MODEL_CACHE_VERIFY] ─────────────────────────────────────────\n",
-        flush=True,
-    )
-
-    if not cache_root.is_dir():
-        missing = [f"cache_root {cache_root} (directory missing)"]
-        _log_cache_invalid(model_name, conventional_dir, missing)
-        return False, missing, conventional_dir
-
-    t_direct_start = time.time()
-    strategy = "direct"
-    resolved_dir: Optional[Path] = None
-    weight_files: list[Path] = []
-
-    if conventional_dir.is_dir():
-        ok_dir, wf, total_bytes = _verify_model_dir(conventional_dir)
-        if ok_dir:
-            resolved_dir = conventional_dir
-            weight_files = wf
-    
-    t_direct_elapsed = time.time() - t_direct_start
-
-    if resolved_dir is None:
-        strategy = "rglob"
+        # -- Print env context ----------------------------------------------------
         print(
-            f"[MODEL_PATH_DISCOVERY_FAILED] conventional_dir={conventional_dir} "
-            f"— falling_back_to_recursive_scan=True",
+            f"\n[MODEL_CACHE_VERIFY] -----------------------------------------\n"
+            f"  HF_HOME                   : {os.environ.get('HF_HOME')}\n"
+            f"  TRANSFORMERS_CACHE        : {os.environ.get('TRANSFORMERS_CACHE')}\n"
+            f"  SENTENCE_TRANSFORMERS_HOME: {os.environ.get('SENTENCE_TRANSFORMERS_HOME')}\n"
+            f"  model_name                : {model_name}\n"
+            f"  cache_root                : {cache_root}\n"
+            f"  cache_root_exists         : {cache_root.is_dir()}\n"
+            f"  conventional_dir          : {conventional_dir}\n"
+            f"  conventional_dir_exists   : {conventional_dir.is_dir()}\n"
+            f"[MODEL_CACHE_VERIFY] -----------------------------------------\n",
             flush=True,
         )
-        t_rglob_start = time.time()
-        weight_files = _find_weight_files(cache_root)
-        t_rglob_elapsed = time.time() - t_rglob_start
 
-        if weight_files:
-            resolved_dir = weight_files[0].parent
-            _, _, total_bytes = _verify_model_dir(resolved_dir)
+        if not cache_root.is_dir():
+            missing = [f"cache_root {cache_root} (directory missing)"]
+            _log_cache_invalid(model_name, conventional_dir, missing)
+            return False, missing, conventional_dir
+
+        t_direct_start = time.time()
+        strategy = "direct"
+        resolved_dir: Optional[Path] = None
+        weight_files: list[Path] = []
+
+        if conventional_dir.is_dir():
+            ok_dir, wf, total_bytes = _verify_model_dir(conventional_dir)
+            if ok_dir:
+                resolved_dir = conventional_dir
+                weight_files = wf
+        
+        t_direct_elapsed = time.time() - t_direct_start
+
+        if resolved_dir is None:
+            strategy = "rglob"
+            print(
+                f"[MODEL_PATH_DISCOVERY_FAILED] conventional_dir={conventional_dir} "
+                f"- falling_back_to_recursive_scan=True",
+                flush=True,
+            )
+            t_rglob_start = time.time()
+            weight_files = _find_weight_files(cache_root)
+            t_rglob_elapsed = time.time() - t_rglob_start
+
+            if weight_files:
+                resolved_dir = weight_files[0].parent
+                _, _, total_bytes = _verify_model_dir(resolved_dir)
+            else:
+                total_bytes = 0
+
+            print(
+                f"[CACHE_DISCOVERY_PERF] strategy=rglob elapsed={t_rglob_elapsed:.3f}s "
+                f"weight_files_found={len(weight_files)}",
+                flush=True,
+            )
         else:
-            total_bytes = 0
+            print(
+                f"[CACHE_DISCOVERY_PERF] strategy=direct elapsed={t_direct_elapsed:.3f}s "
+                f"weight_files_found={len(weight_files)}",
+                flush=True,
+            )
+
+        if not weight_files:
+            top_level = sorted(p.name for p in cache_root.iterdir()) if cache_root.is_dir() else []
+            missing = [
+                f"no weight file (model.safetensors / pytorch_model.bin) found "
+                f"anywhere under {cache_root}. cache_root_contents={top_level}"
+            ]
+            _log_cache_invalid(model_name, conventional_dir, missing)
+            return False, missing, conventional_dir
+
+        t_total = time.time() - t_verify_start
+        weight_size_mb = sum(w.stat().st_size for w in weight_files) / 1024 / 1024
+        top_level = sorted(p.name for p in cache_root.iterdir())
 
         print(
-            f"[CACHE_DISCOVERY_PERF] strategy=rglob elapsed={t_rglob_elapsed:.3f}s "
-            f"weight_files_found={len(weight_files)}",
+            f"[MODEL_CACHE_VERIFY] CACHE_OK\n"
+            f"  strategy           : {strategy}\n"
+            f"  resolved_model_dir : {resolved_dir}\n"
+            f"  weight_files       : {[str(w) for w in weight_files]}\n"
+            f"  weight_size        : {weight_size_mb:.1f} MB\n"
+            f"  total_size         : {total_bytes / 1024 / 1024:.1f} MB\n"
+            f"  cache_root_contents: {top_level}\n"
+            f"  verification_time  : {t_total:.3f}s\n",
             flush=True,
         )
-    else:
-        print(
-            f"[CACHE_DISCOVERY_PERF] strategy=direct elapsed={t_direct_elapsed:.3f}s "
-            f"weight_files_found={len(weight_files)}",
-            flush=True,
-        )
-
-    if not weight_files:
-        top_level = sorted(p.name for p in cache_root.iterdir()) if cache_root.is_dir() else []
-        missing = [
-            f"no weight file (model.safetensors / pytorch_model.bin) found "
-            f"anywhere under {cache_root}. cache_root_contents={top_level}"
-        ]
-        _log_cache_invalid(model_name, conventional_dir, missing)
-        return False, missing, conventional_dir
-
-    t_total = time.time() - t_verify_start
-    weight_size_mb = sum(w.stat().st_size for w in weight_files) / 1024 / 1024
-    top_level = sorted(p.name for p in cache_root.iterdir())
-
-    print(
-        f"[MODEL_CACHE_VERIFY] CACHE_OK\n"
-        f"  strategy           : {strategy}\n"
-        f"  resolved_model_dir : {resolved_dir}\n"
-        f"  weight_files       : {[str(w) for w in weight_files]}\n"
-        f"  weight_size        : {weight_size_mb:.1f} MB\n"
-        f"  total_size         : {total_bytes / 1024 / 1024:.1f} MB\n"
-        f"  cache_root_contents: {top_level}\n"
-        f"  verification_time  : {t_total:.3f}s\n",
-        flush=True,
-    )
-    return True, [], resolved_dir  # type: ignore[return-value]
+        return True, [], resolved_dir  # type: ignore[return-value]
+    finally:
+        print("[EXIT verify_cache()]", flush=True)
+        logger.info("[EXIT verify_cache()]")
 
 
 def _log_cache_invalid(model_name: str, model_dir: Path, missing: list[str]) -> None:
@@ -382,10 +452,34 @@ def _log_torch_diagnostics() -> None:
 
 
 def _import_dependencies_safe() -> None:
-    """Import torch, transformers, and sentence_transformers safely in the calling thread."""
+    """Import torch, transformers, and sentence_transformers safely.
+    Delegates to the main thread's event loop to prevent OpenMP/PyTorch background thread deadlocks.
+    """
     import sys
     if "torch" in sys.modules and "transformers" in sys.modules and "sentence_transformers" in sys.modules:
         return
+
+    # Delegate imports to the main thread event loop if we are in a background thread
+    if _main_loop is not None:
+        try:
+            if threading.current_thread() is not threading.main_thread():
+                logger.info("[DELEGATE_IMPORT] delegating library imports to main thread event loop")
+                print("[DELEGATE_IMPORT] delegating library imports to main thread event loop", flush=True)
+                
+                async def _coro_import():
+                    import torch          # noqa: F401
+                    import transformers   # noqa: F401
+                    from sentence_transformers import SentenceTransformer  # noqa: F401
+                
+                future = asyncio.run_coroutine_threadsafe(_coro_import(), _main_loop)
+                future.result()  # block background thread until main thread completes imports
+                logger.info("[DELEGATE_IMPORT] main thread completed imports successfully")
+                print("[DELEGATE_IMPORT] main thread completed imports successfully", flush=True)
+                return
+        except Exception as e:
+            logger.warning("[DELEGATE_IMPORT_FAILED] falling back to local thread import: %s", e)
+            print(f"[DELEGATE_IMPORT_FAILED] falling back to local thread import: {e}", flush=True)
+
     import torch          # noqa: F401
     import transformers   # noqa: F401
     from sentence_transformers import SentenceTransformer  # noqa: F401
@@ -400,6 +494,8 @@ def _do_load(model_name: str) -> None:
     Loads the model through all phases. Executed either directly in the
     calling thread (lazy load path) or in a preload thread (lifespan path).
     """
+    print("[ENTER _do_load()]", flush=True)
+    logger.info("[ENTER _do_load()]")
     global _model, _model_name, _load_state, _load_error, _current_stage
 
     t0 = time.time()
@@ -521,6 +617,8 @@ def _do_load(model_name: str) -> None:
             _load_state = "failed"
     finally:
         _load_event.set()
+        print("[EXIT _do_load()]", flush=True)
+        logger.info("[EXIT _do_load()]")
 
 
 # ---------------------------------------------------------------------------
@@ -647,3 +745,9 @@ def reset() -> None:
         pass
     gc.collect()
     logger.info("[MODEL_SERVICE] reset() — model unloaded.")
+
+
+# Configure offline mode and thread limits at module import time
+_set_env_limits()
+_set_offline_mode()
+_set_hf_cache()
