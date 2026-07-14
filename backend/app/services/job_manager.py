@@ -18,16 +18,44 @@ logger = logging.getLogger(__name__)
 supabase_client = create_supabase_client(settings.supabase_url, settings.supabase_service_key)
 
 # Finite State Machine Allowed Transitions
+# Permissive to support recovery checkpoints and stage skips
 VALID_TRANSITIONS = {
-    "queued": {"processing", "failed", "cancelled"},
-    "processing": {"embedding", "failed", "cancelled"},
-    "embedding": {"indexing", "failed", "cancelled"},
+    "queued": {"processing", "embedding", "indexing", "completed", "failed", "cancelled"},
+    "processing": {"embedding", "indexing", "completed", "failed", "cancelled"},
+    "embedding": {"indexing", "completed", "failed", "cancelled"},
     "indexing": {"completed", "failed", "cancelled"},
-    "failed": {"retrying", "queued"},
-    "retrying": {"processing", "failed", "cancelled"},
+    "failed": {"retrying", "queued", "processing", "embedding", "indexing", "completed"},
+    "retrying": {"processing", "embedding", "indexing", "completed", "failed", "cancelled"},
     "completed": set(),
     "cancelled": set()
 }
+
+
+def safe_execute(query_builder, max_retries: int = 3, initial_delay: float = 0.5):
+    """Executes a Supabase query builder with retry backoff.
+    Logs HTTP status and response body on failure.
+    """
+    import time
+    delay = initial_delay
+    for attempt in range(1, max_retries + 1):
+        try:
+            res = query_builder.execute()
+            return res
+        except Exception as exc:
+            status_code = getattr(exc, "status", None) or getattr(exc, "code", "unknown")
+            message = getattr(exc, "message", str(exc))
+            logger.warning(
+                "[DB_OPERATION_RETRY] Attempt %d/%d failed: status=%s, error=%s. Retrying in %.2fs...",
+                attempt, max_retries, status_code, message, delay
+            )
+            if attempt == max_retries:
+                logger.error(
+                    "[DB_OPERATION_FATAL] All %d attempts failed. Last error: status=%s, message=%s",
+                    max_retries, status_code, message
+                )
+                raise exc
+            time.sleep(delay)
+            delay *= 2
 
 class JobManager:
     _instance: Optional["JobManager"] = None
@@ -192,8 +220,22 @@ class JobManager:
         current_status = cache["status"]
         target_status = status or current_status
         
-        if not self.validate_transition(current_status, target_status):
-            logger.error("Illegal job status transition from %s to %s for project %s rejected", current_status, target_status, project_id)
+        transition_accepted = self.validate_transition(current_status, target_status)
+        logger.info(
+            "[FSM_TRANSITION_CHECK] project=%s current_db_status=%s requested_transition=%s -> %s accepted=%s",
+            project_id, current_status, current_status, target_status, transition_accepted
+        )
+        print(
+            f"[FSM_TRANSITION_CHECK] project={project_id} current_db_status={current_status} "
+            f"requested_transition={current_status} -> {target_status} accepted={transition_accepted}",
+            flush=True
+        )
+
+        if not transition_accepted:
+            logger.error(
+                "Illegal job status transition from %s to %s for project %s rejected",
+                current_status, target_status, project_id
+            )
             return
 
         # RAM calculations
@@ -229,9 +271,24 @@ class JobManager:
             db_updates["retry_count"] = retry_count
 
         try:
-            supabase_client.table("background_jobs").update(db_updates).eq("project_id", project_id).eq("status", current_status).execute()
+            builder = supabase_client.table("background_jobs").update(db_updates).eq("project_id", project_id).eq("status", current_status)
+            res = safe_execute(builder)
+            
+            # Log PATCH response and Final DB status
+            db_data = res.data if hasattr(res, "data") else None
+            final_status = db_data[0].get("status") if db_data else target_status
+            logger.info(
+                "[DB_PATCH_APPLIED] project=%s status_before=%s status_after=%s patch_response=%s",
+                project_id, current_status, final_status, db_data
+            )
+            print(
+                f"[DB_PATCH_APPLIED] project={project_id} status_before={current_status} "
+                f"status_after={final_status} patch_response={db_data}",
+                flush=True
+            )
         except Exception as exc:
             logger.error("Supabase job update failed: %s", exc)
+            raise exc
 
     async def fail_job(self, project_id: str, reason: str):
         """Mark job as failed in memory and DB."""
@@ -253,7 +310,8 @@ class JobManager:
             "updated_at": datetime.now(timezone.utc).isoformat()
         }
         try:
-            supabase_client.table("background_jobs").update(db_updates).eq("project_id", project_id).execute()
+            builder = supabase_client.table("background_jobs").update(db_updates).eq("project_id", project_id)
+            safe_execute(builder)
         except Exception as exc:
             logger.error("Supabase job fail persistence failed: %s", exc)
 
@@ -280,7 +338,8 @@ class JobManager:
             "updated_at": datetime.now(timezone.utc).isoformat()
         }
         try:
-            supabase_client.table("background_jobs").update(db_updates).eq("project_id", project_id).execute()
+            builder = supabase_client.table("background_jobs").update(db_updates).eq("project_id", project_id)
+            safe_execute(builder)
         except Exception as exc:
             logger.error("Supabase job cancel persistence failed: %s", exc)
 
@@ -368,16 +427,20 @@ class JobManager:
                         "[RECOVERY] Permanently failing job %s for project %s: %s",
                         job["id"], project_id, reason,
                     )
-                    supabase_client.table("background_jobs").update({
+                    b_job_builder = supabase_client.table("background_jobs").update({
                         "status": "failed",
                         "failure_reason": reason,
                         "updated_at": datetime.now(timezone.utc).isoformat(),
-                    }).eq("id", job["id"]).execute()
-                    supabase_client.table("projects").update({
+                    }).eq("id", job["id"])
+                    safe_execute(b_job_builder)
+
+                    project_builder = supabase_client.table("projects").update({
                         "embedding_status": "failed",
                         "status": "failed",
                         "updated_at": datetime.now(timezone.utc).isoformat(),
-                    }).eq("id", project_id).execute()
+                    }).eq("id", project_id)
+                    safe_execute(project_builder)
+                    
                     permanent_failures += 1
                     continue
 
@@ -387,12 +450,14 @@ class JobManager:
                     "[RECOVERY] Scheduling retry %d/3 for job %s project %s in %ds",
                     new_retry, job["id"], project_id, delay,
                 )
-                supabase_client.table("background_jobs").update({
+                
+                b_job_builder = supabase_client.table("background_jobs").update({
                     "status": "retrying",
                     "retry_count": new_retry,
                     "current_stage": f"Recovering (attempt {new_retry}/3, backoff {delay}s)",
                     "updated_at": datetime.now(timezone.utc).isoformat(),
-                }).eq("id", job["id"]).execute()
+                }).eq("id", job["id"])
+                safe_execute(b_job_builder)
 
                 asyncio.create_task(self._safely_run_indexing_with_backoff(project_id, delay))
                 recovered += 1

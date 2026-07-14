@@ -1265,11 +1265,14 @@ Elapsed: {elapsed_str}
                 _sync_update_progress(project_id, "Starting Indexing", 5,
                                       status=_target_status, retry_count=attempt - 1)
 
-                supabase_client.table("projects").update({
-                    "embedding_status": "processing",
-                    "status": "INDEXING",
-                    "updated_at": _now()
-                }).eq("id", project_id).execute()
+                from app.services.job_manager import safe_execute
+                safe_execute(
+                    supabase_client.table("projects").update({
+                        "embedding_status": "processing",
+                        "status": "INDEXING",
+                        "updated_at": _now()
+                    }).eq("id", project_id)
+                )
 
                 proj_res = supabase_client.table("projects").select("*").eq("id", project_id).execute()
                 if not proj_res.data:
@@ -1382,10 +1385,13 @@ Elapsed: {elapsed_str}
                 _sync_update_progress(project_id, "Generating Embeddings", 20,
                                       status="embedding", retry_count=attempt - 1)
 
-                supabase_client.table("projects").update({
-                    "status": "stream parsed",
-                    "updated_at": _now()
-                }).eq("id", project_id).execute()
+                from app.services.job_manager import safe_execute
+                safe_execute(
+                    supabase_client.table("projects").update({
+                        "status": "stream parsed",
+                        "updated_at": _now()
+                    }).eq("id", project_id)
+                )
 
                 logger.info("Enriched %d candidates. Starting index uploads.", total_candidates)
 
@@ -1471,12 +1477,15 @@ Elapsed: {elapsed_str}
                         from app.services.model_service import ModelLoadTimeout, ModelLoadFailed
                         if isinstance(stage_exc, (ModelLoadTimeout, ModelLoadFailed)):
                             _sync_fail_job(project_id, f"MODEL_LOAD_FAILED: {stage_exc}")
-                            supabase_client.table("projects").update({
-                                "embedding_status": "failed",
-                                "status": "FAILED",
-                                "upload_statistics": {"failure_reason": f"MODEL_LOAD_FAILED: {stage_exc}"},
-                                "updated_at": _now(),
-                            }).eq("id", project_id).execute()
+                            from app.services.job_manager import safe_execute
+                            safe_execute(
+                                supabase_client.table("projects").update({
+                                    "embedding_status": "failed",
+                                    "status": "FAILED",
+                                    "upload_statistics": {"failure_reason": f"MODEL_LOAD_FAILED: {stage_exc}"},
+                                    "updated_at": _now(),
+                                }).eq("id", project_id)
+                            )
                             from app.services.job_manager import JobManager as _JM
                             _c = _JM.get_instance()._progress_cache.get(project_id)
                             if _c:
@@ -1715,10 +1724,13 @@ Elapsed: {elapsed_str}
                 _sync_update_progress(project_id, "Building FAISS Index", 85, status="indexing", retry_count=attempt - 1)
 
                 # Transition status to embeddings generated (Phase 4)
-                supabase_client.table("projects").update({
-                    "status": "embeddings generated",
-                    "updated_at": _now()
-                }).eq("id", project_id).execute()
+                from app.services.job_manager import safe_execute
+                safe_execute(
+                    supabase_client.table("projects").update({
+                        "status": "embeddings generated",
+                        "updated_at": _now()
+                    }).eq("id", project_id)
+                )
 
                 # ── STAGE: Write .npy file ─────────────────────────────────
                 t_stage = time.time()
@@ -1774,10 +1786,13 @@ Elapsed: {elapsed_str}
                     raise
 
                 # Transition status to FAISS built (Phase 4)
-                supabase_client.table("projects").update({
-                    "status": "FAISS built",
-                    "updated_at": _now()
-                }).eq("id", project_id).execute()
+                from app.services.job_manager import safe_execute
+                safe_execute(
+                    supabase_client.table("projects").update({
+                        "status": "FAISS built",
+                        "updated_at": _now()
+                    }).eq("id", project_id)
+                )
 
                 _sync_update_progress(project_id, "Uploading Indexes", 90, status="indexing", retry_count=attempt - 1)
 
@@ -1848,7 +1863,8 @@ Elapsed: {elapsed_str}
                 t_stage = time.time()
                 logger.info("[STAGE_START] project=%s stage=mark_completed ram=%.1fMB", project_id, get_memory_mb())
                 try:
-                    supabase_client.table("projects").update({
+                    from app.services.job_manager import safe_execute
+                    proj_update = supabase_client.table("projects").update({
                         "embedding_status": "completed",
                         "status": "completed",
                         "embeddings_path": f"embeddings/{project_id}/embeddings_v{version}.npy",
@@ -1856,13 +1872,37 @@ Elapsed: {elapsed_str}
                         "role_index_path": f"role-indexes/{project_id}/role_index_v{version}.json",
                         "skill_index_path": f"skill-indexes/{project_id}/skill_index_v{version}.json",
                         "updated_at": _now()
-                    }).eq("id", project_id).execute()
+                    }).eq("id", project_id)
+                    safe_execute(proj_update)
+                    
                     logger.info("[STAGE_PROGRESS] project=%s stage=mark_completed projects_table_updated", project_id)
 
                     _sync_update_progress(project_id, "Completed", 100, status="completed",
                                           processed_candidates=total_candidates,
                                           total_candidates=total_candidates,
                                           retry_count=attempt - 1)
+                    
+                    # Fetch final statuses for required final prints
+                    final_proj = safe_execute(supabase_client.table("projects").select("status, embedding_status").eq("id", project_id)).data
+                    final_job = safe_execute(supabase_client.table("background_jobs").select("status").eq("project_id", project_id).order("started_at", desc=True).limit(1)).data
+                    
+                    proj_status = final_proj[0].get("status") if final_proj else "unknown"
+                    emb_status = final_proj[0].get("embedding_status") if final_proj else "unknown"
+                    bg_status = final_job[0].get("status") if final_job else "unknown"
+                    ready_analysis = "true" if emb_status in ["ready", "completed"] else "false"
+                    
+                    print(
+                        f"INDEXING PIPELINE COMPLETE\n"
+                        f"DB status = {bg_status}\n"
+                        f"Project status = {proj_status}\n"
+                        f"Background job status = {bg_status}\n"
+                        f"Ready for analysis = {ready_analysis}",
+                        flush=True
+                    )
+                    logger.info(
+                        "INDEXING PIPELINE COMPLETE: project=%s project_status=%s emb_status=%s bg_status=%s ready=%s",
+                        project_id, proj_status, emb_status, bg_status, ready_analysis
+                    )
                     logger.info("[STAGE_END] project=%s stage=mark_completed elapsed=%.2fs", project_id, time.time() - t_stage)
                 except Exception as stage_exc:
                     logger.exception("[STAGE_FAIL] project=%s stage=mark_completed elapsed=%.2fs error=%s",
@@ -1908,12 +1948,15 @@ Elapsed: {elapsed_str}
                     logger.error("[BACKGROUND_TASK_FINAL_FAIL] project=%s marking failed in DB", project_id)
                     _sync_fail_job(project_id, str(e))
 
-                    supabase_client.table("projects").update({
-                        "embedding_status": "failed",
-                        "status": "FAILED",
-                        "upload_statistics": {"failure_reason": f"Background indexing failed: {e}"},
-                        "updated_at": _now()
-                    }).eq("id", project_id).execute()
+                    from app.services.job_manager import safe_execute
+                    safe_execute(
+                        supabase_client.table("projects").update({
+                            "embedding_status": "failed",
+                            "status": "FAILED",
+                            "upload_statistics": {"failure_reason": f"Background indexing failed: {e}"},
+                            "updated_at": _now()
+                        }).eq("id", project_id)
+                    )
 
     finally:
         from app.services.cache_service import CacheService

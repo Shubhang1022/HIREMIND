@@ -110,6 +110,7 @@ _load_state: str = "unloaded"       # "unloaded"|"loading"|"loaded"|"failed"
 _load_error: Optional[Exception] = None
 _current_stage: str = "idle"        # tracks which stage is active for timeout logging
 _main_loop: Optional[asyncio.AbstractEventLoop] = None
+_loading: bool = False
 
 
 def set_main_loop(loop: asyncio.AbstractEventLoop) -> None:
@@ -494,11 +495,17 @@ def _do_load(model_name: str) -> None:
     Loads the model through all phases. Executed either directly in the
     calling thread (lazy load path) or in a preload thread (lifespan path).
     """
-    print("[ENTER _do_load()]", flush=True)
-    logger.info("[ENTER _do_load()]")
-    global _model, _model_name, _load_state, _load_error, _current_stage
+    tname = threading.current_thread().name
+    tid = threading.get_ident()
+    print(f"[CONCURRENCY] thread={tname} (tid={tid}) entering _do_load()", flush=True)
+    logger.info(f"[CONCURRENCY] thread={tname} (tid={tid}) entering _do_load()")
+    global _model, _model_name, _load_state, _load_error, _current_stage, _loading
 
     t0 = time.time()
+
+    with _lock:
+        _loading = True
+        _load_state = "loading"
 
     try:
         # 1. Set thread limits and offline environment settings
@@ -530,7 +537,6 @@ def _do_load(model_name: str) -> None:
                 _model_name = model_name
                 with _lock:
                     _load_state = "loaded"
-                _load_event.set()
                 _stage("MODEL_READY", t0)
                 return
         except Exception:
@@ -604,6 +610,8 @@ def _do_load(model_name: str) -> None:
 
         _stage("MODEL_READY", t0)
         print(f"[MODEL_SERVICE] [MODEL_SINGLETON_CREATED] name={model_name}", flush=True)
+        print(f"[CONCURRENCY] thread={tname} (tid={tid}) completed _do_load()", flush=True)
+        logger.info(f"[CONCURRENCY] thread={tname} (tid={tid}) completed _do_load()")
 
     except Exception as exc:
         import traceback
@@ -612,10 +620,16 @@ def _do_load(model_name: str) -> None:
             "[MODEL_SERVICE] [MODEL_LOAD_FAILED] model=%s stage=%s error=%s\n%s",
             model_name, _current_stage, exc, tb,
         )
+        print(f"[CONCURRENCY] LOADER_EXCEPTION in thread={tname} (tid={tid}): {exc}", flush=True)
+        logger.error(f"[CONCURRENCY] LOADER_EXCEPTION in thread={tname} (tid={tid}): {exc}")
         with _lock:
             _load_error = exc
             _load_state = "failed"
     finally:
+        print(f"[CONCURRENCY] LOADER_FINALLY in thread={tname} (tid={tid})", flush=True)
+        logger.info(f"[CONCURRENCY] LOADER_FINALLY in thread={tname} (tid={tid})")
+        with _lock:
+            _loading = False
         _load_event.set()
         print("[EXIT _do_load()]", flush=True)
         logger.info("[EXIT _do_load()]")
@@ -627,16 +641,31 @@ def _do_load(model_name: str) -> None:
 
 def preload(model_name: Optional[str] = None) -> bool:
     """Kicks off background model preload (lifespan startup context)."""
-    global _load_state
+    global _load_state, _loading
     target = model_name or _get_model_name()
     with _lock:
-        if _load_state in ("loaded", "loading"):
+        if _load_state in ("loaded", "loading") or _loading:
             return False
         _load_state = "loading"
+        _loading = True
         _load_event.clear()
-    t = threading.Thread(target=_do_load, args=(target,), name="model-preload", daemon=True)
-    t.start()
-    return True
+    
+    tname = "model-preload"
+    try:
+        t = threading.Thread(target=_do_load, args=(target,), name=tname, daemon=True)
+        t.start()
+        print(f"[CONCURRENCY] thread={tname} started background preloading", flush=True)
+        logger.info(f"[CONCURRENCY] thread={tname} started background preloading")
+        return True
+    except Exception as exc:
+        print(f"[CONCURRENCY] LOADER_EXCEPTION failed to start preload thread: {exc}", flush=True)
+        logger.error(f"[CONCURRENCY] LOADER_EXCEPTION failed to start preload thread: {exc}")
+        with _lock:
+            _load_state = "failed"
+            _load_error = exc
+            _loading = False
+        _load_event.set()
+        raise exc
 
 
 def get_model(timeout: float = MODEL_LOAD_TIMEOUT_SECONDS):
@@ -644,10 +673,12 @@ def get_model(timeout: float = MODEL_LOAD_TIMEOUT_SECONDS):
     Returns the loaded SentenceTransformer.
     Loads directly in the calling thread if currently unloaded to prevent deadlock.
     """
-    global _load_state, _load_error, _model
+    global _load_state, _load_error, _model, _loading
 
     target = _get_model_name()
     trigger_direct_load = False
+    tname = threading.current_thread().name
+    tid = threading.get_ident()
 
     with _lock:
         if _load_state == "loaded" and _model is not None:
@@ -656,10 +687,14 @@ def get_model(timeout: float = MODEL_LOAD_TIMEOUT_SECONDS):
         if _load_state == "failed":
             raise ModelLoadFailed(f"Model '{target}' failed: {_load_error}") from _load_error
 
-        if _load_state == "unloaded":
+        # If unloaded, or if failed/idle and not currently loading, we elect this thread as loader
+        if _load_state == "unloaded" or (not _loading and not _load_event.is_set()):
             _load_state = "loading"
+            _loading = True
             _load_event.clear()
             trigger_direct_load = True
+            print(f"[CONCURRENCY] thread={tname} (tid={tid}) elected as loader", flush=True)
+            logger.info(f"[CONCURRENCY] thread={tname} (tid={tid}) elected as loader")
 
     if trigger_direct_load:
         logger.info(
@@ -670,14 +705,13 @@ def get_model(timeout: float = MODEL_LOAD_TIMEOUT_SECONDS):
             f"[MODEL_SERVICE] [LAZY_LOAD_TRIGGERED] model={target} (direct load)",
             flush=True,
         )
-        # Import the heavy packages in the calling thread BEFORE performing construction
-        _import_dependencies_safe()
-        
-        # Load the model directly in the calling thread (avoiding thread join timeouts)
         _do_load(target)
+    else:
+        print(f"[CONCURRENCY] thread={tname} (tid={tid}) waiting for loader", flush=True)
+        logger.info(f"[CONCURRENCY] thread={tname} (tid={tid}) waiting for loader")
 
     # Wait if it was loading concurrently (e.g. from background preloader)
-    if _load_state == "loading":
+    if _load_state == "loading" or _loading:
         waited = 0.0
         heartbeat = 5.0
         while waited < timeout:
@@ -697,6 +731,8 @@ def get_model(timeout: float = MODEL_LOAD_TIMEOUT_SECONDS):
             with _lock:
                 _load_error = exc
                 _load_state = "failed"
+                _loading = False
+            _load_event.set()
             raise exc
 
     with _lock:
@@ -730,13 +766,14 @@ def get_load_error() -> Optional[Exception]:
 
 def reset() -> None:
     """For tests only. Unloads model and resets state."""
-    global _model, _model_name, _load_state, _load_error, _current_stage
+    global _model, _model_name, _load_state, _load_error, _current_stage, _loading
     with _lock:
         _model = None
         _model_name = None
         _load_state = "unloaded"
         _load_error = None
         _current_stage = "idle"
+        _loading = False
         _load_event.clear()
     try:
         from src.features.embedding import _MODEL_CACHE
