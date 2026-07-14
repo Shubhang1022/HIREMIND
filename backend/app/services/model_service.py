@@ -473,7 +473,7 @@ def _import_dependencies_safe() -> None:
                     from sentence_transformers import SentenceTransformer  # noqa: F401
                 
                 future = asyncio.run_coroutine_threadsafe(_coro_import(), _main_loop)
-                future.result()  # block background thread until main thread completes imports
+                future.result(timeout=5.0)  # block background thread until main thread completes imports, with a 5s timeout fallback
                 logger.info("[DELEGATE_IMPORT] main thread completed imports successfully")
                 print("[DELEGATE_IMPORT] main thread completed imports successfully", flush=True)
                 return

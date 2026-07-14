@@ -6,6 +6,7 @@ import time
 import gc
 import os
 import psutil
+import threading
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
@@ -17,18 +18,20 @@ logger = logging.getLogger(__name__)
 # Initialize client
 supabase_client = create_supabase_client(settings.supabase_url, settings.supabase_service_key)
 
-# Finite State Machine Allowed Transitions
-# Permissive to support recovery checkpoints and stage skips
+_lock = threading.Lock()
+
+# Strict FSM Transitions
 VALID_TRANSITIONS = {
-    "queued": {"processing", "embedding", "indexing", "completed", "failed", "cancelled"},
-    "processing": {"embedding", "indexing", "completed", "failed", "cancelled"},
-    "embedding": {"indexing", "completed", "failed", "cancelled"},
+    "queued": {"processing", "failed", "cancelled"},
+    "processing": {"embedding", "failed", "cancelled"},
+    "embedding": {"indexing", "failed", "cancelled"},
     "indexing": {"completed", "failed", "cancelled"},
-    "failed": {"retrying", "queued", "processing", "embedding", "indexing", "completed"},
-    "retrying": {"processing", "embedding", "indexing", "completed", "failed", "cancelled"},
+    "failed": {"retrying", "queued", "processing"},
+    "retrying": {"processing", "failed", "cancelled"},
     "completed": set(),
     "cancelled": set()
 }
+
 
 
 def safe_execute(query_builder, max_retries: int = 3, initial_delay: float = 0.5):
@@ -66,6 +69,50 @@ class JobManager:
     # Active cancellation request tokens: project_id
     _cancellation_tokens: set[str] = set()
 
+    # Active jobs registry: project_id -> worker state metadata
+    _active_jobs: Dict[str, Dict[str, Any]] = {}
+
+    def is_job_active(self, project_id: str) -> bool:
+        with _lock:
+            self._prune_stale_jobs_under_lock()
+            return project_id in self._active_jobs
+
+    def start_job(self, project_id: str, current_stage: str = "Enqueued") -> bool:
+        with _lock:
+            self._prune_stale_jobs_under_lock()
+            if project_id in self._active_jobs:
+                return False
+            self._active_jobs[project_id] = {
+                "worker_id": f"worker_{os.getpid()}",
+                "thread_id": threading.get_ident(),
+                "started_at": datetime.now(timezone.utc).isoformat(),
+                "heartbeat": time.time(),
+                "current_stage": current_stage
+            }
+            return True
+
+    def update_job_heartbeat(self, project_id: str, current_stage: str):
+        with _lock:
+            if project_id in self._active_jobs:
+                self._active_jobs[project_id]["heartbeat"] = time.time()
+                self._active_jobs[project_id]["current_stage"] = current_stage
+
+    def finish_job(self, project_id: str):
+        with _lock:
+            if project_id in self._active_jobs:
+                del self._active_jobs[project_id]
+
+    def _prune_stale_jobs_under_lock(self):
+        now = time.time()
+        stale_project_ids = []
+        for pid, info in self._active_jobs.items():
+            if now - info["heartbeat"] > 30.0:
+                stale_project_ids.append(pid)
+        for pid in stale_project_ids:
+            logger.warning("[ACTIVE_JOB_REGISTRY] Pruning stale job for project %s (no heartbeat > 30s)", pid)
+            del self._active_jobs[pid]
+
+
     def __new__(cls, *args, **kwargs):
         if not cls._instance:
             cls._instance = super(JobManager, cls).__new__(cls, *args, **kwargs)
@@ -89,9 +136,28 @@ class JobManager:
         allowed = VALID_TRANSITIONS.get(current_status, set())
         valid = target_status in allowed
         if not valid:
-            logger.warning(
-                "[FSM] Rejected illegal transition %s → %s for project (call ignored)",
-                current_status, target_status,
+            import traceback
+            tb_str = "".join(traceback.format_stack())
+            # Find the caller frame outside of job_manager.py
+            frames = traceback.extract_stack()
+            caller_info = "Unknown"
+            for frame in reversed(frames):
+                if "job_manager.py" not in frame.filename:
+                    caller_info = f"{frame.filename}:{frame.lineno} in {frame.name}"
+                    break
+            if caller_info == "Unknown" and len(frames) >= 2:
+                caller_frame = frames[-2]
+                caller_info = f"{caller_frame.filename}:{caller_frame.lineno} in {caller_frame.name}"
+
+            logger.error(
+                "[FSM_TRANSITION_ERROR] Rejected illegal transition %s → %s.\n"
+                "Caller: %s\nStack trace:\n%s",
+                current_status, target_status, caller_info, tb_str
+            )
+            print(
+                f"\n[FSM_TRANSITION_ERROR] Rejected illegal transition {current_status} -> {target_status}.\n"
+                f"Caller: {caller_info}",
+                flush=True
             )
         return valid
 
@@ -142,12 +208,8 @@ class JobManager:
                 project_id,
                 exc,
             )
-            # Do NOT re-raise — the background task must still be allowed to start.
-            # Progress updates will use the in-memory cache only for this session.
 
         # Always populate the in-memory cache regardless of DB outcome.
-        # This ensures progress-stream and worker-status endpoints keep working
-        # even if the DB insert failed.
         self._progress_cache[project_id] = {
             "job_id": job_id,
             "project_id": project_id,
@@ -155,7 +217,7 @@ class JobManager:
             "job_type": job_type,
             "current_stage": "Enqueued",
             "progress_percentage": 0,
-            "started_at": time.time(),
+            "started_at": now_str,
             "updated_at": time.time(),
             "last_heartbeat": time.time(),
             "retry_count": 0,
@@ -165,6 +227,7 @@ class JobManager:
             "ram_usage": 0.0,
             "peak_ram": 0.0,
             "eta": "00:00:00",
+            "speed": 0.0,
         }
 
         if job_id:
@@ -185,7 +248,8 @@ class JobManager:
         processed_candidates: int = 0,
         total_candidates: int = 0,
         eta: str = "",
-        retry_count: Optional[int] = None
+        retry_count: Optional[int] = None,
+        speed: Optional[float] = None
     ):
         """Update job metrics in-memory and persist to Supabase background_jobs table."""
         cache = self._progress_cache.get(project_id)
@@ -201,7 +265,7 @@ class JobManager:
                     "job_type": db_job.get("job_type", "indexing"),
                     "current_stage": db_job.get("current_stage"),
                     "progress_percentage": db_job.get("progress_percentage", 0),
-                    "started_at": time.time(),
+                    "started_at": db_job.get("started_at") or datetime.now(timezone.utc).isoformat(),
                     "updated_at": time.time(),
                     "last_heartbeat": time.time(),
                     "retry_count": db_job.get("retry_count", 0),
@@ -210,7 +274,8 @@ class JobManager:
                     "total_candidates": total_candidates,
                     "ram_usage": 0.0,
                     "peak_ram": 0.0,
-                    "eta": eta
+                    "eta": eta,
+                    "speed": speed or 0.0
                 }
                 cache = self._progress_cache[project_id]
             else:
@@ -233,9 +298,33 @@ class JobManager:
 
         if not transition_accepted:
             logger.error(
-                "Illegal job status transition from %s to %s for project %s rejected",
+                "Illegal job status transition from %s to %s for project %s rejected. Failing job with FSM_TRANSITION_ERROR.",
                 current_status, target_status, project_id
             )
+            # Mark cache as failed with FSM_TRANSITION_ERROR
+            cache["status"] = "failed"
+            cache["failure_reason"] = f"FSM_TRANSITION_ERROR: Illegal transition {current_status} -> {target_status}"
+            cache["updated_at"] = time.time()
+            
+            db_updates = {
+                "status": "failed",
+                "failure_reason": f"FSM_TRANSITION_ERROR: Illegal transition {current_status} -> {target_status}",
+                "updated_at": datetime.now(timezone.utc).isoformat()
+            }
+            try:
+                if cache.get("job_id"):
+                    supabase_client.table("background_jobs").update(db_updates).eq("id", cache["job_id"]).execute()
+                else:
+                    supabase_client.table("background_jobs").update(db_updates).eq("project_id", project_id).execute()
+                
+                # Also fail project status
+                supabase_client.table("projects").update({
+                    "embedding_status": "failed",
+                    "status": "failed",
+                    "updated_at": datetime.now(timezone.utc).isoformat()
+                }).eq("id", project_id).execute()
+            except Exception as e:
+                logger.error("Failed to mark FSM error in DB: %s", e)
             return
 
         # RAM calculations
@@ -254,10 +343,15 @@ class JobManager:
         cache["processed_candidates"] = processed_candidates
         cache["total_candidates"] = total_candidates
         cache["eta"] = eta
+        if speed is not None:
+            cache["speed"] = speed
         cache["updated_at"] = time.time()
         cache["last_heartbeat"] = time.time()
         if retry_count is not None:
             cache["retry_count"] = retry_count
+
+        # Update active job registry heartbeat
+        self.update_job_heartbeat(project_id, stage)
 
         # Persist to database
         db_updates = {
@@ -271,7 +365,11 @@ class JobManager:
             db_updates["retry_count"] = retry_count
 
         try:
-            builder = supabase_client.table("background_jobs").update(db_updates).eq("project_id", project_id).eq("status", current_status)
+            # Update by primary key if available, otherwise project_id
+            if cache.get("job_id"):
+                builder = supabase_client.table("background_jobs").update(db_updates).eq("id", cache["job_id"])
+            else:
+                builder = supabase_client.table("background_jobs").update(db_updates).eq("project_id", project_id)
             res = safe_execute(builder)
             
             # Log PATCH response and Final DB status
@@ -304,13 +402,19 @@ class JobManager:
             cache["failure_reason"] = reason
             cache["updated_at"] = time.time()
 
+        # Remove from active jobs registry
+        self.finish_job(project_id)
+
         db_updates = {
             "status": "failed",
             "failure_reason": reason,
             "updated_at": datetime.now(timezone.utc).isoformat()
         }
         try:
-            builder = supabase_client.table("background_jobs").update(db_updates).eq("project_id", project_id)
+            if cache and cache.get("job_id"):
+                builder = supabase_client.table("background_jobs").update(db_updates).eq("id", cache["job_id"])
+            else:
+                builder = supabase_client.table("background_jobs").update(db_updates).eq("project_id", project_id)
             safe_execute(builder)
         except Exception as exc:
             logger.error("Supabase job fail persistence failed: %s", exc)
@@ -329,8 +433,9 @@ class JobManager:
             cache["current_stage"] = "Cancelled"
             cache["updated_at"] = time.time()
 
-        # Mark cancellation requested in tokens
+        # Mark cancellation requested in tokens and remove from active registry
         self.request_cancellation(project_id)
+        self.finish_job(project_id)
 
         db_updates = {
             "status": "cancelled",
@@ -338,10 +443,14 @@ class JobManager:
             "updated_at": datetime.now(timezone.utc).isoformat()
         }
         try:
-            builder = supabase_client.table("background_jobs").update(db_updates).eq("project_id", project_id)
+            if cache and cache.get("job_id"):
+                builder = supabase_client.table("background_jobs").update(db_updates).eq("id", cache["job_id"])
+            else:
+                builder = supabase_client.table("background_jobs").update(db_updates).eq("project_id", project_id)
             safe_execute(builder)
         except Exception as exc:
             logger.error("Supabase job cancel persistence failed: %s", exc)
+
 
     def request_cancellation(self, project_id: str):
         """Set token requesting candidate indexing worker task cancel."""

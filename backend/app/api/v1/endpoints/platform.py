@@ -833,6 +833,7 @@ def process_candidate_upload_task(
                 "[CANDIDATE_UPLOAD_BACKGROUND] no job_id for project %s — in-memory tracking only",
                 project_id,
             )
+        _sync_update_progress(project_id, "Upload received", 5, status="queued")
 
         _log_upload_memory_spike(baseline_mb, "after_background_job_creation", get_memory_mb())
 
@@ -1237,11 +1238,15 @@ Elapsed: {elapsed_str}
     temp_dir = None
 
     try:
+        from app.services.job_manager import JobManager
+        job_manager = JobManager.get_instance()
+        if not job_manager.start_job(project_id, "Validating candidates"):
+            logger.warning("[BACKGROUND_TASK_IGNORE] Indexing already active for project %s. Ignoring duplicate call.", project_id)
+            return
+
         for attempt in range(1, max_retries + 1):
             try:
                 # Check for cancellation requested (Phase 3)
-                from app.services.job_manager import JobManager
-                job_manager = JobManager.get_instance()
                 if job_manager.is_cancelled(project_id):
                     _sync_update_progress(project_id, "Cancelled", 0, status="cancelled")
                     job_manager.clear_cancellation(project_id)
@@ -1256,14 +1261,18 @@ Elapsed: {elapsed_str}
                         project_id, attempt, last_done,
                     )
 
-                # ── Status transition: never go backwards ──────────────────
-                # On attempt 1: queued→processing.
-                # On retry: stay in embedding/indexing (don't regress to processing).
-                _jm_cache = job_manager.get_job_status(project_id)
-                _current_job_status = _jm_cache.get("status", "queued") if _jm_cache else "queued"
-                _target_status = "processing" if _current_job_status in ("queued", "retrying") else _current_job_status
-                _sync_update_progress(project_id, "Starting Indexing", 5,
-                                      status=_target_status, retry_count=attempt - 1)
+                # ── Catch up FSM states if resuming from checkpoint ──
+                if last_done:
+                    logger.info("[RECOVERY] Catching up FSM states for project %s from checkpoint %s", project_id, last_done)
+                    _sync_update_progress(project_id, "Resuming", 10, status="processing", retry_count=attempt - 1)
+                    
+                    if _stage_already_done(last_done, "upload_indexes"):
+                        _sync_update_progress(project_id, "Resuming", 50, status="embedding", retry_count=attempt - 1)
+                        
+                    if _stage_already_done(last_done, "write_npy"):
+                        _sync_update_progress(project_id, "Resuming", 82, status="indexing", retry_count=attempt - 1)
+                else:
+                    _sync_update_progress(project_id, "Validating candidates", 10, status="processing", retry_count=attempt - 1)
 
                 from app.services.job_manager import safe_execute
                 safe_execute(
@@ -1273,6 +1282,7 @@ Elapsed: {elapsed_str}
                         "updated_at": _now()
                     }).eq("id", project_id)
                 )
+
 
                 proj_res = supabase_client.table("projects").select("*").eq("id", project_id).execute()
                 if not proj_res.data:
@@ -1311,7 +1321,10 @@ Elapsed: {elapsed_str}
                     job_manager.clear_cancellation(project_id)
                     return
 
-                _sync_update_progress(project_id, "Streaming Candidates", 10,
+                _sync_update_progress(project_id, "Streaming candidates", 20,
+                                      status="processing", retry_count=attempt - 1)
+
+                _sync_update_progress(project_id, "Resume standardization", 35,
                                       status="processing", retry_count=attempt - 1)
 
                 with open(enriched_jsonl_path, "w", encoding="utf-8") as f_enriched:
@@ -1448,6 +1461,9 @@ Elapsed: {elapsed_str}
                     _save_checkpoint("upload_indexes")
 
                 # ── STAGE: Load embedding model ────────────────────────────
+                _sync_update_progress(project_id, "Loading embedding model", 50,
+                                      status="embedding", retry_count=attempt - 1)
+
                 if _stage_already_done(last_done, "load_model"):
                     logger.info("[SKIP] project=%s stage=load_model already completed in prior attempt — loading encoder from singleton", project_id)
                     from src.features.text_builder import build_candidate_text
@@ -1569,7 +1585,9 @@ Elapsed: {elapsed_str}
                 _monitor_thread.start()
 
                 try:
-                    _sync_update_progress(project_id, "Generating Embeddings", 25, status="embedding",
+                    t_embeddings_start = time.time()
+                    batch_durations = []
+                    _sync_update_progress(project_id, f"Embedding 0 / {total_candidates}", 50, status="embedding",
                                           processed_candidates=0, total_candidates=total_candidates,
                                           retry_count=attempt - 1)
 
@@ -1631,15 +1649,29 @@ Elapsed: {elapsed_str}
                                         index.add(dummy)
 
                                     global_idx += len(batch_candidates)
-                                    # Progress: 25% → 78% across all batches
-                                    progress_pct = 25 + int(global_idx / max(total_candidates, 1) * 53)
+                                    progress_pct = 50 + int((global_idx / max(total_candidates, 1)) * 32)
+                                    
+                                    # ETA calculation
                                     batch_elapsed = time.time() - t_batch
-                                    speed = len(batch_candidates) / max(batch_elapsed, 0.001)
-                                    stage_label = f"Embedding batch {batch_num}/{total_batches} ({global_idx}/{total_candidates})"
+                                    batch_durations.append(batch_elapsed)
+                                    if len(batch_durations) > 5:
+                                        batch_durations.pop(0)
+                                    avg_batch_time = sum(batch_durations) / len(batch_durations)
+                                    remaining_batches = max(0, total_batches - batch_num)
+                                    eta_seconds = remaining_batches * avg_batch_time
+                                    eta_m = int(eta_seconds // 60)
+                                    eta_s = int(eta_seconds % 60)
+                                    eta_str = f"{eta_m:02d}:{eta_s:02d}"
+                                    
+                                    overall_speed = global_idx / max(time.time() - t_embeddings_start, 0.001)
+                                    stage_label = f"Embedding {global_idx} / {total_candidates}"
+                                    
                                     _sync_update_progress(project_id, stage_label, progress_pct,
                                                           status="embedding",
                                                           processed_candidates=global_idx,
                                                           total_candidates=total_candidates,
+                                                          eta=eta_str,
+                                                          speed=overall_speed,
                                                           retry_count=attempt - 1)
                                     logger.info(
                                         "[EMBEDDING_BATCH] project=%s batch=%d/%d "
@@ -1688,13 +1720,16 @@ Elapsed: {elapsed_str}
                                     index.add(dummy)
 
                                 global_idx += len(batch_candidates)
+                                overall_speed = global_idx / max(time.time() - t_embeddings_start, 0.001)
                                 _sync_update_progress(
                                     project_id,
-                                    f"Embedding batch {batch_num}/{total_batches} ({global_idx}/{total_candidates})",
-                                    78,
+                                    f"Embedding {global_idx} / {total_candidates}",
+                                    82,
                                     status="embedding",
                                     processed_candidates=global_idx,
                                     total_candidates=total_candidates,
+                                    eta="00:00",
+                                    speed=overall_speed,
                                     retry_count=attempt - 1,
                                 )
                                 log_worker_heartbeat("Generating Embeddings", global_idx, total_candidates, batch_num)
@@ -1721,7 +1756,7 @@ Elapsed: {elapsed_str}
                     job_manager.clear_cancellation(project_id)
                     return
 
-                _sync_update_progress(project_id, "Building FAISS Index", 85, status="indexing", retry_count=attempt - 1)
+                _sync_update_progress(project_id, "Building FAISS", 82, status="indexing", retry_count=attempt - 1)
 
                 # Transition status to embeddings generated (Phase 4)
                 from app.services.job_manager import safe_execute
@@ -1794,7 +1829,7 @@ Elapsed: {elapsed_str}
                     }).eq("id", project_id)
                 )
 
-                _sync_update_progress(project_id, "Uploading Indexes", 90, status="indexing", retry_count=attempt - 1)
+                _sync_update_progress(project_id, "Uploading indexes", 92, status="indexing", retry_count=attempt - 1)
 
                 # ── STAGE: Upload artifacts ────────────────────────────────
                 t_stage = time.time()
@@ -1827,6 +1862,8 @@ Elapsed: {elapsed_str}
                             project_id, time.time() - t_stage, get_memory_mb())
 
                 # ── STAGE: Validate artifacts ──────────────────────────────
+                _sync_update_progress(project_id, "Verifying artifacts", 97, status="indexing", retry_count=attempt - 1)
+
                 t_stage = time.time()
                 logger.info("[STAGE_START] project=%s stage=validate_artifacts", project_id)
                 required_artifacts = [
@@ -1877,7 +1914,7 @@ Elapsed: {elapsed_str}
                     
                     logger.info("[STAGE_PROGRESS] project=%s stage=mark_completed projects_table_updated", project_id)
 
-                    _sync_update_progress(project_id, "Completed", 100, status="completed",
+                    _sync_update_progress(project_id, "Ready", 100, status="completed",
                                           processed_candidates=total_candidates,
                                           total_candidates=total_candidates,
                                           retry_count=attempt - 1)
@@ -1959,6 +1996,11 @@ Elapsed: {elapsed_str}
                     )
 
     finally:
+        try:
+            from app.services.job_manager import JobManager
+            JobManager.get_instance().finish_job(project_id)
+        except Exception:
+            pass
         from app.services.cache_service import CacheService
         CacheService.invalidate_project(project_id)
         
@@ -2076,6 +2118,87 @@ def _sync_fail_job(project_id: str, reason: str):
             pass
     else:
         loop.run_until_complete(coro)
+
+@router.get("/diagnostics")
+async def get_diagnostics(current_user: Optional[AuthUser] = Depends(get_optional_user)):
+    """Exposes deep health diagnostics of the ML environment, active jobs registry, and connectivity."""
+    import psutil
+    import os
+    import gc
+    from app.services.model_service import is_loaded, get_model_name
+    from app.services.job_manager import JobManager
+    
+    # 1. Model status
+    model_loaded = is_loaded()
+    model_name = get_model_name() or settings.embedding_model
+    
+    # 2. System Usage
+    proc = psutil.Process(os.getpid())
+    rss_mb = proc.memory_info().rss / (1024 * 1024)
+    cpu_pct = proc.cpu_percent(interval=0.1)
+    threads_count = proc.num_threads()
+    
+    # 3. Active jobs registry
+    job_manager = JobManager.get_instance()
+    # Probe to trigger active jobs pruning
+    job_manager.is_job_active("_non_existent_probe_")
+    active_jobs = dict(job_manager._active_jobs)  # clone active jobs
+    active_jobs_count = len(active_jobs)
+    
+    # 4. Queue length
+    queue_len = 0
+    try:
+        res = supabase_client.table("background_jobs").select("id", count="exact").eq("status", "queued").execute()
+        queue_len = res.count if hasattr(res, "count") else len(res.data)
+    except Exception:
+        pass
+        
+    # 5. Connectivity checks
+    supabase_ok = False
+    try:
+        supabase_client.table("projects").select("id").limit(1).execute()
+        supabase_ok = True
+    except Exception:
+        pass
+        
+    storage_ok = False
+    try:
+        from app.services.storage_provider import StorageService
+        StorageService.file_exists("candidate-files", "_startup_probe")
+        storage_ok = True
+    except Exception:
+        pass
+        
+    faiss_ok = False
+    try:
+        import faiss
+        faiss_ok = True
+    except Exception:
+        pass
+        
+    return {
+        "model_loaded": model_loaded,
+        "embedding_model": model_name,
+        "system": {
+            "memory_usage_mb": round(rss_mb, 1),
+            "cpu_usage_percent": cpu_pct,
+            "thread_count": threads_count,
+            "pid": os.getpid()
+        },
+        "worker": {
+            "active_jobs_count": active_jobs_count,
+            "active_jobs": active_jobs,
+            "queue_length": queue_len
+        },
+        "connectivity": {
+            "supabase_db": supabase_ok,
+            "supabase_storage": storage_ok
+        },
+        "ml_libraries": {
+            "faiss_available": faiss_ok
+        }
+    }
+
 
 # Watchdog run — marks jobs whose heartbeat is older than 2 minutes as failed
 def _run_worker_watchdog():
@@ -2361,6 +2484,8 @@ async def retry_indexing(
             job_id = None
     else:
         job_id = loop.run_until_complete(coro)
+
+    _sync_update_progress(project_id, "Upload received", 5, status="queued")
 
     # Kick off fresh indexing in background — reuses current_candidate_path from DB
     background_tasks.add_task(

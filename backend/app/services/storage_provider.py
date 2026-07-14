@@ -3,12 +3,17 @@ import shutil
 import io
 import json
 import re
+import logging
+import time
 from unittest.mock import patch
 from typing import Generator, Optional
 from pathlib import Path
 import httpx
 from supabase import create_client, Client
 from app.core.config import settings
+
+logger = logging.getLogger(__name__)
+
 
 def create_supabase_client(url: str, key: str) -> Client:
     original_match = re.match
@@ -115,72 +120,160 @@ class SupabaseStorageProvider(StorageProvider):
         self.key = settings.supabase_service_key or "sb_secret_FDTVjRiSs3kuGwlKoWtctQ_CFBm_MBV"
         self.client: Client = create_supabase_client(self.url, self.key)
 
+    def _safe_storage_operation(self, operation_name: str, fn, *args, **kwargs):
+        max_retries = 3
+        backoff = 1.0
+        
+        for attempt in range(1, max_retries + 1):
+            t_start = time.time()
+            http_status = None
+            response_body = None
+            
+            # Recreate Supabase client before the final attempt
+            if attempt == max_retries:
+                logger.info("[STORAGE_RETRY] Recreating Supabase client for %s before final attempt", operation_name)
+                try:
+                    self.client = create_supabase_client(self.url, self.key)
+                except Exception as client_exc:
+                    logger.error("Failed to recreate Supabase client: %s", client_exc)
+            
+            try:
+                res = fn(*args, **kwargs)
+                elapsed = time.time() - t_start
+                logger.info(
+                    "[STORAGE_OP_SUCCESS] op=%s attempt=%d elapsed=%.3fs",
+                    operation_name, attempt, elapsed
+                )
+                return res
+            except Exception as exc:
+                elapsed = time.time() - t_start
+                is_transient = False
+                
+                # Check for socket/network errors
+                if isinstance(exc, (BrokenPipeError, ConnectionResetError, TimeoutError, httpx.NetworkError, httpx.TimeoutException)):
+                    is_transient = True
+                
+                # Try to extract HTTP status code
+                status_code = getattr(exc, "status_code", None)
+                if status_code is None:
+                    msg = str(exc)
+                    m = re.search(r"status\s*=\s*(\d+)", msg, re.IGNORECASE)
+                    if m:
+                        status_code = int(m.group(1))
+                        
+                if status_code is not None:
+                    http_status = status_code
+                    if status_code in (429, 500, 502, 503, 504):
+                        is_transient = True
+                    elif status_code in (401, 403, 404):
+                        is_transient = False
+                else:
+                    if isinstance(exc, UnboundLocalError):
+                        is_transient = True
+                        
+                response_body = getattr(exc, "message", str(exc))
+                
+                logger.warning(
+                    "[STORAGE_OP_FAIL] op=%s attempt=%d/%d status=%s elapsed=%.3fs error=%s body=%s",
+                    operation_name, attempt, max_retries, http_status, elapsed, type(exc).__name__, response_body
+                )
+                
+                if not is_transient or attempt == max_retries:
+                    if isinstance(exc, UnboundLocalError):
+                        raise RuntimeError(f"Supabase storage operation '{operation_name}' failed: network / Broken Pipe connection failure") from exc
+                    raise exc
+                
+                time.sleep(backoff)
+                backoff *= 2.0
+
     def upload_file(self, bucket_id: str, path: str, content: bytes) -> str:
-        # Check if file exists, if so update it, otherwise upload it
-        try:
-            # We use supabase client storage API
-            res = self.client.storage.from_(bucket_id).upload(
-                path=path,
-                file=content,
-                file_options={"cache-control": "3600", "upsert": "true"}
-            )
-        except Exception:
-            # Try updating if already exists
-            res = self.client.storage.from_(bucket_id).update(
-                path=path,
-                file=content,
-                file_options={"cache-control": "3600", "upsert": "true"}
-            )
+        def _op():
+            try:
+                return self.client.storage.from_(bucket_id).upload(
+                    path=path,
+                    file=content,
+                    file_options={"cache-control": "3600", "upsert": "true"}
+                )
+            except Exception:
+                return self.client.storage.from_(bucket_id).update(
+                    path=path,
+                    file=content,
+                    file_options={"cache-control": "3600", "upsert": "true"}
+                )
+        self._safe_storage_operation(f"upload:{bucket_id}/{path}", _op)
         return f"{bucket_id}/{path}"
 
     def download_file(self, bucket_id: str, path: str) -> bytes:
         try:
-            return self.client.storage.from_(bucket_id).download(path)
+            return self._safe_storage_operation(
+                f"download:{bucket_id}/{path}",
+                self.client.storage.from_(bucket_id).download,
+                path
+            )
         except Exception as exc:
             raise FileNotFoundError(f"Error downloading {bucket_id}/{path} from Supabase: {exc}")
 
     def download_stream(self, bucket_id: str, path: str) -> Generator[bytes, None, None]:
-        # Stream chunks directly from Supabase Storage HTTP REST endpoint to maintain O(1) memory
-        # Use /object/{bucket}/{path} with service-key auth (NOT /authenticated/ which requires anon JWT)
         headers = {
             "Authorization": f"Bearer {self.key}",
             "apikey": self.key
         }
         url = f"{self.url}/storage/v1/object/{bucket_id}/{path}"
         
-        with httpx.stream("GET", url, headers=headers) as r:
-            if r.status_code != 200:
-                raise FileNotFoundError(f"File not found in Supabase Storage: {bucket_id}/{path} (status {r.status_code})")
-            for chunk in r.iter_bytes(chunk_size=65536):
-                yield chunk
+        def _get_stream():
+            return httpx.stream("GET", url, headers=headers)
+            
+        try:
+            stream_context = self._safe_storage_operation(
+                f"download_stream:{bucket_id}/{path}",
+                _get_stream
+            )
+            with stream_context as r:
+                if r.status_code != 200:
+                    raise FileNotFoundError(f"File not found in Supabase Storage: {bucket_id}/{path} (status {r.status_code})")
+                for chunk in r.iter_bytes(chunk_size=65536):
+                    yield chunk
+        except Exception as exc:
+            raise FileNotFoundError(f"Error streaming {bucket_id}/{path} from Supabase: {exc}")
 
     def delete_file(self, bucket_id: str, path: str) -> bool:
         try:
-            self.client.storage.from_(bucket_id).remove(path)
+            self._safe_storage_operation(
+                f"delete:{bucket_id}/{path}",
+                self.client.storage.from_(bucket_id).remove,
+                path
+            )
             return True
         except Exception:
             return False
 
     def file_exists(self, bucket_id: str, path: str) -> bool:
         try:
-            # List files in parent directory to check if it exists
             parts = path.split("/")
             parent_dir = "/".join(parts[:-1]) if len(parts) > 1 else ""
             filename = parts[-1]
-            files = self.client.storage.from_(bucket_id).list(parent_dir)
+            files = self._safe_storage_operation(
+                f"list:{bucket_id}/{parent_dir}",
+                self.client.storage.from_(bucket_id).list,
+                parent_dir
+            )
             return any(f.get("name") == filename for f in files)
         except Exception:
             return False
 
     def generate_signed_url(self, bucket_id: str, path: str, expires_in: int = 3600) -> str:
         try:
-            res = self.client.storage.from_(bucket_id).create_signed_url(path, expires_in)
+            res = self._safe_storage_operation(
+                f"signed_url:{bucket_id}/{path}",
+                self.client.storage.from_(bucket_id).create_signed_url,
+                path,
+                expires_in
+            )
             return res.get("signedURL") or res.get("signedUrl") or ""
         except Exception:
             return f"{self.url}/storage/v1/object/authenticated/{bucket_id}/{path}"
 
     def stream_jsonl(self, bucket_id: str, path: str) -> Generator[dict, None, None]:
-        # Read from the downloaded stream line-by-line
         buffer = ""
         try:
             for chunk in self.download_stream(bucket_id, path):
@@ -193,7 +286,6 @@ class SupabaseStorageProvider(StorageProvider):
                             yield json.loads(line)
                         except Exception:
                             continue
-            # Yield any remaining text in buffer
             buffer = buffer.strip()
             if buffer:
                 try:
@@ -202,6 +294,7 @@ class SupabaseStorageProvider(StorageProvider):
                     pass
         except Exception:
             return
+
 
 
 class StorageService:

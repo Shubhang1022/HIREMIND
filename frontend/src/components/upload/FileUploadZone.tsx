@@ -27,7 +27,9 @@ export function FileUploadZone({ onUpload, uploadType = 'candidates', multiple =
     setUploading(true);
     try {
       await onUpload(arr);
-      toast.success(`Uploaded ${arr.length} file(s) successfully`);
+      if (uploadType !== 'candidates') {
+        toast.success(`Uploaded ${arr.length} file(s) successfully`);
+      }
       setFiles([]);
     } catch (err) {
       toast.error(err instanceof Error ? err.message : 'Upload failed');

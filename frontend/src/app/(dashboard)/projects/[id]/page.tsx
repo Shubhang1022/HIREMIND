@@ -380,6 +380,193 @@ export default function ProjectDetailPage() {
   const canRunAnalysis = project.candidate_count > 0 && !!selectedJobId && isEmbeddingReady;
   const selectedJob = jobs.find(j => j.id === selectedJobId);
 
+  const isFailed = project.embedding_status === 'failed' && project.candidate_count > 0;
+  const isIndexing = ['queued', 'processing', 'embedding', 'indexing'].includes(project.embedding_status ?? '') && project.candidate_count > 0;
+
+  if (isIndexing || isFailed) {
+    const progress = workerStatus?.progress_percentage || (isFailed ? 0 : 5);
+    const stage = workerStatus?.current_stage || (isFailed ? 'Failed' : 'Upload received');
+    const processed = workerStatus?.processed_candidates || 0;
+    const total = workerStatus?.total_candidates || project.candidate_count || 0;
+    const elapsed = workerStatus?.elapsed_time || 0;
+    const speed = workerStatus?.speed || 0;
+    const eta = workerStatus?.eta || 'Estimating...';
+    
+    const formatElapsed = (sec: number) => {
+      const m = Math.floor(sec / 60);
+      const s = Math.floor(sec % 60);
+      return `${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`;
+    };
+
+    const baseUrl = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000';
+    const cleanBase = baseUrl.replace(/\/api\/v1\/?$/, '').replace(/\/$/, '');
+
+    return (
+      <div className="p-6 lg:p-8 space-y-6 max-w-4xl mx-auto">
+        <div>
+          <Link href="/projects" className="inline-flex items-center gap-2 text-sm text-muted-foreground hover:text-foreground mb-4 transition-colors">
+            <ArrowLeft className="w-4 h-4" /> Back to Projects
+          </Link>
+          <h1 className="text-3xl font-bold">{project.name}</h1>
+          <p className="text-muted-foreground mt-1">Candidate Ingestion & Indexing Pipeline</p>
+        </div>
+
+        {isIndexing ? (
+          <Card className="border-indigo-500/20 bg-zinc-950/40 shadow-xl overflow-hidden relative">
+            <div className="absolute top-0 left-0 w-full h-[3px] bg-zinc-800">
+              <div 
+                className="h-full bg-gradient-to-r from-indigo-500 via-purple-500 to-pink-500 transition-all duration-500 shadow-[0_0_8px_rgba(99,102,241,0.5)]"
+                style={{ width: `${progress}%` }}
+              />
+            </div>
+            <CardHeader className="pt-8 pb-6">
+              <div className="flex items-center justify-between">
+                <div>
+                  <CardTitle className="text-xl flex items-center gap-2 text-white font-bold">
+                    <Loader2 className="w-5 h-5 text-indigo-400 animate-spin" />
+                    Preparing Candidate Index
+                  </CardTitle>
+                  <CardDescription className="text-white/60 mt-1">
+                    Please do not close this window. Embeddings are generating in the background.
+                  </CardDescription>
+                </div>
+                <span className="text-3xl font-black bg-gradient-to-r from-indigo-400 to-purple-400 bg-clip-text text-transparent">
+                  {progress}%
+                </span>
+              </div>
+            </CardHeader>
+            <CardContent className="space-y-6 pb-8">
+              <div className="w-full bg-zinc-900 rounded-full h-3 overflow-hidden border border-zinc-800">
+                <div 
+                  className="bg-gradient-to-r from-indigo-500 via-purple-500 to-pink-500 h-full rounded-full transition-all duration-500" 
+                  style={{ width: `${progress}%` }}
+                />
+              </div>
+
+              <div className="grid grid-cols-2 sm:grid-cols-4 gap-4">
+                <div className="bg-zinc-900/50 p-4 rounded-xl border border-zinc-800/80 flex flex-col">
+                  <span className="text-xs text-white/40 font-semibold uppercase tracking-wider">Current Stage</span>
+                  <span className="text-sm font-bold text-indigo-300 mt-2 truncate">{stage}</span>
+                </div>
+                <div className="bg-zinc-900/50 p-4 rounded-xl border border-zinc-800/80 flex flex-col">
+                  <span className="text-xs text-white/40 font-semibold uppercase tracking-wider">Candidates</span>
+                  <span className="text-sm font-bold text-white mt-2">
+                    {processed > 0 ? `${processed} / ${total}` : 'Queued'}
+                  </span>
+                </div>
+                <div className="bg-zinc-900/50 p-4 rounded-xl border border-zinc-800/80 flex flex-col">
+                  <span className="text-xs text-white/40 font-semibold uppercase tracking-wider">Elapsed Time</span>
+                  <span className="text-sm font-bold text-white mt-2">{formatElapsed(elapsed)}</span>
+                </div>
+                <div className="bg-zinc-900/50 p-4 rounded-xl border border-zinc-800/80 flex flex-col">
+                  <span className="text-xs text-white/40 font-semibold uppercase tracking-wider">ETA</span>
+                  <span className="text-sm font-bold text-emerald-400 mt-2">{eta}</span>
+                </div>
+              </div>
+
+              <div className="flex flex-wrap items-center justify-between text-xs text-white/40 pt-2 border-t border-zinc-900 gap-2">
+                {speed > 0 && <span>Average Speed: <strong className="text-white">{speed.toFixed(1)} candidates/sec</strong></span>}
+                {workerStatus?.ram_usage > 0 && (
+                  <span>RAM Usage: <strong className="text-white">{workerStatus.ram_usage.toFixed(1)}MB</strong> / Peak: <strong className="text-white">{workerStatus.peak_ram?.toFixed(1)}MB</strong></span>
+                )}
+                <span>Status: <strong className="text-white">Building semantic search index...</strong></span>
+              </div>
+
+              <div className="flex justify-end pt-4">
+                <Button
+                  onClick={async () => {
+                    if (confirm('Are you sure you want to cancel indexing?')) {
+                      setCancelling(true);
+                      try {
+                        await platformApi.cancelIndexing(projectId);
+                        toast.success('Indexing cancellation requested');
+                        await load();
+                      } catch (err: any) {
+                        toast.error(err.message || 'Failed to cancel indexing');
+                      } finally {
+                        setCancelling(false);
+                      }
+                    }
+                  }}
+                  disabled={cancelling}
+                  variant="outline"
+                  className="border-red-500/20 text-red-400 hover:bg-red-500/10 cursor-pointer"
+                >
+                  {cancelling ? 'Cancelling...' : 'Cancel Indexing'}
+                </Button>
+              </div>
+            </CardContent>
+          </Card>
+        ) : (
+          <Card className="border-red-500/25 bg-red-950/10 shadow-xl overflow-hidden">
+            <CardHeader className="pb-4">
+              <CardTitle className="text-xl text-red-400 flex items-center gap-2 font-bold">
+                <AlertTriangle className="w-5 h-5 shrink-0" />
+                Indexing Failed
+              </CardTitle>
+            </CardHeader>
+            <CardContent className="space-y-6 pb-8">
+              <div className="bg-red-950/20 border border-red-500/20 p-4 rounded-xl text-sm text-red-300 space-y-1">
+                <p className="font-semibold text-white">Reason:</p>
+                <p className="opacity-90 font-mono break-all whitespace-pre-wrap">{project.upload_statistics?.failure_reason || workerStatus?.failure_reason || 'Unknown error during indexing.'}</p>
+              </div>
+
+              <div className="grid grid-cols-3 gap-4 text-center">
+                <div className="bg-zinc-900/50 p-4 rounded-xl border border-zinc-800 flex flex-col justify-center">
+                  <span className="text-xs text-white/40">Stage</span>
+                  <span className="text-sm font-bold text-white mt-1 truncate">{stage}</span>
+                </div>
+                <div className="bg-zinc-900/50 p-4 rounded-xl border border-zinc-800 flex flex-col justify-center">
+                  <span className="text-xs text-white/40">Elapsed</span>
+                  <span className="text-sm font-bold text-white mt-1">{formatElapsed(elapsed)}</span>
+                </div>
+                <div className="bg-zinc-900/50 p-4 rounded-xl border border-zinc-800 flex flex-col justify-center">
+                  <span className="text-xs text-white/40">Candidates</span>
+                  <span className="text-sm font-bold text-white mt-1">{total}</span>
+                </div>
+              </div>
+
+              <div className="flex flex-wrap items-center justify-between gap-4 pt-4">
+                <Button
+                  onClick={async () => {
+                    const logsUrl = `${cleanBase}/api/v1/platform/diagnostics`;
+                    window.open(logsUrl, '_blank');
+                  }}
+                  variant="outline"
+                  className="border-zinc-700 hover:bg-zinc-900 cursor-pointer"
+                >
+                  View Logs / Diagnostics
+                </Button>
+                <div className="flex gap-2">
+                  <Button
+                    onClick={() => {
+                      if (confirm('Cancel and return to project dashboard?')) {
+                        router.push('/projects');
+                      }
+                    }}
+                    variant="ghost"
+                    className="hover:bg-zinc-900 cursor-pointer text-white/60 hover:text-white"
+                  >
+                    Cancel
+                  </Button>
+                  <Button
+                    onClick={handleRetryIndexing}
+                    disabled={retrying}
+                    className="bg-gradient-to-r from-red-600 to-pink-600 text-white border-0 shadow-lg shadow-red-600/25 cursor-pointer"
+                  >
+                    {retrying
+                      ? <><Loader2 className="w-3.5 h-3.5 mr-2 animate-spin" />Retrying...</>
+                      : '↺ Retry Indexing — No Re-upload'}
+                  </Button>
+                </div>
+              </div>
+            </CardContent>
+          </Card>
+        )}
+      </div>
+    );
+  }
+
   const formatCount = (num: number): string => {
     if (num >= 1000000) return (num / 1000000).toFixed(1).replace(/\.0$/, '') + 'M';
     if (num >= 1000) return (num / 1000).toFixed(1).replace(/\.0$/, '') + 'k';
