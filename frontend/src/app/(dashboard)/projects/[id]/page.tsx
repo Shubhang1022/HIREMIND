@@ -52,7 +52,7 @@ function setCachedRanking(projectId: string, jobId: string, ranking: Ranking) {
       if (Date.now() - stored[k].cachedAt > CACHE_TTL_MS) delete stored[k];
     });
     localStorage.setItem('hiremind_ranking_cache', JSON.stringify(stored));
-  } catch {}
+  } catch { }
 }
 
 function loadCacheFromStorage() {
@@ -63,7 +63,7 @@ function loadCacheFromStorage() {
         rankingCache.set(key, val);
       }
     });
-  } catch {}
+  } catch { }
 }
 
 
@@ -208,7 +208,7 @@ export default function ProjectDetailPage() {
     if (ranking && ranking.metadata_only_fallback && isReady && !analyzing) {
       try {
         localStorage.removeItem(`ranking_${projectId}_${selectedJobId}`);
-      } catch (e) {}
+      } catch (e) { }
       toast.info('Project embeddings are ready. Re-running ranking for full semantic match...');
       handleAnalyze(true);
     }
@@ -391,7 +391,7 @@ export default function ProjectDetailPage() {
     const elapsed = workerStatus?.elapsed_time || 0;
     const speed = workerStatus?.speed || 0;
     const eta = workerStatus?.eta || 'Estimating...';
-    
+
     const formatElapsed = (sec: number) => {
       const m = Math.floor(sec / 60);
       const s = Math.floor(sec % 60);
@@ -414,7 +414,7 @@ export default function ProjectDetailPage() {
         {isIndexing ? (
           <Card className="border-indigo-500/20 bg-zinc-950/40 shadow-xl overflow-hidden relative">
             <div className="absolute top-0 left-0 w-full h-[3px] bg-zinc-800">
-              <div 
+              <div
                 className="h-full bg-gradient-to-r from-indigo-500 via-purple-500 to-pink-500 transition-all duration-500 shadow-[0_0_8px_rgba(99,102,241,0.5)]"
                 style={{ width: `${progress}%` }}
               />
@@ -437,8 +437,8 @@ export default function ProjectDetailPage() {
             </CardHeader>
             <CardContent className="space-y-6 pb-8">
               <div className="w-full bg-zinc-900 rounded-full h-3 overflow-hidden border border-zinc-800">
-                <div 
-                  className="bg-gradient-to-r from-indigo-500 via-purple-500 to-pink-500 h-full rounded-full transition-all duration-500" 
+                <div
+                  className="bg-gradient-to-r from-indigo-500 via-purple-500 to-pink-500 h-full rounded-full transition-all duration-500"
                   style={{ width: `${progress}%` }}
                 />
               </div>
@@ -594,7 +594,7 @@ export default function ProjectDetailPage() {
             {!['completed', 'processing', 'ranking', 'uploaded', 'failed', 'draft'].includes(project.status) && (
               <Badge variant="secondary" className="w-fit capitalize">{project.status}</Badge>
             )}
-            
+
             <div className="flex items-center gap-2">
               <select
                 value={performanceMode}
@@ -609,11 +609,10 @@ export default function ProjectDetailPage() {
               <Button
                 onClick={() => handleAnalyze()}
                 disabled={analyzing || !canRunAnalysis}
-                className={`text-white border-0 shadow-lg transition-all ${
-                  canRunAnalysis
+                className={`text-white border-0 shadow-lg transition-all ${canRunAnalysis
                     ? 'bg-gradient-to-r from-indigo-500 to-purple-600 shadow-indigo-500/20 hover:opacity-90'
                     : 'bg-zinc-800 text-zinc-500 cursor-not-allowed shadow-none hover:bg-zinc-800'
-                }`}
+                  }`}
                 title={!canRunAnalysis ? 'Upload candidates and select job description first' : undefined}
               >
                 {analyzing
@@ -628,13 +627,12 @@ export default function ProjectDetailPage() {
       {/* Progress steps */}
       <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
         {steps.map((s, i) => (
-          <div key={s.label} className={`p-4 rounded-xl border transition-colors ${
-            s.done
+          <div key={s.label} className={`p-4 rounded-xl border transition-colors ${s.done
               ? 'border-green-500/40 bg-green-500/5'
               : i === 0 || steps[i - 1]?.done
-              ? 'border-indigo-500/30 bg-indigo-500/5'
-              : 'border-border bg-muted/10'
-          }`}>
+                ? 'border-indigo-500/30 bg-indigo-500/5'
+                : 'border-border bg-muted/10'
+            }`}>
             <div className="flex items-center gap-3">
               {s.done
                 ? <CheckCircle2 className="w-5 h-5 text-green-400 shrink-0" />
@@ -693,11 +691,10 @@ export default function ProjectDetailPage() {
                         <button
                           key={j.id}
                           onClick={() => handleSelectJob(j.id)}
-                          className={`w-full text-left p-4 rounded-xl border transition-all ${
-                            isSelected
+                          className={`w-full text-left p-4 rounded-xl border transition-all ${isSelected
                               ? 'border-indigo-500/60 bg-indigo-500/10 ring-1 ring-indigo-500/40'
                               : 'border-border/50 bg-muted/10 hover:border-indigo-500/30 hover:bg-muted/20'
-                          }`}
+                            }`}
                         >
                           <div className="flex items-start justify-between gap-3">
                             <div className="flex-1 min-w-0">
@@ -736,7 +733,7 @@ export default function ProjectDetailPage() {
                     <Label htmlFor="jd-title">Job Title <span className="text-muted-foreground font-normal">(optional)</span></Label>
                     <Input id="jd-title" placeholder="e.g. Senior AI Engineer" value={jdTitle} onChange={e => setJdTitle(e.target.value)} />
                   </div>
-                  
+
                   <div className="grid grid-cols-2 gap-4">
                     <div className="space-y-2">
                       <Label htmlFor="jd-openings">Number of Openings</Label>
@@ -794,17 +791,15 @@ export default function ProjectDetailPage() {
                   <div className="flex gap-2 p-1 bg-muted rounded-lg w-fit">
                     <button
                       onClick={() => setJdInputMode('file')}
-                      className={`flex items-center gap-2 px-4 py-2 rounded-md text-sm font-medium transition-colors ${
-                        jdInputMode === 'file' ? 'bg-background shadow text-foreground' : 'text-muted-foreground hover:text-foreground'
-                      }`}
+                      className={`flex items-center gap-2 px-4 py-2 rounded-md text-sm font-medium transition-colors ${jdInputMode === 'file' ? 'bg-background shadow text-foreground' : 'text-muted-foreground hover:text-foreground'
+                        }`}
                     >
                       <Upload className="w-4 h-4" /> Upload File
                     </button>
                     <button
                       onClick={() => setJdInputMode('text')}
-                      className={`flex items-center gap-2 px-4 py-2 rounded-md text-sm font-medium transition-colors ${
-                        jdInputMode === 'text' ? 'bg-background shadow text-foreground' : 'text-muted-foreground hover:text-foreground'
-                      }`}
+                      className={`flex items-center gap-2 px-4 py-2 rounded-md text-sm font-medium transition-colors ${jdInputMode === 'text' ? 'bg-background shadow text-foreground' : 'text-muted-foreground hover:text-foreground'
+                        }`}
                     >
                       <PenLine className="w-4 h-4" /> Paste / Type
                     </button>
@@ -886,8 +881,8 @@ export default function ProjectDetailPage() {
                       {analyzing
                         ? <><Loader2 className="w-4 h-4 mr-2 animate-spin" />Analysis Running...</>
                         : getCachedRanking(projectId, selectedJobId)
-                        ? <><Sparkles className="w-4 h-4 mr-2" />View Cached Ranking</>
-                        : <><Sparkles className="w-4 h-4 mr-2" />Run AI Analysis — Rank Candidates</>}
+                          ? <><Sparkles className="w-4 h-4 mr-2" />View Cached Ranking</>
+                          : <><Sparkles className="w-4 h-4 mr-2" />Run AI Analysis — Rank Candidates</>}
                     </Button>
                   </div>
                 </div>
@@ -1029,12 +1024,11 @@ export default function ProjectDetailPage() {
                   </div>
                 </div>
 
-                    {project?.embedding_status && project.embedding_status !== 'ready' && project.embedding_status !== 'completed' && (
-                  <div className={`p-4 rounded-xl border text-left text-sm ${
-                    project.embedding_status === 'failed' 
+                {project?.embedding_status && project.embedding_status !== 'ready' && project.embedding_status !== 'completed' && (
+                  <div className={`p-4 rounded-xl border text-left text-sm ${project.embedding_status === 'failed'
                       ? 'border-red-500/25 bg-red-950/20 text-red-300'
                       : 'border-amber-500/25 bg-amber-950/20 text-amber-300'
-                  }`}>
+                    }`}>
                     <div className="flex items-start gap-3 w-full">
                       {project.embedding_status === 'failed' ? (
                         <AlertTriangle className="w-5 h-5 text-red-400 shrink-0 mt-0.5" />
@@ -1066,12 +1060,12 @@ export default function ProjectDetailPage() {
                               : '↺ Retry Indexing — No Re-upload Needed'}
                           </Button>
                         )}
-                        
+
                         {project.embedding_status !== 'failed' && workerStatus && (
                           <div className="mt-3 space-y-2 w-full">
                             <div className="w-full bg-zinc-800 rounded-full h-1.5 overflow-hidden">
-                              <div 
-                                className="bg-indigo-500 h-1.5 rounded-full transition-all duration-500" 
+                              <div
+                                className="bg-indigo-500 h-1.5 rounded-full transition-all duration-500"
                                 style={{ width: `${workerStatus.progress_percentage || 0}%` }}
                               />
                             </div>
@@ -1125,11 +1119,10 @@ export default function ProjectDetailPage() {
                     onClick={() => handleAnalyze()}
                     disabled={analyzing || !canRunAnalysis}
                     size="lg"
-                    className={`w-full sm:w-auto text-white border-0 shadow-lg transition-all ${
-                      canRunAnalysis
+                    className={`w-full sm:w-auto text-white border-0 shadow-lg transition-all ${canRunAnalysis
                         ? 'bg-gradient-to-r from-indigo-500 to-purple-600 shadow-indigo-500/20 hover:opacity-90'
                         : 'bg-zinc-800 text-zinc-500 cursor-not-allowed shadow-none hover:bg-zinc-800'
-                    }`}
+                      }`}
                   >
                     {analyzing
                       ? <><Loader2 className="w-4 h-4 mr-2 animate-spin" />Analysis Running...</>
@@ -1141,10 +1134,10 @@ export default function ProjectDetailPage() {
                     {!project.candidate_count && !selectedJobId
                       ? 'Please upload candidates and select a job description to begin.'
                       : !project.candidate_count
-                      ? 'Please upload candidates first.'
-                      : !selectedJobId
-                      ? 'Please select or upload a job description first.'
-                      : 'Candidate indexing is still in progress. Please wait until indexing completes.'}
+                        ? 'Please upload candidates first.'
+                        : !selectedJobId
+                          ? 'Please select or upload a job description first.'
+                          : 'Candidate indexing is still in progress. Please wait until indexing completes.'}
                   </p>
                 )}
               </CardContent>
@@ -1153,20 +1146,18 @@ export default function ProjectDetailPage() {
             <div className="space-y-6">
               {/* Analysis Status Banner (Requirement 7) */}
               {ranking && (
-                <Card className={`border p-4 flex items-start gap-3 rounded-xl transition-all ${
-                  ranking.metadata_only_fallback
+                <Card className={`border p-4 flex items-start gap-3 rounded-xl transition-all ${ranking.metadata_only_fallback
                     ? 'border-zinc-200 dark:border-zinc-800 bg-zinc-50 dark:bg-zinc-950/20 text-zinc-800 dark:text-zinc-300'
                     : ranking.ai_enhancement_unavailable
-                    ? 'border-blue-200 dark:border-blue-500/20 bg-blue-50 dark:bg-blue-950/10 text-blue-800 dark:text-blue-300'
-                    : 'border-indigo-200 dark:border-indigo-500/30 bg-gradient-to-r from-indigo-50/50 to-purple-50/50 dark:from-indigo-950/20 dark:to-purple-950/20 text-indigo-900 dark:text-indigo-300'
-                }`}>
-                  <CheckCircle2 className={`w-5 h-5 shrink-0 mt-0.5 ${
-                    ranking.metadata_only_fallback
+                      ? 'border-blue-200 dark:border-blue-500/20 bg-blue-50 dark:bg-blue-950/10 text-blue-800 dark:text-blue-300'
+                      : 'border-indigo-200 dark:border-indigo-500/30 bg-gradient-to-r from-indigo-50/50 to-purple-50/50 dark:from-indigo-950/20 dark:to-purple-950/20 text-indigo-900 dark:text-indigo-300'
+                  }`}>
+                  <CheckCircle2 className={`w-5 h-5 shrink-0 mt-0.5 ${ranking.metadata_only_fallback
                       ? 'text-zinc-600 dark:text-zinc-400'
                       : ranking.ai_enhancement_unavailable
-                      ? 'text-blue-600 dark:text-blue-400'
-                      : 'text-indigo-600 dark:text-indigo-400'
-                  }`} />
+                        ? 'text-blue-600 dark:text-blue-400'
+                        : 'text-indigo-600 dark:text-indigo-400'
+                    }`} />
                   <div>
                     <h4 className="font-semibold text-sm">
                       Analysis Status: Complete
@@ -1175,8 +1166,8 @@ export default function ProjectDetailPage() {
                       {ranking.metadata_only_fallback
                         ? 'Deterministic Ranking (Fast metadata filtering & keyword matching active)'
                         : ranking.ai_enhancement_unavailable
-                        ? 'Semantic Ranking Enabled (Embedding-based semantic similarity search active)'
-                        : 'AI Assisted Ranking (Full multi-dimensional semantic match & LLM evaluations active)'}
+                          ? 'Semantic Ranking Enabled (Embedding-based semantic similarity search active)'
+                          : 'AI Assisted Ranking (Full multi-dimensional semantic match & LLM evaluations active)'}
                     </p>
                   </div>
                 </Card>
@@ -1268,7 +1259,7 @@ export default function ProjectDetailPage() {
                         <span className="text-[10px] text-muted-foreground uppercase mt-0.5">1. Uploaded</span>
                         <span className="text-[9px] text-muted-foreground/60">Raw Ingestion</span>
                       </div>
-                      
+
                       <div className="text-muted-foreground hidden md:block">→</div>
 
                       {/* Step 2: Eligible */}
@@ -1394,7 +1385,7 @@ export default function ProjectDetailPage() {
                         </CardDescription>
                       </CardHeader>
                       <CardContent className="space-y-2">
-                         {ranking.alternative_candidates.slice(0, 5).map(r => (
+                        {ranking.alternative_candidates.slice(0, 5).map(r => (
                           <div
                             key={r.candidate_id}
                             className="flex items-start gap-4 p-3 rounded-lg bg-muted/20 hover:bg-muted/40 transition-colors cursor-pointer group/cand"
@@ -1484,20 +1475,18 @@ export default function ProjectDetailPage() {
                               },
                             })}
                           >
-                            <div className={`w-9 h-9 rounded-full flex items-center justify-center text-xs font-bold shrink-0 ${
-                              r.rank <= 3 ? 'bg-gradient-to-br from-amber-400 to-orange-500 text-white' : 'bg-muted text-muted-foreground'
-                            }`}>#{r.rank}</div>
+                            <div className={`w-9 h-9 rounded-full flex items-center justify-center text-xs font-bold shrink-0 ${r.rank <= 3 ? 'bg-gradient-to-br from-amber-400 to-orange-500 text-white' : 'bg-muted text-muted-foreground'
+                              }`}>#{r.rank}</div>
                             <div className="flex-1 min-w-0">
                               <div className="flex items-center gap-2 flex-wrap">
                                 <p className="text-sm font-medium truncate group-hover/cand:text-indigo-400 transition-colors">{(r as any).candidate_name || r.candidate_id}</p>
                                 {r.eligibility !== undefined && (
-                                  <Badge 
-                                    variant={r.eligibility ? 'default' : 'outline'} 
-                                    className={`text-[10px] px-1.5 py-0 capitalize font-semibold ${
-                                      r.eligibility 
-                                        ? 'bg-emerald-500/20 text-emerald-300 border-emerald-500/30 hover:bg-emerald-500/30' 
+                                  <Badge
+                                    variant={r.eligibility ? 'default' : 'outline'}
+                                    className={`text-[10px] px-1.5 py-0 capitalize font-semibold ${r.eligibility
+                                        ? 'bg-emerald-500/20 text-emerald-300 border-emerald-500/30 hover:bg-emerald-500/30'
                                         : 'bg-rose-500/20 text-rose-300 border-rose-500/30 hover:bg-rose-500/30'
-                                    }`}
+                                      }`}
                                     title={r.eligibility_reason}
                                   >
                                     {r.eligibility ? 'Eligible' : 'Ineligible'}
@@ -1541,8 +1530,8 @@ export default function ProjectDetailPage() {
                           </select>
                           <span className="text-muted-foreground text-xs ml-2">
                             Showing {pageSize === -1 ? 1 : (currentPage - 1) * pageSize + 1} - {
-                              pageSize === -1 
-                                ? ranking.results.length 
+                              pageSize === -1
+                                ? ranking.results.length
                                 : Math.min(currentPage * pageSize, ranking.results.length)
                             } of {ranking.results.length} candidates
                           </span>

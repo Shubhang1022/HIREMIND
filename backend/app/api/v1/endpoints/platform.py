@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import csv
+import threading
 import io
 import json
 import logging
@@ -343,6 +344,12 @@ async def run_startup_initialization() -> None:
         # Verify table existence (Phase 1)
         await _verify_background_jobs_table_exists()
         
+        # Distributed lock clearance and stale jobs cleanup on boot
+        from app.services.job_manager import JobManager
+        manager = JobManager.get_instance()
+        await manager.clear_locks_on_boot()
+        await manager.cleanup_stale_jobs(timeout_minutes=15)
+        
         # Recover unfinished jobs (Phase 1)
         await _recover_interrupted_jobs()
 
@@ -466,6 +473,7 @@ async def _delayed_resume_indexing(project_id: str, user_id: str, delay_seconds:
 # The model is loaded ONCE via ModelService (preloaded at startup).
 # Never call EmbeddingEncoder() or SentenceTransformer() directly here.
 _encoder = None  # kept for health-check compatibility (main.py references it)
+_encoder_lock = threading.Lock()
 
 
 def _get_encoder():
@@ -476,40 +484,50 @@ def _get_encoder():
     logger.info("[ENTER get_encoder()]")
     print("[ENTER get_encoder()]", flush=True)
     global _encoder
-    try:
-        from app.services.model_service import get_model, is_loaded, ModelLoadTimeout, ModelLoadFailed
+    
+    # Fast path: check without lock
+    if _encoder is not None:
+        # Verify the underlying model is still the same
+        from app.core.config import settings as _settings
+        if _encoder.model_name == _settings.embedding_model and _encoder._model is not None:
+            logger.info("[EXIT get_encoder()] (fast path)")
+            print("[EXIT get_encoder()] (fast path)", flush=True)
+            return _encoder
 
-        # Fast path: return cached wrapper if already resolved
+    with _encoder_lock:
+        # Double checked lock
         if _encoder is not None:
-            # Verify the underlying model is still the same
             from app.core.config import settings as _settings
             if _encoder.model_name == _settings.embedding_model and _encoder._model is not None:
-                logger.info("[EXIT get_encoder()] (fast path)")
-                print("[EXIT get_encoder()] (fast path)", flush=True)
+                logger.info("[EXIT get_encoder()] (fast path - locked)")
+                print("[EXIT get_encoder()] (fast path - locked)", flush=True)
                 return _encoder
 
-        # Get (or wait for) the singleton model
-        raw_model = get_model()  # raises on timeout/failure; never returns None
+        try:
+            from app.services.model_service import get_model, is_loaded, ModelLoadTimeout, ModelLoadFailed
 
-        # Wrap in EmbeddingEncoder so encode_batch / encode_single / embedding_dim work
-        import sys, os as _os
-        _project_root = _os.path.dirname(_os.path.dirname(_os.path.dirname(
-            _os.path.dirname(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))))))
-        if _project_root not in sys.path:
-            sys.path.insert(0, _project_root)
+            # Get (or wait for) the singleton model
+            raw_model = get_model()  # raises on timeout/failure; never returns None
 
-        from app.core.config import settings as _settings
-        from src.features.embedding import EmbeddingEncoder
-        enc = EmbeddingEncoder(model_name=_settings.embedding_model)
-        enc._model = raw_model  # inject the already-loaded model — no download
-        _encoder = enc
-        logger.info("[EXIT get_encoder()] (full path)")
-        print("[EXIT get_encoder()] (full path)", flush=True)
-        return _encoder
-    except Exception as e:
-        logger.error("[EXIT get_encoder()] (exception: %s)", e)
-        print(f"[EXIT get_encoder()] (exception: {e})", flush=True)
-        raise
+            # Wrap in EmbeddingEncoder so encode_batch / encode_single / embedding_dim work
+            import sys, os as _os
+            _project_root = _os.path.dirname(_os.path.dirname(_os.path.dirname(
+                _os.path.dirname(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))))))
+            if _project_root not in sys.path:
+                sys.path.insert(0, _project_root)
+
+            from app.core.config import settings as _settings
+            from src.features.embedding import EmbeddingEncoder
+            enc = EmbeddingEncoder(model_name=_settings.embedding_model)
+            enc._model = raw_model  # inject the already-loaded model — no download
+            _encoder = enc
+            logger.info("[EXIT get_encoder()] (full path)")
+            print("[EXIT get_encoder()] (full path)", flush=True)
+            return _encoder
+        except Exception as e:
+            logger.error("[EXIT get_encoder()] (exception: %s)", e)
+            print(f"[EXIT get_encoder()] (exception: {e})", flush=True)
+            raise
 
 
 def preload_model_singleton() -> None:
@@ -1240,8 +1258,31 @@ Elapsed: {elapsed_str}
     try:
         from app.services.job_manager import JobManager
         job_manager = JobManager.get_instance()
-        if not job_manager.start_job(project_id, "Validating candidates"):
-            logger.warning("[BACKGROUND_TASK_IGNORE] Indexing already active for project %s. Ignoring duplicate call.", project_id)
+        
+        # Load user_id dynamically from projects table to register locking job
+        try:
+            p_res = supabase_client.table("projects").select("user_id").eq("id", project_id).execute()
+            user_id = p_res.data[0].get("user_id") if p_res.data else None
+        except Exception:
+            user_id = None
+
+        # Lock check / start job using the event loop wrapper
+        try:
+            loop = asyncio.get_event_loop()
+        except RuntimeError:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            
+        coro = job_manager.start_job(project_id, user_id, "Validating candidates")
+        if loop.is_running():
+            from asyncio import run_coroutine_threadsafe
+            fut = run_coroutine_threadsafe(coro, loop)
+            started = fut.result(timeout=15.0)
+        else:
+            started = loop.run_until_complete(coro)
+
+        if not started:
+            logger.warning("[BACKGROUND_TASK_IGNORE] Indexing already active or locked by another worker for project %s. Ignoring duplicate call.", project_id)
             return
 
         for attempt in range(1, max_retries + 1):
@@ -1679,7 +1720,7 @@ Elapsed: {elapsed_str}
                                         "speed=%.1f cand/s elapsed=%.2fs ram=%.1fMB",
                                         project_id, batch_num, total_batches,
                                         global_idx, total_candidates, progress_pct,
-                                        speed, batch_elapsed, get_memory_mb(),
+                                        overall_speed, batch_elapsed, get_memory_mb(),
                                     )
                                     if batch_elapsed > 60.0:
                                         logger.warning("[PIPELINE_TIMEOUT] project=%s stage=generate_embeddings "
@@ -1956,6 +1997,12 @@ Elapsed: {elapsed_str}
                 break
 
             except Exception as e:
+                from app.services.job_manager import LockLostError
+                if isinstance(e, LockLostError) or "LockLostError" in type(e).__name__:
+                    logger.warning("[LOCK_LOST_ABORT] project=%s indexing aborted: lock was lost/hijacked by another worker.", project_id)
+                    print(f"[LOCK_LOST_ABORT] project={project_id} indexing aborted: lock lost", flush=True)
+                    return
+
                 import traceback as _tb
                 elapsed = time.time() - t_start
                 mem_end = get_memory_mb()
@@ -2094,10 +2141,19 @@ def _sync_update_progress(
         future = run_coroutine_threadsafe(coro, loop)
         try:
             future.result(timeout=5.0)
-        except Exception:
-            pass  # Non-critical: progress update failure must never abort indexing
+        except Exception as exc:
+            from app.services.job_manager import LockLostError
+            if isinstance(exc, LockLostError) or "LockLostError" in type(exc).__name__:
+                raise exc
+            pass  # Non-critical: other progress update failures must never abort indexing
     else:
-        loop.run_until_complete(coro)
+        try:
+            loop.run_until_complete(coro)
+        except Exception as exc:
+            from app.services.job_manager import LockLostError
+            if isinstance(exc, LockLostError) or "LockLostError" in type(exc).__name__:
+                raise exc
+            pass
 
 def _sync_fail_job(project_id: str, reason: str):
     import asyncio
@@ -2141,8 +2197,8 @@ async def get_diagnostics(current_user: Optional[AuthUser] = Depends(get_optiona
     # 3. Active jobs registry
     job_manager = JobManager.get_instance()
     # Probe to trigger active jobs pruning
-    job_manager.is_job_active("_non_existent_probe_")
-    active_jobs = dict(job_manager._active_jobs)  # clone active jobs
+    await job_manager.is_job_active("_non_existent_probe_")
+    active_jobs = dict(job_manager._progress_cache)  # clone active jobs
     active_jobs_count = len(active_jobs)
     
     # 4. Queue length
@@ -2240,66 +2296,152 @@ async def get_worker_status(project_id: str, current_user: Optional[AuthUser] = 
     if not proj_res.data:
         raise HTTPException(status_code=404, detail="Project not found")
 
-    from app.services.job_manager import JobManager
-    manager = JobManager.get_instance()
-    status_info = manager.get_job_status(project_id)
-    if not status_info:
-        res = supabase_client.table("background_jobs").select("*").eq("project_id", project_id).order("started_at", desc=True).limit(1).execute()
-        if res.data:
-            job = res.data[0]
-            started_at = job.get("started_at")
-            elapsed_time = 0.0
-            if started_at:
-                try:
-                    import time as _time
-                    from datetime import datetime, timezone
+    from app.services.job_manager import DBConnection
+    import uuid
+    import time as _time
+    from datetime import datetime, timezone
+
+    async with DBConnection() as conn:
+        job = await conn.fetchrow(
+            """
+            SELECT id, job_type, current_stage, progress_percentage, status, failure_reason, retry_count, 
+                   started_at, last_heartbeat, processed_candidates, total_candidates, ram_usage, peak_ram, eta, speed
+            FROM public.background_jobs
+            WHERE project_id = $1
+            ORDER BY started_at DESC
+            LIMIT 1
+            """,
+            uuid.UUID(project_id)
+        )
+
+    if job:
+        started_at = job["started_at"]
+        elapsed_time = 0.0
+        if started_at:
+            try:
+                if isinstance(started_at, str):
                     started_dt = datetime.fromisoformat(started_at.replace("Z", "+00:00"))
-                    elapsed_time = (datetime.now(timezone.utc) - started_dt).total_seconds()
-                except Exception:
-                    pass
-            status_info = {
-                "job_id": job["id"],
-                "project_id": project_id,
-                "job_type": job["job_type"],
-                "current_stage": job["current_stage"],
-                "progress_percentage": job["progress_percentage"],
-                "status": job["status"],
-                "failure_reason": job.get("failure_reason"),
-                "retry_count": job["retry_count"],
-                "last_heartbeat": job["last_heartbeat"],
-                "processed_candidates": 0,
-                "total_candidates": 0,
-                "ram_usage": 0.0,
-                "peak_ram": 0.0,
-                "eta": "00:00:00",
-                "elapsed_time": elapsed_time,
-            }
-        else:
-            return {
-                "status": "idle",
-                "current_stage": "Not Started",
-                "progress_percentage": 0,
-                "processed_candidates": 0,
-                "total_candidates": 0,
-                "ram_usage": 0.0,
-                "peak_ram": 0.0,
-                "eta": "00:00:00",
-                "failure_reason": None,
-                "retry_count": 0,
-                "elapsed_time": 0.0,
-            }
-    # Ensure failure_reason is always present
-    if "failure_reason" not in status_info:
-        status_info["failure_reason"] = status_info.get("failure_reason")
-    # Calculate elapsed_time if missing
-    if "elapsed_time" not in status_info:
-        import time as _time
-        started = status_info.get("started_at")
-        if isinstance(started, float):
-            status_info["elapsed_time"] = round(_time.time() - started, 1)
-        else:
-            status_info["elapsed_time"] = 0.0
+                else:
+                    started_dt = started_at
+                elapsed_time = (datetime.now(timezone.utc) - started_dt).total_seconds()
+            except Exception:
+                pass
+
+        status_info = {
+            "job_id": str(job["id"]),
+            "project_id": project_id,
+            "job_type": job["job_type"],
+            "current_stage": job["current_stage"],
+            "progress_percentage": job["progress_percentage"],
+            "status": job["status"],
+            "failure_reason": job["failure_reason"],
+            "retry_count": job["retry_count"],
+            "last_heartbeat": job["last_heartbeat"].isoformat() if job["last_heartbeat"] else None,
+            "processed_candidates": job["processed_candidates"] or 0,
+            "total_candidates": job["total_candidates"] or 0,
+            "ram_usage": job["ram_usage"] or 0.0,
+            "peak_ram": job["peak_ram"] or 0.0,
+            "eta": job["eta"] or "00:00:00",
+            "speed": job["speed"] or 0.0,
+            "elapsed_time": elapsed_time,
+        }
+    else:
+        status_info = {
+            "status": "idle",
+            "current_stage": "Not Started",
+            "progress_percentage": 0,
+            "processed_candidates": 0,
+            "total_candidates": 0,
+            "ram_usage": 0.0,
+            "peak_ram": 0.0,
+            "eta": "00:00:00",
+            "speed": 0.0,
+            "failure_reason": None,
+            "retry_count": 0,
+            "elapsed_time": 0.0,
+        }
     return status_info
+
+
+@router.get("/projects/{project_id}/diagnostics")
+async def get_project_diagnostics(project_id: str, current_user: Optional[AuthUser] = Depends(get_optional_user)):
+    user_id = get_user_id(current_user)
+    
+    # Check project state
+    proj_res = supabase_client.table("projects").select("*").eq("id", project_id).eq("user_id", user_id).execute()
+    if not proj_res.data:
+        raise HTTPException(status_code=404, detail="Project not found")
+    project = proj_res.data[0]
+    
+    # Query database jobs for this project
+    from app.services.job_manager import DBConnection
+    import uuid
+    from datetime import datetime, timezone
+    
+    async with DBConnection() as conn:
+        job = await conn.fetchrow(
+            """
+            SELECT id, status, current_stage, started_at, updated_at, last_heartbeat, 
+                   retry_count, failure_reason, owner_id, lease_expires_at,
+                   processed_candidates, total_candidates, ram_usage, peak_ram, eta, speed
+            FROM public.background_jobs
+            WHERE project_id = $1
+            ORDER BY started_at DESC
+            LIMIT 1
+            """,
+            uuid.UUID(project_id)
+        )
+        
+    diagnostics = {
+        "project_id": project_id,
+        "project_name": project.get("name"),
+        "project_status": project.get("status"),
+        "project_embedding_status": project.get("embedding_status"),
+        "active_job": None,
+        "blocking_reason": None
+    }
+    
+    if job:
+        now = datetime.now(timezone.utc)
+        lease_expires = job["lease_expires_at"]
+        lease_expired = lease_expires < now if lease_expires else True
+        last_hb = job["last_heartbeat"]
+        seconds_since_hb = (now - last_hb).total_seconds() if last_hb else None
+        
+        diagnostics["active_job"] = {
+            "job_id": str(job["id"]),
+            "job_status": job["status"],
+            "current_stage": job["current_stage"],
+            "owner_id": job["owner_id"],
+            "lease_expires_at": lease_expires.isoformat() if lease_expires else None,
+            "lease_expired": lease_expired,
+            "seconds_since_heartbeat": seconds_since_hb,
+            "started_at": job["started_at"].isoformat() if job["started_at"] else None,
+            "updated_at": job["updated_at"].isoformat() if job["updated_at"] else None,
+            "last_heartbeat": last_hb.isoformat() if last_hb else None,
+            "retry_count": job["retry_count"],
+            "failure_reason": job["failure_reason"],
+            "processed_candidates": job["processed_candidates"],
+            "total_candidates": job["total_candidates"],
+            "ram_usage": job["ram_usage"],
+            "peak_ram": job["peak_ram"],
+            "eta": job["eta"],
+            "speed": job["speed"],
+        }
+        
+        # Blocked analysis checks
+        is_active = job["status"] not in ("completed", "failed", "cancelled")
+        if is_active:
+            if lease_expired:
+                diagnostics["blocking_reason"] = "Job is inactive (lease expired). Can be claimed by any worker."
+            else:
+                diagnostics["blocking_reason"] = f"Job is active. Owned by worker {job['owner_id']} (lease expires in {round((lease_expires - now).total_seconds(), 1)}s)."
+        else:
+            diagnostics["blocking_reason"] = "No active background job for this project."
+    else:
+        diagnostics["blocking_reason"] = "No background job record found in database for this project."
+        
+    return diagnostics
 
 
 @router.get("/projects/{project_id}/progress-stream")
@@ -2312,41 +2454,60 @@ async def get_progress_stream(project_id: str, current_user: Optional[AuthUser] 
 
     async def event_generator():
         import logging as _log
+        import uuid
+        from app.services.job_manager import DBConnection
         _logger = _log.getLogger(__name__)
-        from app.services.job_manager import JobManager
-        manager = JobManager.get_instance()
         last_heartbeat = asyncio.get_event_loop().time()
-        HEARTBEAT_INTERVAL = 5.0  # send a comment ping every 5s to keep connection alive
+        HEARTBEAT_INTERVAL = 5.0
         TERMINAL_STATES = {"completed", "failed", "cancelled"}
 
         while True:
             try:
-                status_info = manager.get_job_status(project_id)
-                if not status_info:
-                    res = supabase_client.table("background_jobs").select("*").eq("project_id", project_id).order("started_at", desc=True).limit(1).execute()
-                    if res.data:
-                        job = res.data[0]
-                        status_info = {
-                            "status": job["status"],
-                            "current_stage": job["current_stage"],
-                            "progress_percentage": job["progress_percentage"],
-                            "processed_candidates": 0,
-                            "total_candidates": 0,
-                            "eta": "00:00:00",
-                            "ram_usage": 0.0,
-                            "peak_ram": 0.0,
-                        }
-                    else:
-                        status_info = {
-                            "status": "idle",
-                            "current_stage": "Not Started",
-                            "progress_percentage": 0,
-                            "processed_candidates": 0,
-                            "total_candidates": 0,
-                            "eta": "00:00:00",
-                            "ram_usage": 0.0,
-                            "peak_ram": 0.0,
-                        }
+                async with DBConnection() as conn:
+                    job = await conn.fetchrow(
+                        """
+                        SELECT id, job_type, current_stage, progress_percentage, status, failure_reason, retry_count, 
+                               last_heartbeat, processed_candidates, total_candidates, ram_usage, peak_ram, eta, speed
+                        FROM public.background_jobs
+                        WHERE project_id = $1
+                        ORDER BY started_at DESC
+                        LIMIT 1
+                        """,
+                        uuid.UUID(project_id)
+                    )
+
+                if job:
+                    status_info = {
+                        "job_id": str(job["id"]),
+                        "project_id": project_id,
+                        "job_type": job["job_type"],
+                        "current_stage": job["current_stage"],
+                        "progress_percentage": job["progress_percentage"],
+                        "status": job["status"],
+                        "failure_reason": job["failure_reason"],
+                        "retry_count": job["retry_count"],
+                        "last_heartbeat": job["last_heartbeat"].isoformat() if job["last_heartbeat"] else None,
+                        "processed_candidates": job["processed_candidates"] or 0,
+                        "total_candidates": job["total_candidates"] or 0,
+                        "ram_usage": job["ram_usage"] or 0.0,
+                        "peak_ram": job["peak_ram"] or 0.0,
+                        "eta": job["eta"] or "00:00:00",
+                        "speed": job["speed"] or 0.0,
+                    }
+                else:
+                    status_info = {
+                        "status": "idle",
+                        "current_stage": "Not Started",
+                        "progress_percentage": 0,
+                        "processed_candidates": 0,
+                        "total_candidates": 0,
+                        "ram_usage": 0.0,
+                        "peak_ram": 0.0,
+                        "eta": "00:00:00",
+                        "speed": 0.0,
+                        "failure_reason": None,
+                        "retry_count": 0,
+                    }
 
                 data_json = json.dumps(status_info)
                 yield f"data: {data_json}\n\n"
@@ -2355,11 +2516,9 @@ async def get_progress_stream(project_id: str, current_user: Optional[AuthUser] 
                 if current_status in TERMINAL_STATES:
                     _logger.info("[SSE] project=%s sending terminal event status=%s progress=%s",
                                  project_id, current_status, status_info.get("progress_percentage"))
-                    # Send one final event explicitly confirming terminal state, then close
                     yield f"data: {data_json}\n\n"
                     break
 
-                # Send SSE comment as heartbeat ping to keep the connection alive
                 now = asyncio.get_event_loop().time()
                 if now - last_heartbeat >= HEARTBEAT_INTERVAL:
                     yield ": heartbeat\n\n"
@@ -3235,40 +3394,7 @@ async def run_analysis(
             except Exception as watchdog_exc:
                 logger.error("Watchdog check failed: %s", watchdog_exc)
 
-    # Verify embedding status before initiating analysis (Phase 3 & Most Important Production Change)
-    if embedding_status in ["queued", "processing", "pending"]:
-        logger.warning("Analysis attempt rejected: Candidate indexing is still in progress for project %s", project_id)
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="Candidate indexing is still in progress. Please wait until indexing completes before running analysis."
-        )
-    elif embedding_status == "failed":
-        logger.warning("Analysis attempt rejected: Candidate indexing failed for project %s", project_id)
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail={
-                "code": "INDEXING_FAILED",
-                "message": "Candidate indexing failed. Use the retry endpoint to restart indexing — no re-upload required.",
-                "retry_endpoint": f"/api/v1/platform/projects/{project_id}/retry-indexing",
-                "action": "retry_indexing",
-            }
-        )
-
-    # 1. Verify Job exists (Phase 5 Index Integrity Validation)
-    job_res = supabase_client.table("jobs").select("*").eq("id", body.job_id).execute()
-    if not job_res.data:
-        raise HTTPException(status_code=404, detail="Job description not found. Please add a job description first.")
-    job = job_res.data[0]
-
-    # 2. Verify candidate uploads exists
-    uploads_res = supabase_client.table("candidate_uploads").select("id").eq("project_id", project_id).eq("status", "COMPLETED").execute()
-    if not uploads_res.data:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="Candidate upload record not found. Please upload candidates first."
-        )
-
-    # 3. Verify physical files exist in storage (Dynamic version check, Phase 4 & 5)
+    # Redesigned: Check physical indexing artifacts in storage first (Requirement 9)
     version = p.get("version") or 1
     faiss_key = f"{project_id}/faiss_v{version}.index"
     embeddings_key = f"{project_id}/embeddings_v{version}.npy"
@@ -3284,6 +3410,12 @@ async def run_analysis(
         ("skill-indexes", skill_key, "Skill Index mapping file")
     ]
     
+    # 1. Verify Job exists (Phase 5 Index Integrity Validation)
+    job_res = supabase_client.table("jobs").select("*").eq("id", body.job_id).execute()
+    if not job_res.data:
+        raise HTTPException(status_code=404, detail="Job description not found. Please add a job description first.")
+    job = job_res.data[0]
+
     # Determine allowed categories
     jd_category = job.get("role_category") or "BACKEND"
     allowed_categories = COMPATIBLE_CATEGORIES.get(jd_category.upper(), {jd_category.upper()})
@@ -3294,13 +3426,56 @@ async def run_analysis(
     for bucket_name, file_key, label in required_preflights:
         if not StorageService.file_exists(bucket_name, file_key):
             missing_preflights.append(f"{label} ({bucket_name}/{file_key})")
-            
-    if missing_preflights:
-        missing_str = ", ".join(missing_preflights)
-        logger.error("Analysis preflight check failed for project %s: missing %s", project_id, missing_str)
+
+    if not missing_preflights:
+        # All artifacts exist! Heal project embedding_status if out of sync
+        if embedding_status != "completed":
+            logger.info("[ANALYZE_HEAL] Healing embedding_status from %s to completed for project %s", embedding_status, project_id)
+            supabase_client.table("projects").update({
+                "embedding_status": "completed",
+                "status": "COMPLETED",
+                "updated_at": _now()
+            }).eq("id", project_id).execute()
+            embedding_status = "completed"
+    else:
+        # Artifacts missing: check transient job/project status to give descriptive errors
+        if embedding_status in ["queued", "processing", "pending"]:
+            logger.warning("Analysis attempt rejected: Candidate indexing is still in progress for project %s", project_id)
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Candidate indexing is still in progress. Please wait until indexing completes before running analysis."
+            )
+        elif embedding_status == "failed":
+            logger.warning("Analysis attempt rejected: Candidate indexing failed for project %s", project_id)
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={
+                    "code": "INDEXING_FAILED",
+                    "message": "Candidate indexing failed. Use the retry endpoint to restart indexing — no re-upload required.",
+                    "retry_endpoint": f"/api/v1/platform/projects/{project_id}/retry-indexing",
+                    "action": "retry_indexing",
+                }
+            )
+        else:
+            # Completed but missing files (corrupted/deleted files)
+            missing_str = ", ".join(missing_preflights)
+            logger.error("Analysis preflight check failed for project %s: missing %s", project_id, missing_str)
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={
+                    "code": "INDEX_ARTIFACTS_MISSING",
+                    "message": f"Required indexing artifacts are missing: {missing_str}. Please use the retry endpoint to rebuild the index.",
+                    "retry_endpoint": f"/api/v1/platform/projects/{project_id}/retry-indexing",
+                    "action": "retry_indexing",
+                }
+            )
+
+    # 2. Verify candidate uploads exists
+    uploads_res = supabase_client.table("candidate_uploads").select("id").eq("project_id", project_id).eq("status", "COMPLETED").execute()
+    if not uploads_res.data:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
-            detail=f"Required indexing artifacts are missing: {missing_str}. Please re-upload candidate files to rebuild the index."
+            detail="Candidate upload record not found. Please upload candidates first."
         )
 
     # Database-level check for active analyses
