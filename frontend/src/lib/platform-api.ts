@@ -47,6 +47,10 @@ export interface Project {
   started_at?: string;
   last_heartbeat?: string;
   last_updated?: string;
+  upload_statistics?: {
+    failure_reason?: string;
+    [key: string]: any;
+  };
   created_at: string;
   updated_at: string;
 }
