@@ -46,26 +46,69 @@ class LockResult(Enum):
     ERROR = "ERROR"
 
 
+_asyncpg_pool = None
+_pool_lock = asyncio.Lock()
+
+
 def get_clean_db_url() -> str:
+    try:
+        from dotenv import load_dotenv
+        load_dotenv()
+    except Exception:
+        pass
     url = os.environ.get("DATABASE_URL", "")
-    if "postgresql+asyncpg://" in url:
-        url = url.replace("postgresql+asyncpg://", "postgresql://")
+    if not url:
+        return ""
+    if url.startswith("postgresql+asyncpg://"):
+        url = url.replace("postgresql+asyncpg://", "postgresql://", 1)
     return url
+
+
+async def get_asyncpg_pool():
+    global _asyncpg_pool
+    if _asyncpg_pool is None:
+        async with _pool_lock:
+            if _asyncpg_pool is None:
+                import asyncpg
+                url = get_clean_db_url()
+                if not url:
+                    raise RuntimeError("DATABASE_URL environment variable is not set")
+                logger.info("[DATABASE_POOL_INIT] Initializing asyncpg connection pool with statement_cache_size=0")
+                ssl_option = "require" if "localhost" not in url and "127.0.0.1" not in url else None
+                _asyncpg_pool = await asyncpg.create_pool(
+                    url,
+                    ssl=ssl_option,
+                    statement_cache_size=0,
+                    min_size=2,
+                    max_size=10,
+                    max_queries=50000,
+                    max_inactive_connection_lifetime=300.0,
+                    command_timeout=60.0
+                )
+    return _asyncpg_pool
+
+
+async def close_asyncpg_pool():
+    global _asyncpg_pool
+    if _asyncpg_pool is not None:
+        logger.info("[DATABASE_POOL_CLOSE] Closing connection pool")
+        await _asyncpg_pool.close()
+        _asyncpg_pool = None
 
 
 class DBConnection:
     def __init__(self):
+        self.pool = None
         self.conn = None
 
     async def __aenter__(self):
-        url = get_clean_db_url()
-        import asyncpg
-        self.conn = await asyncpg.connect(url, ssl="require")
+        self.pool = await get_asyncpg_pool()
+        self.conn = await self.pool.acquire()
         return self.conn
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
-        if self.conn:
-            await self.conn.close()
+        if self.pool and self.conn:
+            await self.pool.release(self.conn)
 
 
 def safe_execute(query_builder, max_retries: int = 3, initial_delay: float = 0.5):
@@ -97,6 +140,7 @@ def safe_execute(query_builder, max_retries: int = 3, initial_delay: float = 0.5
 
 class JobManager:
     _instance: Optional["JobManager"] = None
+    loop: Optional[asyncio.AbstractEventLoop] = None
     
     # Memory progress cache: project_id -> progress details dict
     _progress_cache: Dict[str, Dict[str, Any]] = {}
@@ -391,6 +435,10 @@ class JobManager:
     def get_instance(cls) -> "JobManager":
         if cls._instance is None:
             cls._instance = JobManager()
+        try:
+            cls._instance.loop = asyncio.get_running_loop()
+        except RuntimeError:
+            pass
         return cls._instance
 
     def validate_transition(self, current_status: str, target_status: str) -> bool:

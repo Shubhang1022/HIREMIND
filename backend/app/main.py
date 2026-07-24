@@ -276,7 +276,7 @@ def validate_required_env() -> list[str]:
             )
             missing.append(var)
         else:
-            logger.info("[STARTUP_ENV] %s = %s...", var, value[:8] if len(value) > 8 else "***")
+            logger.info("[STARTUP_ENV] %s = configured", var)
     return missing
 
 
@@ -412,7 +412,7 @@ async def run_startup_check() -> bool:
     import traceback
     import importlib.util
     import sys
-    from app.services.job_manager import DBConnection, JobManager
+    from app.services.job_manager import DBConnection, JobManager, LockResult
     from app.api.v1.endpoints.platform import supabase_client as _sc
 
     checks: list[tuple[str, bool, str]] = []   # (label, passed, detail)
@@ -471,8 +471,59 @@ async def run_startup_check() -> bool:
         checks.append(("Supabase API Connectivity", False, str(exc)[:80]))
 
     # 5. Lock mechanism readiness
-    locking_ok = db_ok and schema_ok
-    checks.append(("Lock Mechanism Readiness", locking_ok, ""))
+    locking_ok = False
+    lock_detail = ""
+    if db_ok and schema_ok:
+        try:
+            import uuid
+            # Query an existing project to test locking
+            async with DBConnection() as conn:
+                project_row = await conn.fetchrow("SELECT id FROM public.projects LIMIT 1")
+                if project_row:
+                    test_project_id = str(project_row["id"])
+                    created_test_project = False
+                else:
+                    # Create a temporary project
+                    test_project_id = str(uuid.uuid4())
+                    try:
+                        await conn.execute(
+                            "INSERT INTO public.projects (id, name, created_at, updated_at) VALUES ($1, $2, NOW(), NOW())",
+                            uuid.UUID(test_project_id), "Startup Lock Test Project"
+                        )
+                        created_test_project = True
+                    except Exception as proj_exc:
+                        logger.warning("[LOCK_MECHANISM_CHECK] Could not insert test project, using dummy UUID: %s", proj_exc)
+                        created_test_project = False
+
+                try:
+                    # Test lock acquisition
+                    lock_res, job_id, owner_id = await manager.acquire_lock(test_project_id, None, "startup_check")
+                    if lock_res == LockResult.ACQUIRED:
+                        # Clean up the job we inserted
+                        await conn.execute(
+                            "DELETE FROM public.background_jobs WHERE id = $1",
+                            uuid.UUID(job_id)
+                        )
+                        # Remove from progress cache
+                        manager._progress_cache.pop(test_project_id, None)
+                        locking_ok = True
+                        lock_detail = "Lock acquire and release test passed"
+                    elif lock_res == LockResult.ALREADY_HELD:
+                        locking_ok = True
+                        lock_detail = f"Lock mechanism verified (already held by {owner_id})"
+                    else:
+                        lock_detail = f"Lock result: {lock_res}"
+                finally:
+                    if created_test_project:
+                        try:
+                            await conn.execute("DELETE FROM public.projects WHERE id = $1", uuid.UUID(test_project_id))
+                        except Exception as del_exc:
+                            logger.warning("[LOCK_MECHANISM_CHECK] Failed to delete test project: %s", del_exc)
+        except Exception as exc:
+            lock_detail = f"Lock test failed: {exc}"
+            logger.error("[LOCK_MECHANISM_CHECK] success=false error=%s", exc)
+
+    checks.append(("Lock Mechanism Readiness", locking_ok, lock_detail))
 
     # Critical Job system check
     job_system_ready = asyncpg_ok and db_ok and schema_ok and locking_ok and supabase_ok
@@ -557,7 +608,13 @@ async def run_startup_check() -> bool:
         "",
     ]
     report = "\n".join(lines)
-    print(report, flush=True)
+    try:
+        print(report, flush=True)
+    except UnicodeEncodeError:
+        try:
+            print(report.encode('ascii', errors='replace').decode('ascii'), flush=True)
+        except Exception:
+            pass
     logger.info("[STARTUP_CHECK] all_critical_pass=%s checks=%d",
                 all_critical_pass, len(checks))
     for label, ok, detail in checks:
@@ -565,10 +622,9 @@ async def run_startup_check() -> bool:
             logger.error("[STARTUP_CHECK_FAIL] %s — %s", label, detail)
 
     if not job_system_ready:
-        logger.critical("[JOB_SYSTEM_FATAL] Critical startup check failed. Job system is not ready. Aborting startup.")
-        sys.exit(1)
+        logger.critical("[JOB_SYSTEM_FATAL] Critical startup check failed. Job system is not ready.")
 
-    return all_critical_pass
+    return all_critical_pass and job_system_ready
 
 
 @asynccontextmanager
@@ -643,65 +699,29 @@ async def lifespan(app: FastAPI):
         settings.embedding_model,
     )
 
-    # ── Step 4: Schedule deferred startup tasks as a background asyncio task ──
-    # run_startup_check() makes network calls (Supabase, Storage).
-    # Scheduling it as a background task means the server yields and becomes
-    # ready immediately; the check runs after the first event-loop iteration.
-    async def _deferred_startup():
-        """Run deferred startup tasks after the server is live.
+    # ── Step 4: Run startup checks synchronously inside lifespan ──
+    from app.core.startup_state import (
+        mark_api_ready,
+        mark_startup_check_complete,
+        mark_initialization_complete,
+    )
 
-        All awaits inside this function can raise asyncio.CancelledError when the
-        server shuts down.  We let CancelledError propagate up to
-        _run_deferred_startup_safe() which swallows it cleanly.
-        Any other exception is also allowed to propagate for the same reason.
-        """
-        # Small yield so uvicorn finishes binding and starts accepting connections
-        await asyncio.sleep(0.5)
+    try:
+        startup_ok = await run_startup_check()
+        if not startup_ok:
+            logger.critical("[JOB_SYSTEM_FATAL] Critical startup check failed. Job system is not ready. Aborting startup.")
+            raise RuntimeError("Critical startup check failed. Job system is not ready.")
 
-        # Mark API as ready immediately — server is live and accepting requests
-        try:
-            from app.core.startup_state import (
-                mark_api_ready,
-                mark_startup_check_complete,
-                mark_initialization_complete,
-            )
-            mark_api_ready()
-            logger.info("[STARTUP_STATE] mark_api_ready() called")
-        except Exception as exc:
-            logger.warning("[STARTUP_STATE] mark_api_ready failed: %s", exc)
+        mark_api_ready()
+        mark_startup_check_complete(ok=True)
 
-        startup_ok = False
-        try:
-            startup_ok = await run_startup_check()
-            if not startup_ok:
-                logger.error(
-                    "[STARTUP_FAILED] One or more critical subsystem checks failed. "
-                    "Service is running but may be degraded."
-                )
-        except Exception as exc:
-            logger.warning("[STARTUP] run_startup_check deferred error: %s", exc)
-        finally:
-            try:
-                from app.core.startup_state import mark_startup_check_complete
-                mark_startup_check_complete(ok=startup_ok)
-                logger.info("[STARTUP_STATE] mark_startup_check_complete(ok=%s) called", startup_ok)
-            except Exception as exc:
-                logger.warning("[STARTUP_STATE] mark_startup_check_complete failed: %s", exc)
+        # Run startup initialization (locks clearance, stale job cleanup, etc.)
+        from app.api.v1.endpoints.platform import run_startup_initialization
+        await run_startup_initialization()
+        mark_initialization_complete()
+        logger.info("[STARTUP] Lifespan startup check and initialization completed successfully.")
 
-        try:
-            from app.api.v1.endpoints.platform import run_startup_initialization
-            await run_startup_initialization()
-        except Exception as exc:
-            logger.warning("[STARTUP] run_startup_initialization error: %s", exc)
-        finally:
-            try:
-                from app.core.startup_state import mark_initialization_complete
-                mark_initialization_complete()
-                logger.info("[STARTUP_STATE] mark_initialization_complete() called")
-            except Exception as exc:
-                logger.warning("[STARTUP_STATE] mark_initialization_complete failed: %s", exc)
-
-        # Model service diagnostics (runs ~0.5s after boot, non-blocking)
+        # Model service diagnostics (runs synchronously here, non-blocking / won't trigger load)
         try:
             from app.services import model_service as _ms_mod
             _ms_state  = _ms_mod.get_load_state()
@@ -730,32 +750,9 @@ async def lifespan(app: FastAPI):
         except Exception as exc:
             logger.warning("[STARTUP] log_deployment_diagnostics error: %s", exc)
 
-    async def _run_deferred_startup_safe():
-        """Outer safety wrapper — no exception from _deferred_startup can escape to the event loop.
-
-        Handles three cases:
-        1. Normal completion — no action needed
-        2. asyncio.CancelledError — server is shutting down; log and exit cleanly (no re-raise)
-        3. Any other exception — log as WORKER_CRASH but do not propagate
-        """
-        try:
-            await _deferred_startup()
-        except asyncio.CancelledError:
-            # The event loop was shut down (SIGTERM/restart) while the startup
-            # task was still running. This is expected and safe — just log it.
-            logger.info(
-                "[STARTUP_CANCELLED] Deferred startup task was cancelled — "
-                "server is shutting down cleanly. This is not an error."
-            )
-            # Do NOT re-raise: swallowing CancelledError here is intentional so
-            # that asyncio does not log "Task exception was never retrieved".
-        except Exception as exc:
-            logger.critical(
-                "[WORKER_CRASH] _deferred_startup raised unhandled exception: %s\n%s",
-                exc, traceback.format_exc(),
-            )
-
-    asyncio.create_task(_run_deferred_startup_safe())
+    except Exception as exc:
+        logger.critical("[STARTUP_FATAL] Startup initialization encountered a fatal error: %s", exc)
+        raise exc
 
     # Log CORS config
     logger.info("[CORS_STARTUP] Allowed Origins: %s", allowed_origins)
@@ -778,10 +775,11 @@ async def lifespan(app: FastAPI):
         logger.info("[SHUTDOWN_START] Signal Received: SIGTERM")
 
         try:
-            from app.services.job_manager import JobManager
+            from app.services.job_manager import JobManager, close_asyncpg_pool
             JobManager.get_instance().cancel_all_active_jobs()
+            await close_asyncpg_pool()
         except Exception as e:
-            logger.error("Failed to cancel background jobs: %s", e)
+            logger.error("Failed to clean up background jobs or database pool: %s", e)
 
         try:
             from app.services.cache_service import CacheService
@@ -1012,195 +1010,61 @@ async def health_cors(request: Request):
 
 
 @app.get("/health", tags=["health"])
-async def detailed_health():
-    import time as _time
-    import threading as _threading
+async def health_liveness():
+    """Simple liveness probe to verify that the API process is alive."""
+    return {"status": "healthy"}
 
-    # ── 1. Supabase connectivity ──────────────────────────────────────────────
-    db_status = "healthy"
-    db_error = None
+
+@app.get("/ready", tags=["health"])
+async def readiness_check():
+    """Readiness probe to verify that critical dependencies are ready."""
+    api_status = "healthy"
+    
+    # 2. Supabase
+    supabase_status = "healthy"
     try:
-        from app.api.v1.endpoints.platform import supabase_client
-        supabase_client.table("projects").select("id").limit(1).execute()
-    except Exception as e:
-        db_status = "unhealthy"
-        db_error = str(e)
-
-    # ── 2. Storage connectivity ───────────────────────────────────────────────
-    storage_status = "healthy"
-    storage_error = None
-    try:
-        from app.services.storage_provider import StorageService
-        StorageService.file_exists("candidate-files", "test-connectivity-probe")
-    except Exception as e:
-        storage_status = "unhealthy"
-        storage_error = str(e)
-
-    # ── 3. OpenRouter (key-presence check only — no network call) ────────────
-    openrouter_status = "configured" if settings.openrouter_api_key else "not_configured"
-
-    # ── 4. Model singleton status ─────────────────────────────────────────────
-    from app.services import model_service as _ms
-    model_loaded   = _ms.is_loaded()
-    model_name     = _ms.get_model_name() or settings.embedding_model
-    model_state    = _ms.get_load_state()
-    model_error    = str(_ms.get_load_error()) if _ms.get_load_error() else None
-
-    # Embedding dimension (only available after model is loaded)
-    embedding_dim: int | None = None
-    singleton_active = False
-    try:
-        if model_loaded:
-            raw = _ms.get_model()  # does not block — already loaded
-            embedding_dim = int(raw.get_sentence_embedding_dimension())
-            singleton_active = True
-    except Exception:
-        pass
-
-    # Count SentenceTransformer instances in the process (should always be 1 or 0)
-    # Inspect _MODEL_CACHE from embedding.py + model_service._model
-    st_instance_count = 0
-    try:
-        from src.features.embedding import _MODEL_CACHE as _ec
-        st_instance_count = len(_ec)
-    except Exception:
-        pass
-    # model_service._model counts as 1 additional if loaded
-    # In a healthy process: st_instance_count == 1 (both point to the same object)
-
-    # ── 5. HF cache verification ──────────────────────────────────────────────
-    hf_home         = os.environ.get("HF_HOME", "/app/.cache/huggingface")
-    st_home         = os.environ.get("SENTENCE_TRANSFORMERS_HOME", "/app/.cache/sentence-transformers")
-    hf_cache_found  = os.path.isdir(hf_home)
-    docker_cache_found = os.path.isdir(st_home) and bool(
-        # Non-empty means model files are present (Docker pre-download worked)
-        os.listdir(st_home) if os.path.isdir(st_home) else []
-    )
-
-    # ── 6. FAISS availability ─────────────────────────────────────────────────
-    faiss_available = False
-    try:
-        import faiss as _faiss  # noqa: F401
-        faiss_available = True
-    except ImportError:
-        pass
-
-    # ── 7. Memory telemetry ───────────────────────────────────────────────────
-    rss_mb   = 0.0
-    cpu_pct  = 0.0
-    avail_mb = 0.0
-    try:
-        _proc    = psutil.Process(os.getpid())
-        rss_mb   = _proc.memory_info().rss / (1024 * 1024)
-        cpu_pct  = _proc.cpu_percent(interval=None)
-        avail_mb = psutil.virtual_memory().available / (1024 * 1024)
-    except Exception:
-        pass
-
-    # ── 8. Background jobs ────────────────────────────────────────────────────
-    active_jobs: list[dict] = []
-    failed_recent = 0
-    recovering_jobs = 0
-    try:
-        from app.services.job_manager import JobManager
         from app.api.v1.endpoints.platform import supabase_client as _sc
-        _jm = JobManager.get_instance()
-        for pid, info in _jm._progress_cache.items():
-            active_jobs.append({
-                "project_id": pid,
-                "status": info.get("status"),
-                "stage": info.get("current_stage"),
-                "progress": info.get("progress_percentage"),
-                "processed": info.get("processed_candidates"),
-                "total": info.get("total_candidates"),
-            })
-        _fjobs = _sc.table("background_jobs").select("id").eq("status", "failed").execute()
-        failed_recent = len(_fjobs.data) if _fjobs.data else 0
-        _rjobs = _sc.table("background_jobs").select("id").eq("status", "retrying").execute()
-        recovering_jobs = len(_rjobs.data) if _rjobs.data else 0
+        _sc.table("projects").select("id").limit(1).execute()
     except Exception:
-        pass
-
-    # ── 9. In-process ranking cache size ─────────────────────────────────────
-    cache_size = 0
+        supabase_status = "unhealthy"
+        
+    # 3. Database Connection
+    database_status = "healthy"
     try:
-        from app.api.v1.endpoints.platform import _backend_ranking_cache
-        cache_size = len(_backend_ranking_cache)
+        from app.services.job_manager import DBConnection
+        async with DBConnection() as conn:
+            val = await conn.fetchval("SELECT 1")
+            if val != 1:
+                database_status = "unhealthy"
     except Exception:
-        pass
-
-    # ── 10. Thread count ──────────────────────────────────────────────────────
-    thread_count = _threading.active_count()
-
-    # ── Overall status ────────────────────────────────────────────────────────
-    overall = "healthy"
-    if db_status == "unhealthy" or storage_status == "unhealthy":
-        overall = "degraded"
-    # NOTE: model not loaded is expected at startup (lazy-load mode).
-    # Do NOT degrade health status just because model is unloaded.
-    if model_state == "failed":
-        overall = "degraded"
-
-    return {
-        # Top-level readiness
-        "status": overall,
-        "application_ready": True,           # always True — model loads lazily on first request
-        "timestamp": _time.time(),
-        "uptime_seconds": round(_time.time() - _startup_time, 1),
-
-        # Model singleton — "unloaded" is EXPECTED at startup (lazy-load mode)
-        "model": {
-            "loaded": model_loaded,
-            "model_state": model_state,      # "unloaded"|"loading"|"loaded"|"failed"
-            "load_mode": "lazy",             # model loads on first embedding request
-            "cached": model_loaded,
-            "name": model_name,
-            "configured_model": settings.embedding_model,
-            "embedding_dim": embedding_dim,  # None until loaded
-            "singleton_active": singleton_active,
-            "sentence_transformer_instances": st_instance_count,
-            "error": model_error,
-        },
-
-        # HF / Docker cache
-        "cache": {
-            "hf_home": hf_home,
-            "st_home": st_home,
-            "hf_cache_found": hf_cache_found,
-            "docker_cache_found": docker_cache_found,
-        },
-
-        # External services
-        "database":  {"status": db_status,  "error": db_error},
-        "storage":   {"status": storage_status, "error": storage_error},
-        "openrouter": {"status": openrouter_status, "ready": openrouter_status == "configured"},
-
-        # FAISS
-        "faiss": {"available": faiss_available},
-
-        # Memory & CPU
-        "memory": {
-            "rss_mb":        round(rss_mb, 1),
-            "available_mb":  round(avail_mb, 1),
-            "safety_limit_mb": 900.0,     # ~950 MB was the old OOM threshold
-            "under_threshold": rss_mb < 900.0,
-            "model_load_mode": "lazy",    # model loads on first embedding request
-        },
-        "cpu_percent": round(cpu_pct, 1),
-        "threads": thread_count,
-
-        # Background jobs
-        "background_jobs": {
-            "active":          active_jobs,
-            "active_count":    len(active_jobs),
-            "failed_jobs":     failed_recent,
-            "recovering_jobs": recovering_jobs,
-        },
-
-        # Convenience flat fields (for quick scripted checks)
-        "ranking_cache_size": cache_size,
-        "supabase_ready":   db_status == "healthy",
-        "storage_ready":    storage_status == "healthy",
-        "openrouter_ready": openrouter_status == "configured",
-        "model_loaded":     model_loaded,
-    }
+        database_status = "unhealthy"
+        
+    # 4. Job system & Distributed locking
+    job_system_status = "healthy" if database_status == "healthy" else "unhealthy"
+    distributed_locking_status = "healthy" if database_status == "healthy" else "unhealthy"
+    
+    # 5. Embedding model load state (do NOT load it)
+    from app.services import model_service as _ms
+    embedding_model_status = _ms.get_load_state()  # returns "unloaded", "loaded", "loading", or "failed"
+    
+    overall_ready = (
+        api_status == "healthy" and 
+        supabase_status == "healthy" and 
+        database_status == "healthy" and 
+        job_system_status == "healthy"
+    )
+    
+    status_code = 200 if overall_ready else 503
+    
+    from fastapi.responses import JSONResponse
+    return JSONResponse(
+        status_code=status_code,
+        content={
+            "api": api_status,
+            "supabase": supabase_status,
+            "database": database_status,
+            "job_system": job_system_status,
+            "distributed_locking": distributed_locking_status,
+            "embedding_model": embedding_model_status
+        }
+    )

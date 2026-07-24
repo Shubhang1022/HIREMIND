@@ -318,11 +318,11 @@ async def _verify_background_jobs_table_exists() -> None:
     logger = logging.getLogger(__name__)
     try:
         supabase_client.table("background_jobs").select("id").limit(1).execute()
-        logger.info("✓ Verified background_jobs table exists in Supabase database.")
-        print("✓ Verified background_jobs table exists in Supabase database.", flush=True)
+        logger.info("[STARTUP] Verified background_jobs table exists in Supabase database.")
+        print("[STARTUP] Verified background_jobs table exists in Supabase database.", flush=True)
     except Exception as exc:
-        logger.error("✗ Failed to verify background_jobs table: %s. Please run migrations.", exc)
-        print(f"✗ Failed to verify background_jobs table: {exc}", flush=True)
+        logger.error("[STARTUP_ERROR] Failed to verify background_jobs table: %s. Please run migrations.", exc)
+        print(f"[STARTUP_ERROR] Failed to verify background_jobs table: {exc}", flush=True)
 
 
 async def _recover_interrupted_jobs() -> None:
@@ -442,10 +442,8 @@ async def _delayed_resume_indexing(project_id: str, user_id: str, delay_seconds:
             loop = _asyncio.new_event_loop()
             _asyncio.set_event_loop(loop)
         if loop.is_running():
-            from asyncio import run_coroutine_threadsafe
-            fut = run_coroutine_threadsafe(coro, loop)
             try:
-                fut.result(timeout=10.0)
+                await coro
             except Exception:
                 pass
         else:
@@ -1267,19 +1265,24 @@ Elapsed: {elapsed_str}
             user_id = None
 
         # Lock check / start job using the event loop wrapper
-        try:
-            loop = asyncio.get_event_loop()
-        except RuntimeError:
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            
+        main_loop = getattr(job_manager, "loop", None)
         coro = job_manager.start_job(project_id, user_id, "Validating candidates")
-        if loop.is_running():
+        if main_loop and main_loop.is_running():
             from asyncio import run_coroutine_threadsafe
-            fut = run_coroutine_threadsafe(coro, loop)
+            fut = run_coroutine_threadsafe(coro, main_loop)
             started = fut.result(timeout=15.0)
         else:
-            started = loop.run_until_complete(coro)
+            try:
+                loop = asyncio.get_event_loop()
+            except RuntimeError:
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+            if loop.is_running():
+                from asyncio import run_coroutine_threadsafe
+                fut = run_coroutine_threadsafe(coro, loop)
+                started = fut.result(timeout=15.0)
+            else:
+                started = loop.run_until_complete(coro)
 
         lock_res, job_id, owner_id = started
 
@@ -2146,11 +2149,7 @@ def _sync_update_progress(
     import asyncio
     from app.services.job_manager import JobManager
     manager = JobManager.get_instance()
-    try:
-        loop = asyncio.get_event_loop()
-    except RuntimeError:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
+    main_loop = getattr(manager, "loop", None)
 
     coro = manager.update_job_progress(
         project_id,
@@ -2162,44 +2161,74 @@ def _sync_update_progress(
         eta,
         retry_count,
     )
-    if loop.is_running():
+
+    if main_loop and main_loop.is_running():
         from asyncio import run_coroutine_threadsafe
-        future = run_coroutine_threadsafe(coro, loop)
+        future = run_coroutine_threadsafe(coro, main_loop)
         try:
             future.result(timeout=5.0)
         except Exception as exc:
             from app.services.job_manager import LockLostError
             if isinstance(exc, LockLostError) or "LockLostError" in type(exc).__name__:
                 raise exc
-            pass  # Non-critical: other progress update failures must never abort indexing
+            pass
     else:
         try:
-            loop.run_until_complete(coro)
-        except Exception as exc:
-            from app.services.job_manager import LockLostError
-            if isinstance(exc, LockLostError) or "LockLostError" in type(exc).__name__:
-                raise exc
-            pass
+            loop = asyncio.get_event_loop()
+        except RuntimeError:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+        if loop.is_running():
+            from asyncio import run_coroutine_threadsafe
+            future = run_coroutine_threadsafe(coro, loop)
+            try:
+                future.result(timeout=5.0)
+            except Exception as exc:
+                from app.services.job_manager import LockLostError
+                if isinstance(exc, LockLostError) or "LockLostError" in type(exc).__name__:
+                    raise exc
+                pass
+        else:
+            try:
+                loop.run_until_complete(coro)
+            except Exception as exc:
+                from app.services.job_manager import LockLostError
+                if isinstance(exc, LockLostError) or "LockLostError" in type(exc).__name__:
+                    raise exc
+                pass
 
 def _sync_fail_job(project_id: str, reason: str):
     import asyncio
     from app.services.job_manager import JobManager
     manager = JobManager.get_instance()
-    try:
-        loop = asyncio.get_event_loop()
-    except RuntimeError:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
+    main_loop = getattr(manager, "loop", None)
     coro = manager.fail_job(project_id, reason)
-    if loop.is_running():
+
+    if main_loop and main_loop.is_running():
         from asyncio import run_coroutine_threadsafe
-        future = run_coroutine_threadsafe(coro, loop)
+        future = run_coroutine_threadsafe(coro, main_loop)
         try:
             future.result(timeout=5.0)
         except Exception:
             pass
     else:
-        loop.run_until_complete(coro)
+        try:
+            loop = asyncio.get_event_loop()
+        except RuntimeError:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+        if loop.is_running():
+            from asyncio import run_coroutine_threadsafe
+            future = run_coroutine_threadsafe(coro, loop)
+            try:
+                future.result(timeout=5.0)
+            except Exception:
+                pass
+        else:
+            try:
+                loop.run_until_complete(coro)
+            except Exception:
+                pass
 
 @router.get("/diagnostics")
 async def get_diagnostics(current_user: Optional[AuthUser] = Depends(get_optional_user)):
