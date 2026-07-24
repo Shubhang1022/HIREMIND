@@ -202,6 +202,30 @@ export default function ProjectDetailPage() {
     };
   }, [project?.embedding_status, projectId, load]);
 
+  // Fallback Polling (Phase 11 / Phase 15)
+  useEffect(() => {
+    const activeStatuses = ['queued', 'processing', 'embedding', 'indexing'];
+    if (!project || !activeStatuses.includes(project.embedding_status ?? '')) {
+      return;
+    }
+
+    const pollInterval = setInterval(async () => {
+      try {
+        const statusData = await platformApi.workerStatus(projectId);
+        if (statusData) {
+          setWorkerStatus(statusData);
+          if (statusData.status === 'completed' || statusData.status === 'failed' || statusData.status === 'cancelled') {
+            load();
+          }
+        }
+      } catch (err) {
+        console.error('[Polling] Error fetching worker status:', err);
+      }
+    }, 4000);
+
+    return () => clearInterval(pollInterval);
+  }, [project?.embedding_status, projectId, load]);
+
   // Trigger background refresh if project embedding status ready but ranking is fallback (PART 1)
   useEffect(() => {
     const isReady = project && (project.embedding_status === 'ready' || project.embedding_status === 'completed');

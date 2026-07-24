@@ -21,6 +21,9 @@ COPY backend/requirements.txt .
 RUN pip install --upgrade pip && \
     pip install --no-cache-dir -r requirements.txt
 
+# Verify asyncpg installation at build time
+RUN python -c "import asyncpg; print('asyncpg:', asyncpg.__version__)"
+
 # ── HuggingFace cache configuration ──────────────────────────────────────────
 # These vars are read by model_service at runtime. Never override them in Railway.
 ENV HF_HOME=/app/.cache/huggingface \

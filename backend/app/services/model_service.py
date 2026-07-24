@@ -518,6 +518,7 @@ def _do_load(model_name: str) -> None:
             "[MODEL_SERVICE] [MODEL_LOAD_START] model=%s pid=%d",
             model_name, os.getpid(),
         )
+        print(f"[MODEL_LOAD_START] model={model_name}", flush=True)
 
         # 2. Verify Cache
         _stage("VERIFY_CACHE", t0)
@@ -527,6 +528,9 @@ def _do_load(model_name: str) -> None:
                 f"Docker cache incomplete for model '{model_name}'. "
                 f"Missing: {missing_files}. Network download disabled."
             )
+        
+        logger.info("[MODEL_CACHE_RESOLVED] resolved_model_dir=%s", model_dir)
+        print(f"[MODEL_CACHE_RESOLVED] resolved_model_dir={model_dir}", flush=True)
 
         # 3. Check in-process cache
         try:
@@ -592,6 +596,8 @@ def _do_load(model_name: str) -> None:
             f"elapsed={elapsed:.1f}s embedding_dim={dim} RSS={rss_post:.1f}MB",
             flush=True,
         )
+        logger.info("[MODEL_LOAD_COMPLETE] model=%s", model_name)
+        print(f"[MODEL_LOAD_COMPLETE] model={model_name}", flush=True)
 
         # gc.collect to free any load-time temporaries
         gc.collect()
@@ -610,6 +616,8 @@ def _do_load(model_name: str) -> None:
 
         _stage("MODEL_READY", t0)
         print(f"[MODEL_SERVICE] [MODEL_SINGLETON_CREATED] name={model_name}", flush=True)
+        logger.info("[MODEL_SINGLETON_CREATED] name=%s", model_name)
+        print(f"[MODEL_SINGLETON_CREATED] name={model_name}", flush=True)
         print(f"[CONCURRENCY] thread={tname} (tid={tid}) completed _do_load()", flush=True)
         logger.info(f"[CONCURRENCY] thread={tname} (tid={tid}) completed _do_load()")
 

@@ -38,6 +38,14 @@ class LockLostError(RuntimeError):
     """Raised when a worker attempts to update a job but has lost the lock."""
 
 
+from enum import Enum
+
+class LockResult(Enum):
+    ACQUIRED = "ACQUIRED"
+    ALREADY_HELD = "ALREADY_HELD"
+    ERROR = "ERROR"
+
+
 def get_clean_db_url() -> str:
     url = os.environ.get("DATABASE_URL", "")
     if "postgresql+asyncpg://" in url:
@@ -52,7 +60,7 @@ class DBConnection:
     async def __aenter__(self):
         url = get_clean_db_url()
         import asyncpg
-        self.conn = await asyncpg.connect(url)
+        self.conn = await asyncpg.connect(url, ssl="require")
         return self.conn
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
@@ -102,44 +110,68 @@ class JobManager:
     # Schema initialized flag
     _schema_initialized: bool = False
 
-    async def ensure_db_schema(self):
-        """Ensure all required columns and indexes exist in public.background_jobs."""
+    async def ensure_db_schema(self) -> bool:
+        """Verify all required columns and indexes exist in public.background_jobs."""
         if JobManager._schema_initialized:
-            return
+            return True
             
         try:
             async with DBConnection() as conn:
-                logger.info("[DB_SCHEMA] Checking and enforcing background_jobs columns/indexes...")
-                # 1. Add owner_id and lease_expires_at
-                await conn.execute(
+                # 1. Check table existence
+                table_exists = await conn.fetchval(
                     """
-                    ALTER TABLE public.background_jobs ADD COLUMN IF NOT EXISTS owner_id VARCHAR(100);
-                    ALTER TABLE public.background_jobs ADD COLUMN IF NOT EXISTS lease_expires_at TIMESTAMPTZ;
-                    """
-                )
-                # 2. Add progress columns
-                await conn.execute(
-                    """
-                    ALTER TABLE public.background_jobs ADD COLUMN IF NOT EXISTS processed_candidates INTEGER DEFAULT 0;
-                    ALTER TABLE public.background_jobs ADD COLUMN IF NOT EXISTS total_candidates INTEGER DEFAULT 0;
-                    ALTER TABLE public.background_jobs ADD COLUMN IF NOT EXISTS ram_usage DOUBLE PRECISION DEFAULT 0.0;
-                    ALTER TABLE public.background_jobs ADD COLUMN IF NOT EXISTS peak_ram DOUBLE PRECISION DEFAULT 0.0;
-                    ALTER TABLE public.background_jobs ADD COLUMN IF NOT EXISTS eta VARCHAR(50);
-                    ALTER TABLE public.background_jobs ADD COLUMN IF NOT EXISTS speed DOUBLE PRECISION DEFAULT 0.0;
+                    SELECT EXISTS (
+                        SELECT FROM information_schema.tables 
+                        WHERE table_schema = 'public' AND table_name = 'background_jobs'
+                    )
                     """
                 )
-                # 3. Add partial unique index
-                await conn.execute(
+                if not table_exists:
+                    logger.error("[DB_SCHEMA_ERROR] Table public.background_jobs does not exist.")
+                    return False
+                
+                # 2. Check columns
+                columns = await conn.fetch(
                     """
-                    CREATE UNIQUE INDEX IF NOT EXISTS idx_background_jobs_active_project 
-                    ON public.background_jobs (project_id) 
-                    WHERE status NOT IN ('completed', 'failed', 'cancelled');
+                    SELECT column_name FROM information_schema.columns 
+                    WHERE table_schema = 'public' AND table_name = 'background_jobs'
                     """
                 )
-                logger.info("[DB_SCHEMA] background_jobs table verified successfully.")
+                existing_cols = {c["column_name"] for c in columns}
+                required_cols = {
+                    "id", "project_id", "user_id", "job_type", "current_stage", 
+                    "progress_percentage", "status", "failure_reason", "started_at", 
+                    "updated_at", "last_heartbeat", "retry_count", "owner_id", 
+                    "lease_expires_at", "processed_candidates", "total_candidates", 
+                    "ram_usage", "peak_ram", "eta", "speed"
+                }
+                
+                missing_cols = required_cols - existing_cols
+                if missing_cols:
+                    logger.error("[DB_SCHEMA_ERROR] Missing columns in public.background_jobs: %s", missing_cols)
+                    return False
+                    
+                # 3. Check partial unique index
+                index_exists = await conn.fetchval(
+                    """
+                    SELECT EXISTS (
+                        SELECT 1 FROM pg_indexes 
+                        WHERE schemaname = 'public' 
+                          AND tablename = 'background_jobs' 
+                          AND indexname = 'idx_background_jobs_active_project'
+                    )
+                    """
+                )
+                if not index_exists:
+                    logger.error("[DB_SCHEMA_ERROR] Index idx_background_jobs_active_project does not exist.")
+                    return False
+                    
+                logger.info("[JOB_SCHEMA_CHECK] jobs_table=true lock_fields=true lease_fields=true required_indexes=true success=true")
                 JobManager._schema_initialized = True
+                return True
         except Exception as e:
-            logger.error("[DB_SCHEMA_ERROR] Failed to ensure database schema: %s", e)
+            logger.error("[DB_SCHEMA_ERROR] Failed to verify database schema: %s", e)
+            return False
 
     async def clear_locks_on_boot(self):
         """Clear owner_id and lease_expires_at for all active background jobs at startup.
@@ -161,15 +193,17 @@ class JobManager:
         except Exception as e:
             logger.error("[STARTUP_ERROR] Failed to clear lock owners: %s", e)
 
-    async def acquire_lock(self, project_id: str, user_id: Optional[str], current_stage: str) -> bool:
+    async def acquire_lock(self, project_id: str, user_id: Optional[str], current_stage: str) -> tuple[LockResult, Optional[str], Optional[str]]:
         """
         Tries to acquire or renew a distributed DB-level lock for the project.
-        Returns True if acquired, False if locked by another worker.
+        Returns (LockResult, job_id, owner_id).
         """
         worker_id = self.worker_id
         now = datetime.now(timezone.utc)
         lease_duration = timedelta(seconds=60)
         expires_at = now + lease_duration
+
+        logger.info("[LOCK_ACQUIRE_START] project=%s worker=%s", project_id, worker_id)
 
         try:
             async with DBConnection() as conn:
@@ -220,10 +254,10 @@ class JobManager:
                             "speed": 0.0,
                         }
                         logger.info("[LOCK_ACQUIRED] Lock claimed/recovered for project %s. Job ID: %s", project_id, job_id)
-                        return True
+                        return LockResult.ACQUIRED, job_id, worker_id
                     else:
-                        logger.warning("[LOCK_REJECTED] Project %s is locked by owner %s until %s", project_id, owner_id, lease_expires_at)
-                        return False
+                        logger.warning("[LOCK_ALREADY_HELD] project=%s owner=%s", project_id, owner_id)
+                        return LockResult.ALREADY_HELD, job_id, owner_id
                 else:
                     # Create a new active job
                     job_id = str(uuid.uuid4())
@@ -253,13 +287,19 @@ class JobManager:
                             "speed": 0.0,
                         }
                         logger.info("[LOCK_ACQUIRED] Created new background job %s and locked for project %s", job_id, project_id)
-                        return True
+                        return LockResult.ACQUIRED, job_id, worker_id
                     except Exception as ins_err:
                         logger.warning("[LOCK_REJECTED] Concurrent insert failed for project %s: %s", project_id, ins_err)
-                        return False
+                        res = await conn.fetchrow(
+                            "SELECT id, owner_id FROM public.background_jobs WHERE project_id = $1 AND status NOT IN ('completed', 'failed', 'cancelled')",
+                            uuid.UUID(project_id)
+                        )
+                        if res:
+                            return LockResult.ALREADY_HELD, str(res["id"]), res["owner_id"]
+                        return LockResult.ERROR, None, str(ins_err)
         except Exception as e:
             logger.error("[LOCK_ERROR] Error acquiring lock for project %s: %s", project_id, e)
-            return False
+            return LockResult.ERROR, None, str(e)
 
     async def cleanup_stale_jobs(self, timeout_minutes: int = 15):
         """
@@ -330,9 +370,11 @@ class JobManager:
         except Exception:
             return False
 
-    async def start_job(self, project_id: str, user_id: Optional[str] = None, current_stage: str = "Enqueued") -> bool:
+    async def start_job(self, project_id: str, user_id: Optional[str] = None, current_stage: str = "Enqueued") -> tuple[LockResult, Optional[str], Optional[str]]:
         """Acquire lock on job and transition state to 'processing'."""
-        await self.ensure_db_schema()
+        db_ok = await self.ensure_db_schema()
+        if not db_ok:
+            return LockResult.ERROR, None, "Database schema check failed"
         return await self.acquire_lock(project_id, user_id, current_stage)
 
     def finish_job(self, project_id: str):
@@ -377,76 +419,76 @@ class JobManager:
             )
         return valid
 
-    async def register_job(self, project_id: str, user_id: str, job_type: str) -> Optional[str]:
+    async def register_job(self, project_id: str, user_id: str, job_type: str) -> str:
         """Register a new job in Supabase background_jobs table with lock protection."""
-        await self.ensure_db_schema()
+        logger.info("[INDEX_JOB_REGISTER_START] project=%s", project_id)
+        db_ok = await self.ensure_db_schema()
+        if not db_ok:
+            raise RuntimeError("Database schema check failed")
         
         now = datetime.now(timezone.utc)
         lease_duration = timedelta(seconds=60)
         expires_at = now + lease_duration
         worker_id = self.worker_id
         
-        # Check if there is an active job
-        try:
-            async with DBConnection() as conn:
-                active_job = await conn.fetchrow(
-                    """
-                    SELECT id, owner_id, lease_expires_at, status 
-                    FROM public.background_jobs
-                    WHERE project_id = $1 AND status NOT IN ('completed', 'failed', 'cancelled')
-                    """,
-                    uuid.UUID(project_id)
-                )
+        async with DBConnection() as conn:
+            active_job = await conn.fetchrow(
+                """
+                SELECT id, owner_id, lease_expires_at, status 
+                FROM public.background_jobs
+                WHERE project_id = $1 AND status NOT IN ('completed', 'failed', 'cancelled')
+                """,
+                uuid.UUID(project_id)
+            )
+            
+            if active_job:
+                owner_id = active_job["owner_id"]
+                lease_expires_at = active_job["lease_expires_at"]
                 
-                if active_job:
-                    owner_id = active_job["owner_id"]
-                    lease_expires_at = active_job["lease_expires_at"]
-                    
-                    if owner_id == worker_id or owner_id is None or lease_expires_at < now:
-                        job_id = str(active_job["id"])
-                        await conn.execute(
-                            """
-                            UPDATE public.background_jobs
-                            SET owner_id = $1,
-                                lease_expires_at = $2,
-                                last_heartbeat = $3,
-                                updated_at = $3,
-                                status = 'queued',
-                                current_stage = 'Enqueued',
-                                failure_reason = NULL,
-                                retry_count = 0
-                            WHERE id = $4
-                            """,
-                            worker_id, expires_at, now, uuid.UUID(job_id)
-                        )
-                        logger.info("[REGISTER_JOB] Reclaimed existing job %s for project %s as queued", job_id, project_id)
-                    else:
-                        logger.warning("[REGISTER_JOB] Cannot register job. Project %s already has active job run by %s", project_id, owner_id)
-                        return str(active_job["id"])
+                if owner_id == worker_id or owner_id is None or lease_expires_at < now:
+                    job_id = str(active_job["id"])
+                    await conn.execute(
+                        """
+                        UPDATE public.background_jobs
+                        SET owner_id = $1,
+                            lease_expires_at = $2,
+                            last_heartbeat = $3,
+                            updated_at = $3,
+                            status = 'queued',
+                            current_stage = 'Enqueued',
+                            failure_reason = NULL,
+                            retry_count = 0
+                        WHERE id = $4
+                        """,
+                        worker_id, expires_at, now, uuid.UUID(job_id)
+                    )
+                    logger.info("[INDEX_JOB_REGISTERED] Reclaimed existing job %s for project %s as queued", job_id, project_id)
                 else:
-                    job_id = str(uuid.uuid4())
-                    try:
-                        await conn.execute(
-                            """
-                            INSERT INTO public.background_jobs (
-                                id, project_id, user_id, job_type, current_stage, progress_percentage, status, owner_id, lease_expires_at, started_at, updated_at, last_heartbeat, retry_count
-                            ) VALUES ($1, $2, $3, $4, 'Enqueued', 0, 'queued', $5, $6, $7, $7, $7, 0)
-                            """,
-                            uuid.UUID(job_id), uuid.UUID(project_id), uuid.UUID(user_id) if user_id else None,
-                            job_type, worker_id, expires_at, now
-                        )
-                        logger.info("[REGISTER_JOB] Registered new job %s for project %s", job_id, project_id)
-                    except Exception as e:
-                        logger.warning("[REGISTER_JOB] Concurrent insert failed for project %s: %s", project_id, e)
-                        res = await conn.fetchrow(
-                            "SELECT id FROM public.background_jobs WHERE project_id = $1 AND status NOT IN ('completed', 'failed', 'cancelled')",
-                            uuid.UUID(project_id)
-                        )
-                        return str(res["id"]) if res else None
-        except Exception as db_err:
-            logger.error("[REGISTER_JOB_ERROR] Database error registering job for project %s: %s", project_id, db_err)
-            # Memory fallback
-            job_id = str(uuid.uuid4())
+                    job_id = str(active_job["id"])
+                    logger.warning("[INDEX_JOB_REGISTERED] Reused active job %s for project %s owned by %s", job_id, project_id, owner_id)
+            else:
+                job_id = str(uuid.uuid4())
+                try:
+                    await conn.execute(
+                        """
+                        INSERT INTO public.background_jobs (
+                            id, project_id, user_id, job_type, current_stage, progress_percentage, status, owner_id, lease_expires_at, started_at, updated_at, last_heartbeat, retry_count
+                        ) VALUES ($1, $2, $3, $4, 'Enqueued', 0, 'queued', $5, $6, $7, $7, $7, 0)
+                        """,
+                        uuid.UUID(job_id), uuid.UUID(project_id), uuid.UUID(user_id) if user_id else None,
+                        job_type, worker_id, expires_at, now
+                    )
+                    logger.info("[INDEX_JOB_REGISTERED] Registered new job %s for project %s", job_id, project_id)
+                except Exception as e:
+                    logger.warning("[INDEX_JOB_REGISTERED] Concurrent insert failed for project %s, fetching existing: %s", project_id, e)
+                    res = await conn.fetchrow(
+                        "SELECT id FROM public.background_jobs WHERE project_id = $1 AND status NOT IN ('completed', 'failed', 'cancelled')",
+                        uuid.UUID(project_id)
+                    )
+                    if res:
+                        job_id = str(res["id"])
+                    else:
+                        raise e
 
         # Synchronize progress cache
         self._progress_cache[project_id] = {
@@ -481,6 +523,7 @@ class JobManager:
         speed: Optional[float] = None
     ):
         """Update job metrics in-memory and persist to Supabase background_jobs table."""
+        worker_id = self.worker_id
         cache = self._progress_cache.get(project_id)
         if not cache:
             # Reconstruct cache from DB
@@ -555,8 +598,9 @@ class JobManager:
             cache["retry_count"] = retry_count
 
         now = datetime.now(timezone.utc)
-        expires_at = now + timedelta(seconds=60)
-        worker_id = self.worker_id
+        is_terminal = target_status in ('completed', 'failed', 'cancelled')
+        expires_at = None if is_terminal else now + timedelta(seconds=60)
+        db_owner = None if is_terminal else worker_id
 
         # Persist to database verifying lock ownership
         try:
@@ -576,12 +620,13 @@ class JobManager:
                         ram_usage = $9,
                         peak_ram = $10,
                         eta = $11,
-                        speed = $12
-                    WHERE id = $13 AND owner_id = $14
+                        speed = $12,
+                        owner_id = $13
+                    WHERE id = $14 AND owner_id = $15
                     """,
                     stage, progress, target_status, now, expires_at, retry_count,
                     processed_candidates, total_candidates, ram, cache["peak_ram"],
-                    eta, speed or 0.0, uuid.UUID(cache["job_id"]), worker_id
+                    eta, speed or 0.0, db_owner, uuid.UUID(cache["job_id"]), worker_id
                 )
                 
                 if res == 'UPDATE 0':
@@ -729,6 +774,13 @@ class JobManager:
         except Exception as exc:
             logger.error("Database job cancel all failed: %s", exc)
 
+    _recovery_semaphore: Optional[asyncio.Semaphore] = None
+
+    def get_recovery_semaphore(self) -> asyncio.Semaphore:
+        if self._recovery_semaphore is None:
+            self._recovery_semaphore = asyncio.Semaphore(1)
+        return self._recovery_semaphore
+
     async def recover_interrupted_jobs(self):
         """Startup job checker: restarts interrupted jobs with exponential backoff.
 
@@ -750,14 +802,17 @@ class JobManager:
         retry_counts: dict[str, int] = {}
 
         try:
+            now = datetime.now(timezone.utc)
             async with DBConnection() as conn:
-                # Find all background jobs that are in active status
+                # Find all stale background jobs that are in active status
                 jobs = await conn.fetch(
                     """
                     SELECT id, project_id, user_id, retry_count, failure_reason, status 
                     FROM public.background_jobs
                     WHERE status IN ('queued', 'processing', 'embedding', 'indexing', 'retrying')
-                    """
+                      AND (owner_id IS NULL OR lease_expires_at < $1)
+                    """,
+                    now
                 )
                 
                 if not jobs:
@@ -776,6 +831,42 @@ class JobManager:
                     retry_count = job.get("retry_count", 0)
                     failure_reason = job.get("failure_reason") or ""
 
+                    # Verify that candidate upload exists
+                    upload = await conn.fetchrow(
+                        "SELECT id FROM public.candidate_uploads WHERE project_id = $1 AND status = 'COMPLETED' LIMIT 1",
+                        uuid.UUID(project_id)
+                    )
+                    if not upload:
+                        reason = "Recovery aborted: candidate upload not found."
+                        logger.warning(
+                            "[RECOVERY] Permanently failing job %s for project %s: %s",
+                            job_id, project_id, reason,
+                        )
+                        await conn.execute(
+                            """
+                            UPDATE public.background_jobs 
+                            SET status = 'failed', 
+                                failure_reason = $1, 
+                                updated_at = NOW(),
+                                lease_expires_at = NULL,
+                                owner_id = NULL
+                            WHERE id = $2
+                            """,
+                            reason, job["id"]
+                        )
+                        await conn.execute(
+                            """
+                            UPDATE public.projects 
+                            SET embedding_status = 'failed', 
+                                status = 'failed', 
+                                updated_at = NOW() 
+                            WHERE id = $1
+                            """,
+                            job["project_id"]
+                        )
+                        permanent_failures += 1
+                        continue
+
                     is_non_retryable = any(r in failure_reason for r in NON_RETRYABLE_REASONS)
 
                     if is_non_retryable or retry_count >= 3:
@@ -792,7 +883,9 @@ class JobManager:
                             UPDATE public.background_jobs 
                             SET status = 'failed', 
                                 failure_reason = $1, 
-                                updated_at = NOW() 
+                                updated_at = NOW(),
+                                lease_expires_at = NULL,
+                                owner_id = NULL
                             WHERE id = $2
                             """,
                             reason, job["id"]
@@ -859,9 +952,11 @@ class JobManager:
         await self._safely_run_indexing(project_id)
 
     async def _safely_run_indexing(self, project_id: str):
-        """Spawns process_project_data_task under a safe wrapper."""
+        """Spawns process_project_data_task under a safe wrapper with concurrency control."""
         from app.api.v1.endpoints.platform import process_project_data_task
-        try:
-            await asyncio.to_thread(process_project_data_task, project_id)
-        except Exception as e:
-            logger.error("Recovered indexing failed for project %s: %s", project_id, e)
+        sem = self.get_recovery_semaphore()
+        async with sem:
+            try:
+                await asyncio.to_thread(process_project_data_task, project_id)
+            except Exception as e:
+                logger.error("Recovered indexing failed for project %s: %s", project_id, e)

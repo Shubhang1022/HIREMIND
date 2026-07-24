@@ -1256,7 +1256,7 @@ Elapsed: {elapsed_str}
     temp_dir = None
 
     try:
-        from app.services.job_manager import JobManager
+        from app.services.job_manager import JobManager, LockResult
         job_manager = JobManager.get_instance()
         
         # Load user_id dynamically from projects table to register locking job
@@ -1281,8 +1281,30 @@ Elapsed: {elapsed_str}
         else:
             started = loop.run_until_complete(coro)
 
-        if not started:
-            logger.warning("[BACKGROUND_TASK_IGNORE] Indexing already active or locked by another worker for project %s. Ignoring duplicate call.", project_id)
+        lock_res, job_id, owner_id = started
+
+        if lock_res == LockResult.ALREADY_HELD:
+            logger.warning("[BACKGROUND_TASK_IGNORE] Indexing already active or locked by another worker for project %s. Current owner: %s. Ignoring duplicate call.", project_id, owner_id)
+            return
+        elif lock_res == LockResult.ERROR:
+            err_msg = owner_id or "Unknown lock acquisition error"
+            logger.error("[LOCK_ACQUIRE_ERROR] project=%s exception=%s", project_id, err_msg)
+            # Mark the job and project as failed
+            try:
+                _sync_fail_job(project_id, f"LOCK_ACQUIRE_ERROR: {err_msg}")
+            except Exception:
+                pass
+            try:
+                supabase_client.table("projects").update({
+                    "embedding_status": "failed",
+                    "status": "FAILED",
+                    "upload_statistics": {
+                        "failure_reason": f"Lock acquisition failed: {err_msg}",
+                    },
+                    "updated_at": _now(),
+                }).eq("id", project_id).execute()
+            except Exception:
+                pass
             return
 
         for attempt in range(1, max_retries + 1):
@@ -1930,6 +1952,8 @@ Elapsed: {elapsed_str}
                         missing_str = ", ".join(missing_list)
                         raise FileNotFoundError(f"Missing required indexing artifacts: {missing_str}")
 
+                    logger.info("[INDEX_ARTIFACTS_VERIFIED] project=%s", project_id)
+                    print(f"[INDEX_ARTIFACTS_VERIFIED] project={project_id}", flush=True)
                     logger.info("[STAGE_END] project=%s stage=validate_artifacts elapsed=%.2fs all_present=True",
                                 project_id, time.time() - t_stage)
                 except Exception as stage_exc:
@@ -1959,6 +1983,8 @@ Elapsed: {elapsed_str}
                                           processed_candidates=total_candidates,
                                           total_candidates=total_candidates,
                                           retry_count=attempt - 1)
+                    logger.info("[INDEXING_COMPLETE] project=%s", project_id)
+                    print(f"[INDEXING_COMPLETE] project={project_id}", flush=True)
                     
                     # Fetch final statuses for required final prints
                     final_proj = safe_execute(supabase_client.table("projects").select("status, embedding_status").eq("id", project_id)).data
@@ -2455,6 +2481,7 @@ async def get_progress_stream(project_id: str, current_user: Optional[AuthUser] 
     async def event_generator():
         import logging as _log
         import uuid
+        from datetime import datetime, timezone
         from app.services.job_manager import DBConnection
         _logger = _log.getLogger(__name__)
         last_heartbeat = asyncio.get_event_loop().time()
@@ -2467,7 +2494,7 @@ async def get_progress_stream(project_id: str, current_user: Optional[AuthUser] 
                     job = await conn.fetchrow(
                         """
                         SELECT id, job_type, current_stage, progress_percentage, status, failure_reason, retry_count, 
-                               last_heartbeat, processed_candidates, total_candidates, ram_usage, peak_ram, eta, speed
+                               last_heartbeat, processed_candidates, total_candidates, ram_usage, peak_ram, eta, speed, started_at
                         FROM public.background_jobs
                         WHERE project_id = $1
                         ORDER BY started_at DESC
@@ -2477,6 +2504,7 @@ async def get_progress_stream(project_id: str, current_user: Optional[AuthUser] 
                     )
 
                 if job:
+                    elapsed_seconds = int((datetime.now(timezone.utc) - job["started_at"]).total_seconds()) if job["started_at"] else 0
                     status_info = {
                         "job_id": str(job["id"]),
                         "project_id": project_id,
@@ -2493,6 +2521,12 @@ async def get_progress_stream(project_id: str, current_user: Optional[AuthUser] 
                         "peak_ram": job["peak_ram"] or 0.0,
                         "eta": job["eta"] or "00:00:00",
                         "speed": job["speed"] or 0.0,
+                        # Requirement 13 mapped fields
+                        "progress": job["progress_percentage"],
+                        "stage": job["current_stage"],
+                        "candidate_count": job["total_candidates"] or 0,
+                        "elapsed_seconds": elapsed_seconds,
+                        "elapsed_time": elapsed_seconds,
                     }
                 else:
                     status_info = {
@@ -2507,6 +2541,11 @@ async def get_progress_stream(project_id: str, current_user: Optional[AuthUser] 
                         "speed": 0.0,
                         "failure_reason": None,
                         "retry_count": 0,
+                        "progress": 0,
+                        "stage": "Not Started",
+                        "candidate_count": 0,
+                        "elapsed_seconds": 0,
+                        "elapsed_time": 0,
                     }
 
                 data_json = json.dumps(status_info)
@@ -2525,17 +2564,23 @@ async def get_progress_stream(project_id: str, current_user: Optional[AuthUser] 
                     last_heartbeat = now
 
             except Exception as sse_exc:
-                _logger.error("[SSE] project=%s event_generator error: %s", project_id, sse_exc)
+                _logger.error("[SSE_INFRASTRUCTURE_ERROR] project=%s event_generator error: %s", project_id, sse_exc)
                 # Send a failed event before closing so the frontend knows
                 error_payload = json.dumps({
                     "status": "failed",
-                    "current_stage": f"SSE error: {str(sse_exc)[:80]}",
+                    "current_stage": "SSE Connection Interrupted",
+                    "stage": "SSE Connection Interrupted",
                     "progress_percentage": 0,
+                    "progress": 0,
                     "processed_candidates": 0,
                     "total_candidates": 0,
+                    "candidate_count": 0,
                     "eta": "00:00:00",
                     "ram_usage": 0.0,
                     "peak_ram": 0.0,
+                    "failure_reason": "SSE Infrastructure Error",
+                    "elapsed_seconds": 0,
+                    "elapsed_time": 0,
                 })
                 yield f"data: {error_payload}\n\n"
                 break
@@ -3320,6 +3365,98 @@ def normalize_role_category(cat: str) -> str:
     return mapping.get(cat_clean, "BACKEND")
 
 
+async def is_project_analysis_ready(project_id: str) -> tuple[bool, Optional[str], Optional[str]]:
+    """
+    Canonical readiness check for project analysis.
+    Verifies:
+      1. Candidate upload exists.
+      2. Indexing status is completed.
+      3. Required artifacts exist.
+      4. Artifact version matches current candidate upload.
+      5. No active indexing replacement job exists.
+    """
+    import uuid
+    from app.services.storage_provider import StorageService
+
+    try:
+        # 1. Fetch project
+        proj_res = supabase_client.table("projects").select("*").eq("id", project_id).execute()
+        if not proj_res.data:
+            return False, "PROJECT_NOT_FOUND", "Project not found."
+        p = proj_res.data[0]
+        version = p.get("version") or 1
+        embedding_status = p.get("embedding_status", "pending")
+
+        # 2. Check candidate upload exists
+        uploads_res = supabase_client.table("candidate_uploads").select("*").eq("project_id", project_id).eq("status", "COMPLETED").order("version", desc=True).limit(1).execute()
+        if not uploads_res.data:
+            return False, "CANDIDATES_NOT_UPLOADED", "Candidate upload record not found. Please upload candidates first."
+        latest_upload = uploads_res.data[0]
+        upload_version = latest_upload["version"]
+
+        # 3. Check version mismatch
+        if version != upload_version:
+            return False, "INDEX_VERSION_MISMATCH", f"Project version ({version}) does not match latest candidate upload version ({upload_version})."
+
+        # 4. Check active indexing jobs
+        active_job_res = supabase_client.table("background_jobs").select("status").eq("project_id", project_id).not_.in_("status", ["completed", "failed", "cancelled"]).execute()
+        if active_job_res.data:
+            return False, "INDEXING_IN_PROGRESS", "Candidate indexing is still in progress."
+
+        if embedding_status in ["queued", "processing", "pending"]:
+            return False, "INDEXING_IN_PROGRESS", "Candidate indexing is still in progress."
+        elif embedding_status == "failed":
+            return False, "INDEXING_FAILED", "Candidate indexing failed. Use the retry endpoint to restart indexing — no re-upload required."
+
+        # 5. Check physical artifacts
+        faiss_key = f"{project_id}/faiss_v{version}.index"
+        embeddings_key = f"{project_id}/embeddings_v{version}.npy"
+        ids_key = f"{project_id}/ids_v{version}.json"
+        skill_key = f"{project_id}/skill_index_v{version}.json"
+
+        required_preflights = [
+            ("embeddings", ids_key, "Candidate ID Mapping file"),
+            ("embeddings", embeddings_key, "Numpy Embeddings file"),
+            ("faiss-indexes", faiss_key, "FAISS index file"),
+            ("skill-indexes", skill_key, "Skill Index mapping file")
+        ]
+
+        missing_preflights = []
+        for bucket_name, file_key, label in required_preflights:
+            if not StorageService.file_exists(bucket_name, file_key):
+                missing_preflights.append(f"{label} ({bucket_name}/{file_key})")
+
+        if missing_preflights:
+            missing_str = ", ".join(missing_preflights)
+            return False, "ARTIFACTS_MISSING", f"Required indexing artifacts are missing: {missing_str}. Please retry indexing."
+
+        return True, None, None
+
+    except Exception as e:
+        return False, "ERROR", f"Failed to verify project readiness: {str(e)}"
+
+
+@router.get("/projects/{project_id}/readiness")
+async def check_project_readiness(
+    project_id: str,
+    current_user: Optional[AuthUser] = Depends(get_optional_user),
+):
+    """
+    Exposes project analysis readiness status and reasons.
+    """
+    user_id = get_user_id(current_user)
+    proj_res = supabase_client.table("projects").select("id").eq("id", project_id).eq("user_id", user_id).execute()
+    if not proj_res.data:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    ready, code, message = await is_project_analysis_ready(project_id)
+    return {
+        "ready": ready,
+        "code": code,
+        "message": message
+    }
+
+
 @router.post("/projects/{project_id}/analyze")
 async def run_analysis(
     project_id: str,
@@ -3354,128 +3491,55 @@ async def run_analysis(
         raise HTTPException(status_code=404, detail="Project not found")
     p = proj_res.data[0]
 
-    # Watchdog Check for indexing jobs (Phase 8)
-    embedding_status = p.get("embedding_status", "pending")
-    if embedding_status == "processing":
-        updated_at_str = p.get("updated_at")
-        if updated_at_str:
-            try:
-                from datetime import datetime, timezone
-                clean_ts = updated_at_str.replace("Z", "+00:00")
-                updated_at_dt = datetime.fromisoformat(clean_ts)
-                now_dt = datetime.now(timezone.utc)
-                if updated_at_dt.tzinfo is None:
-                    now_dt = datetime.now()
-                    
-                elapsed_min = (now_dt - updated_at_dt).total_seconds() / 60.0
-                if elapsed_min > 10.0:
-                    logger.warning("[WATCHDOG] Project %s stuck in processing for %.1f minutes. Failing it.", project_id, elapsed_min)
-                    print(f"[WATCHDOG] Project {project_id} stuck in processing for {elapsed_min:.1f} minutes. Failing it.", flush=True)
-                    # Transition to failed
-                    supabase_client.table("projects").update({
-                        "embedding_status": "failed",
-                        "status": "failed",
-                        "upload_statistics": {"failure_reason": f"Watchdog timeout: Indexing stalled for {elapsed_min:.1f} minutes."},
-                        "updated_at": _now()
-                    }).eq("id", project_id).execute()
-                    
-                    # Also write to WorkerWatchdogReport.md
-                    try:
-                        watchdog_path = "C:\\Users\\HP\\.gemini\\antigravity-ide\\brain\\b099a49a-5f3b-44e9-8f48-c198d6c4ebba\\WorkerWatchdogReport.md"
-                        with open(watchdog_path, "a", encoding="utf-8") as f:
-                            f.write(f"\n## Watchdog Expiry: {project_id} ({datetime.now().isoformat()})\n")
-                            f.write(f"Stuck state detected. Elapsed: {elapsed_min:.1f} minutes. Status set to failed.\n")
-                    except Exception:
-                        pass
-                    
-                    p["embedding_status"] = "failed"
-                    p["status"] = "failed"
-                    embedding_status = "failed"
-            except Exception as watchdog_exc:
-                logger.error("Watchdog check failed: %s", watchdog_exc)
+    # Canonical Readiness Check (Phase 8 / Requirement 16)
+    ready, error_code, error_msg = await is_project_analysis_ready(project_id)
+    if not ready:
+        logger.warning("Analysis attempt rejected for project %s: code=%s, msg=%s", project_id, error_code, error_msg)
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "code": error_code,
+                "message": error_msg,
+                "retry_endpoint": f"/api/v1/platform/projects/{project_id}/retry-indexing" if error_code in ("INDEXING_FAILED", "ARTIFACTS_MISSING") else None,
+                "action": "retry_indexing" if error_code in ("INDEXING_FAILED", "ARTIFACTS_MISSING") else None,
+            }
+        )
 
-    # Redesigned: Check physical indexing artifacts in storage first (Requirement 9)
-    version = p.get("version") or 1
-    faiss_key = f"{project_id}/faiss_v{version}.index"
-    embeddings_key = f"{project_id}/embeddings_v{version}.npy"
-    ids_key = f"{project_id}/ids_v{version}.json"
-    skill_key = f"{project_id}/skill_index_v{version}.json"
+    # All artifacts verified, heal status to completed if needed
+    if embedding_status != "completed":
+        logger.info("[ANALYZE_HEAL] Healing embedding_status from %s to completed for project %s", embedding_status, project_id)
+        supabase_client.table("projects").update({
+            "embedding_status": "completed",
+            "status": "COMPLETED",
+            "updated_at": _now()
+        }).eq("id", project_id).execute()
+        embedding_status = "completed"
 
-    # Preflight Check of all required indexing artifacts
-    from app.services.storage_provider import StorageService
-    required_preflights = [
-        ("embeddings", ids_key, "Candidate ID Mapping file"),
-        ("embeddings", embeddings_key, "Numpy Embeddings file"),
-        ("faiss-indexes", faiss_key, "FAISS index file"),
-        ("skill-indexes", skill_key, "Skill Index mapping file")
-    ]
-    
-    # 1. Verify Job exists (Phase 5 Index Integrity Validation)
+    # Verify Job description exists
     job_res = supabase_client.table("jobs").select("*").eq("id", body.job_id).execute()
     if not job_res.data:
         raise HTTPException(status_code=404, detail="Job description not found. Please add a job description first.")
     job = job_res.data[0]
 
-    # Determine allowed categories
+    # Verify specialized role specialty file exists for the category
     jd_category = job.get("role_category") or "BACKEND"
     allowed_categories = COMPATIBLE_CATEGORIES.get(jd_category.upper(), {jd_category.upper()})
+    missing_roles = []
     for cat in allowed_categories:
-        required_preflights.append(("role-indexes", f"{project_id}/role_{cat.upper()}_v{version}.jsonl", f"Role specialty file for {cat}"))
-
-    missing_preflights = []
-    for bucket_name, file_key, label in required_preflights:
-        if not StorageService.file_exists(bucket_name, file_key):
-            missing_preflights.append(f"{label} ({bucket_name}/{file_key})")
-
-    if not missing_preflights:
-        # All artifacts exist! Heal project embedding_status if out of sync
-        if embedding_status != "completed":
-            logger.info("[ANALYZE_HEAL] Healing embedding_status from %s to completed for project %s", embedding_status, project_id)
-            supabase_client.table("projects").update({
-                "embedding_status": "completed",
-                "status": "COMPLETED",
-                "updated_at": _now()
-            }).eq("id", project_id).execute()
-            embedding_status = "completed"
-    else:
-        # Artifacts missing: check transient job/project status to give descriptive errors
-        if embedding_status in ["queued", "processing", "pending"]:
-            logger.warning("Analysis attempt rejected: Candidate indexing is still in progress for project %s", project_id)
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail="Candidate indexing is still in progress. Please wait until indexing completes before running analysis."
-            )
-        elif embedding_status == "failed":
-            logger.warning("Analysis attempt rejected: Candidate indexing failed for project %s", project_id)
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail={
-                    "code": "INDEXING_FAILED",
-                    "message": "Candidate indexing failed. Use the retry endpoint to restart indexing — no re-upload required.",
-                    "retry_endpoint": f"/api/v1/platform/projects/{project_id}/retry-indexing",
-                    "action": "retry_indexing",
-                }
-            )
-        else:
-            # Completed but missing files (corrupted/deleted files)
-            missing_str = ", ".join(missing_preflights)
-            logger.error("Analysis preflight check failed for project %s: missing %s", project_id, missing_str)
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail={
-                    "code": "INDEX_ARTIFACTS_MISSING",
-                    "message": f"Required indexing artifacts are missing: {missing_str}. Please use the retry endpoint to rebuild the index.",
-                    "retry_endpoint": f"/api/v1/platform/projects/{project_id}/retry-indexing",
-                    "action": "retry_indexing",
-                }
-            )
-
-    # 2. Verify candidate uploads exists
-    uploads_res = supabase_client.table("candidate_uploads").select("id").eq("project_id", project_id).eq("status", "COMPLETED").execute()
-    if not uploads_res.data:
+        role_key = f"{project_id}/role_{cat.upper()}_v{version}.jsonl"
+        if not StorageService.file_exists("role-indexes", role_key):
+            missing_roles.append(f"Role specialty file for {cat} ({role_key})")
+    if missing_roles:
+        missing_str = ", ".join(missing_roles)
+        logger.error("Analysis preflight role specialty check failed for project %s: missing %s", project_id, missing_str)
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
-            detail="Candidate upload record not found. Please upload candidates first."
+            detail={
+                "code": "ARTIFACTS_MISSING",
+                "message": f"Required specialized category indexing artifacts are missing: {missing_str}. Please retry indexing.",
+                "retry_endpoint": f"/api/v1/platform/projects/{project_id}/retry-indexing",
+                "action": "retry_indexing",
+            }
         )
 
     # Database-level check for active analyses

@@ -401,38 +401,89 @@ def verify_ai_dependencies():
         logger.info("[STARTUP_DIAGNOSTICS] Dependency check passed.")
 
 
-def run_startup_check() -> bool:
+async def run_startup_check() -> bool:
     """
     Verify all critical subsystems before accepting traffic.
 
-    Prints a STARTUP CHECK table to stdout.
+    Prints a JOB SYSTEM READINESS block and a STARTUP CHECK table to stdout.
     Returns True if all checks passed, False if any critical check failed.
-    Never raises — always returns.
+    Aborts startup (sys.exit(1)) if critical job system check fails.
     """
     import traceback
     import importlib.util
+    import sys
+    from app.services.job_manager import DBConnection, JobManager
+    from app.api.v1.endpoints.platform import supabase_client as _sc
 
     checks: list[tuple[str, bool, str]] = []   # (label, passed, detail)
 
-    # ── Imports ───────────────────────────────────────────────────────────────
-    # NOTE: sentence_transformers is intentionally NOT imported here.
-    # Importing it at startup check time would trigger torch + CUDA library
-    # loading (~350 MB RSS), defeating the lazy-load / Railway OOM fix.
-    # model_service.get_model() will import it on the first real request.
-    for pkg in ("fastapi", "pydantic", "supabase", "numpy"):
+    # 1. asyncpg import check
+    asyncpg_ok = False
+    asyncpg_version = "missing"
+    try:
+        import asyncpg
+        asyncpg_ok = True
+        asyncpg_version = asyncpg.__version__
+        checks.append(("Import:asyncpg", True, f"version {asyncpg_version}"))
+        logger.info("[DEPENDENCY_CHECK] asyncpg=%s status=available", asyncpg_version)
+    except Exception as exc:
+        checks.append(("Import:asyncpg", False, str(exc)))
+        logger.error("[DEPENDENCY_CHECK] asyncpg status=missing error=%s", exc)
+
+    # 2. Database Connectivity
+    db_ok = False
+    if asyncpg_ok:
+        try:
+            async with DBConnection() as conn:
+                val = await conn.fetchval("SELECT 1")
+                if val == 1:
+                    db_ok = True
+                    checks.append(("Database Connection", True, "SELECT 1 succeeded"))
+                    logger.info("[DATABASE_CONNECTION_CHECK] success=true")
+                else:
+                    checks.append(("Database Connection", False, f"Unexpected SELECT 1 result: {val}"))
+                    logger.error("[DATABASE_CONNECTION_CHECK] success=false detail=unexpected_result")
+        except Exception as exc:
+            checks.append(("Database Connection", False, str(exc)))
+            logger.error("[DATABASE_CONNECTION_CHECK] success=false detail=%s", exc)
+    else:
+        checks.append(("Database Connection", False, "Skipped — asyncpg missing"))
+
+    # 3. Schema Check
+    schema_ok = False
+    if db_ok:
+        try:
+            manager = JobManager.get_instance()
+            schema_ok = await manager.ensure_db_schema()
+            checks.append(("Database Schema Check", schema_ok, "Schema verified" if schema_ok else "Schema invalid"))
+        except Exception as exc:
+            checks.append(("Database Schema Check", False, str(exc)))
+    else:
+        checks.append(("Database Schema Check", False, "Skipped — DB connection missing"))
+
+    # 4. Supabase API Connectivity
+    supabase_ok = False
+    try:
+        _sc.table("projects").select("id").limit(1).execute()
+        supabase_ok = True
+        checks.append(("Supabase API Connectivity", True, ""))
+    except Exception as exc:
+        checks.append(("Supabase API Connectivity", False, str(exc)[:80]))
+
+    # 5. Lock mechanism readiness
+    locking_ok = db_ok and schema_ok
+    checks.append(("Lock Mechanism Readiness", locking_ok, ""))
+
+    # Critical Job system check
+    job_system_ready = asyncpg_ok and db_ok and schema_ok and locking_ok and supabase_ok
+
+    # Other legacy checks
+    for pkg in ("fastapi", "pydantic", "numpy"):
         try:
             importlib.import_module(pkg)
             checks.append((f"Import:{pkg}", True, ""))
         except Exception:
             checks.append((f"Import:{pkg}", False, traceback.format_exc()[-120:]))
-
-    # ── model_service import ──────────────────────────────────────────────────
-    try:
-        import importlib as _il
-        _il.import_module("app.services.model_service")
-        checks.append(("Model Service", True, ""))
-    except Exception:
-        checks.append(("Model Service", False, traceback.format_exc()[-200:]))
 
     # ── FAISS ─────────────────────────────────────────────────────────────────
     try:
@@ -441,26 +492,16 @@ def run_startup_check() -> bool:
     except Exception:
         checks.append(("FAISS", False, traceback.format_exc()[-120:]))
 
-    # ── Supabase DB ───────────────────────────────────────────────────────────
-    try:
-        from app.api.v1.endpoints.platform import supabase_client as _sc
-        _sc.table("projects").select("id").limit(1).execute()
-        checks.append(("Supabase DB", True, ""))
-    except Exception:
-        checks.append(("Supabase DB", False, str(sys.exc_info()[1])[:80]))
-
     # ── background_jobs table ─────────────────────────────────────────────────
     try:
-        from app.api.v1.endpoints.platform import supabase_client as _sc2
-        _sc2.table("background_jobs").select("id").limit(1).execute()
+        _sc.table("background_jobs").select("id").limit(1).execute()
         checks.append(("background_jobs table", True, ""))
     except Exception:
         checks.append(("background_jobs table", False, str(sys.exc_info()[1])[:80]))
 
     # ── projects table ────────────────────────────────────────────────────────
     try:
-        from app.api.v1.endpoints.platform import supabase_client as _sc3
-        _sc3.table("projects").select("id").limit(1).execute()
+        _sc.table("projects").select("id").limit(1).execute()
         checks.append(("projects table", True, ""))
     except Exception:
         checks.append(("projects table", False, str(sys.exc_info()[1])[:80]))
@@ -476,6 +517,16 @@ def run_startup_check() -> bool:
     # ── OpenRouter key present ────────────────────────────────────────────────
     openrouter_ok = bool(settings.openrouter_api_key)
     checks.append(("OpenRouter key", openrouter_ok, "" if openrouter_ok else "OPENROUTER_API_KEY not set — LLM scoring disabled"))
+
+    # Print beautiful readiness block to stdout
+    print("\n================ JOB SYSTEM READINESS ================\n", flush=True)
+    print(f"asyncpg             {'PASS' if asyncpg_ok else 'FAIL'} ({asyncpg_version})", flush=True)
+    print(f"database            {'PASS' if db_ok else 'FAIL'}", flush=True)
+    print(f"job schema          {'PASS' if schema_ok else 'FAIL'}", flush=True)
+    print(f"distributed locking {'PASS' if locking_ok else 'FAIL'}", flush=True)
+    print(f"Supabase            {'PASS' if supabase_ok else 'FAIL'}", flush=True)
+    print(f"\nJOB SYSTEM READY = {str(job_system_ready).upper()}\n", flush=True)
+    print("=======================================================\n", flush=True)
 
     # ── Print table ───────────────────────────────────────────────────────────
     all_critical_pass = all(ok for label, ok, _ in checks
@@ -512,6 +563,10 @@ def run_startup_check() -> bool:
     for label, ok, detail in checks:
         if not ok:
             logger.error("[STARTUP_CHECK_FAIL] %s — %s", label, detail)
+
+    if not job_system_ready:
+        logger.critical("[JOB_SYSTEM_FATAL] Critical startup check failed. Job system is not ready. Aborting startup.")
+        sys.exit(1)
 
     return all_critical_pass
 
@@ -617,7 +672,7 @@ async def lifespan(app: FastAPI):
 
         startup_ok = False
         try:
-            startup_ok = run_startup_check()
+            startup_ok = await run_startup_check()
             if not startup_ok:
                 logger.error(
                     "[STARTUP_FAILED] One or more critical subsystem checks failed. "
