@@ -2,6 +2,11 @@
 feature_cache/
 India_runs_data_and_ai_challenge/
 data/
+# HuggingFace / Sentence Transformers
+**/models--*/
+**/sentence-transformers/
+**/huggingface/
+
 
 # ── Python ────────────────────────────────────────────────────────────────────
 __pycache__/
