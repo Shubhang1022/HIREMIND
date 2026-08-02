@@ -523,8 +523,10 @@ def _get_encoder():
             print("[EXIT get_encoder()] (full path)", flush=True)
             return _encoder
         except Exception as e:
-            logger.error("[EXIT get_encoder()] (exception: %s)", e)
-            print(f"[EXIT get_encoder()] (exception: {e})", flush=True)
+            import traceback
+            tb = traceback.format_exc()
+            logger.error("[EXIT get_encoder()] (exception: %s)\n%s", e, tb)
+            print(f"[EXIT get_encoder()] (exception: {e})\n{tb}", flush=True)
             raise
 
 

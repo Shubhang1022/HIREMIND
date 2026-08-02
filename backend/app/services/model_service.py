@@ -111,6 +111,7 @@ _load_error: Optional[Exception] = None
 _current_stage: str = "idle"        # tracks which stage is active for timeout logging
 _main_loop: Optional[asyncio.AbstractEventLoop] = None
 _loading: bool = False
+_stage_start_time: float = 0.0
 
 
 def set_main_loop(loop: asyncio.AbstractEventLoop) -> None:
@@ -162,8 +163,9 @@ def _stage(label: str, t0_global: float) -> None:
     Phase 3: print per-stage checkpoint with elapsed, RSS, CPU, threads.
     Also updates _current_stage for timeout logging.
     """
-    global _current_stage
+    global _current_stage, _stage_start_time
     _current_stage = label
+    _stage_start_time = time.time()
     elapsed = time.time() - t0_global
     rss = _rss_mb()
     cpu = _cpu_pct()
@@ -455,37 +457,85 @@ def _log_torch_diagnostics() -> None:
 
 
 def _import_dependencies_safe() -> None:
-    """Import torch, transformers, and sentence_transformers safely.
-    Delegates to the main thread's event loop to prevent OpenMP/PyTorch background thread deadlocks.
-    """
+    """Import torch, transformers, and sentence_transformers safely via direct imports."""
     import sys
     if "torch" in sys.modules and "transformers" in sys.modules and "sentence_transformers" in sys.modules:
         return
 
-    # Delegate imports to the main thread event loop if we are in a background thread
-    if _main_loop is not None:
-        try:
-            if threading.current_thread() is not threading.main_thread():
-                logger.info("[DELEGATE_IMPORT] delegating library imports to main thread event loop")
-                print("[DELEGATE_IMPORT] delegating library imports to main thread event loop", flush=True)
-                
-                async def _coro_import():
-                    import torch          # noqa: F401
-                    import transformers   # noqa: F401
-                    from sentence_transformers import SentenceTransformer  # noqa: F401
-                
-                future = asyncio.run_coroutine_threadsafe(_coro_import(), _main_loop)
-                future.result(timeout=5.0)  # block background thread until main thread completes imports, with a 5s timeout fallback
-                logger.info("[DELEGATE_IMPORT] main thread completed imports successfully")
-                print("[DELEGATE_IMPORT] main thread completed imports successfully", flush=True)
-                return
-        except Exception as e:
-            logger.warning("[DELEGATE_IMPORT_FAILED] falling back to local thread import: %s", e)
-            print(f"[DELEGATE_IMPORT_FAILED] falling back to local thread import: {e}", flush=True)
+    logger.info("[DIRECT_IMPORT] Starting direct imports")
+    print("[DIRECT_IMPORT] Starting direct imports", flush=True)
 
-    import torch          # noqa: F401
-    import transformers   # noqa: F401
-    from sentence_transformers import SentenceTransformer  # noqa: F401
+    try:
+        t_start = time.time()
+
+        # Import torch
+        logger.info("[DIRECT_IMPORT] Importing torch...")
+        print("[DIRECT_IMPORT] Importing torch...", flush=True)
+        import torch          # noqa: F401
+        logger.info("[DIRECT_IMPORT] Torch imported successfully in %.3fs", time.time() - t_start)
+        print(f"[DIRECT_IMPORT] Torch imported successfully in {time.time() - t_start:.3f}s", flush=True)
+
+        # Import transformers
+        t_trans = time.time()
+        logger.info("[DIRECT_IMPORT] Importing transformers...")
+        print("[DIRECT_IMPORT] Importing transformers...", flush=True)
+        import transformers   # noqa: F401
+        logger.info("[DIRECT_IMPORT] Transformers imported successfully in %.3fs", time.time() - t_trans)
+        print(f"[DIRECT_IMPORT] Transformers imported successfully in {time.time() - t_trans:.3f}s", flush=True)
+
+        # Import sentence_transformers
+        t_st = time.time()
+        logger.info("[DIRECT_IMPORT] Importing sentence_transformers...")
+        print("[DIRECT_IMPORT] Importing sentence_transformers...", flush=True)
+        from sentence_transformers import SentenceTransformer  # noqa: F401
+        logger.info("[DIRECT_IMPORT] SentenceTransformers imported successfully in %.3fs", time.time() - t_st)
+        print(f"[DIRECT_IMPORT] SentenceTransformers imported successfully in {time.time() - t_st:.3f}s", flush=True)
+
+    except Exception as exc:
+        import traceback
+        tb = traceback.format_exc()
+        logger.error("[DIRECT_IMPORT_FAILED] Direct import crashed:\n%s", tb)
+        print(f"[DIRECT_IMPORT_FAILED] Direct import crashed:\n{tb}", flush=True)
+        raise exc
+
+
+def _watchdog_loop(target_thread_id: int, timeout_seconds: float = 30.0) -> None:
+    global _loading, _current_stage, _stage_start_time
+    logger.info("[WATCHDOG] started for thread %d with timeout %s", target_thread_id, timeout_seconds)
+    print(f"[WATCHDOG] started for thread {target_thread_id} with timeout {timeout_seconds}", flush=True)
+    
+    while True:
+        time.sleep(0.5)
+        # Check if loading finished
+        with _lock:
+            if not _loading:
+                logger.info("[WATCHDOG] loading finished, exiting watchdog loop")
+                print("[WATCHDOG] loading finished, exiting watchdog loop", flush=True)
+                break
+                
+            elapsed = time.time() - _stage_start_time
+            if elapsed > timeout_seconds:
+                stage_name = _current_stage
+                err_msg = f"[WATCHDOG_TIMEOUT] Stage '{stage_name}' exceeded timeout of {timeout_seconds}s (elapsed={elapsed:.1f}s)!"
+                print(err_msg, flush=True)
+                logger.error(err_msg)
+                
+                # Asynchronously raise RuntimeError in target thread
+                import ctypes
+                res = ctypes.pythonapi.PyThreadState_SetAsyncExc(
+                    ctypes.c_long(target_thread_id),
+                    ctypes.py_object(RuntimeError)
+                )
+                if res == 0:
+                    logger.error("[WATCHDOG] failed to set exception: invalid thread id")
+                elif res > 1:
+                    ctypes.pythonapi.PyThreadState_SetAsyncExc(ctypes.c_long(target_thread_id), None)
+                    logger.error("[WATCHDOG] PyThreadState_SetAsyncExc failed (reverted)")
+                else:
+                    logger.warning("[WATCHDOG] RuntimeError injected into loading thread %d", target_thread_id)
+                    print(f"[WATCHDOG] RuntimeError injected into loading thread {target_thread_id}", flush=True)
+                
+                break
 
 
 # ---------------------------------------------------------------------------
@@ -553,17 +603,21 @@ def _do_load(model_name: str) -> None:
         logging.getLogger("transformers").setLevel(logging.ERROR)
         logging.getLogger("sentence_transformers").setLevel(logging.WARNING)
 
+        # Start loading watchdog
+        load_thread_id = threading.get_ident()
+        watchdog_thread = threading.Thread(
+            target=_watchdog_loop,
+            args=(load_thread_id, 30.0),
+            name="load_watchdog",
+            daemon=True
+        )
+        watchdog_thread.start()
+
         # 4. Load config / imports
         _stage("LOAD_CONFIG", t0)
         _import_dependencies_safe()
         _log_torch_diagnostics()
 
-        # 5. Load tokenizer
-        _stage("LOAD_TOKENIZER", t0)
-        from sentence_transformers import SentenceTransformer
-
-        # 6. Load model weights
-        _stage("LOAD_MODEL_WEIGHTS", t0)
         st_home = os.environ["SENTENCE_TRANSFORMERS_HOME"]
         resolved_path = Path(st_home) / model_name.replace("/", "_")
         print(
@@ -573,12 +627,47 @@ def _do_load(model_name: str) -> None:
             flush=True,
         )
 
+        # 5. Load tokenizer
+        _stage("TOKENIZER_LOADING_START", t0)
+        from transformers import AutoTokenizer
+        logger.info("[MODEL_SERVICE] Loading AutoTokenizer from %s", model_name)
+        print(f"[MODEL_SERVICE] Loading AutoTokenizer from {model_name}", flush=True)
+        tokenizer = AutoTokenizer.from_pretrained(
+            model_name,
+            cache_dir=st_home,
+            local_files_only=True
+        )
+        _stage("TOKENIZER_LOADING_END", t0)
+
+        # 6. Load model weights (safetensors)
+        _stage("SAFETENSOR_LOADING_START", t0)
+        from transformers import AutoModel
+        logger.info("[MODEL_SERVICE] Loading AutoModel from %s", model_name)
+        print(f"[MODEL_SERVICE] Loading AutoModel from {model_name}", flush=True)
+        raw_model = AutoModel.from_pretrained(
+            model_name,
+            cache_dir=st_home,
+            local_files_only=True
+        )
+        _stage("SAFETENSOR_LOADING_END", t0)
+
+        # 7. Move model to CPU
+        _stage("MODEL_TO_CPU_START", t0)
+        raw_model = raw_model.to("cpu")
+        _stage("MODEL_TO_CPU_END", t0)
+
+        # 8. Construct SentenceTransformer
+        _stage("SENTENCE_TRANSFORMER_CONSTRUCT_START", t0)
+        from sentence_transformers import SentenceTransformer
+        logger.info("[MODEL_SERVICE] Constructing SentenceTransformer from %s", model_name)
+        print(f"[MODEL_SERVICE] Constructing SentenceTransformer from {model_name}", flush=True)
         loaded = SentenceTransformer(
             model_name,
             cache_folder=st_home,
             local_files_only=True,
             device="cpu",
         )
+        _stage("SENTENCE_TRANSFORMER_CONSTRUCT_END", t0)
 
         # 7. Discover path from object & log modules
         t_discover = time.time()
@@ -798,3 +887,4 @@ def reset() -> None:
 _set_env_limits()
 _set_offline_mode()
 _set_hf_cache()
+_import_dependencies_safe()
