@@ -206,8 +206,8 @@ def _set_env_limits() -> None:
     """Phase 5 — thread limits before any ML library import."""
     for var in ("OMP_NUM_THREADS", "MKL_NUM_THREADS",
                 "OPENBLAS_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
-        os.environ.setdefault(var, "1")
-    os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+        os.environ[var] = "1"
+    os.environ["TOKENIZERS_PARALLELISM"] = "false"
     logger.info(
         "[MODEL_SERVICE] Thread limits: OMP=%s MKL=%s OPENBLAS=%s "
         "NUMEXPR=%s TOKENIZERS_PARALLELISM=%s",
@@ -887,4 +887,3 @@ def reset() -> None:
 _set_env_limits()
 _set_offline_mode()
 _set_hf_cache()
-_import_dependencies_safe()

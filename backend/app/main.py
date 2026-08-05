@@ -1,16 +1,30 @@
 """FastAPI application entry point — HireMind AI."""
 
+import os
+# Enforce thread limits before any heavy ML library gets imported
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
+os.environ["OPENBLAS_NUM_THREADS"] = "1"
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
 import asyncio
 import logging
-import os
 import signal
 import sys
 import time
 import gc
 import threading
 import traceback
+import subprocess
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import datetime, timezone
+
+# Resolve Git version SHA once at startup
+try:
+    _git_sha = subprocess.check_output(["git", "rev-parse", "--short", "HEAD"]).decode("utf-8").strip()
+except Exception:
+    _git_sha = os.environ.get("RENDER_GIT_COMMIT", "unknown")
+
 
 # Setup path to import from project root 'src'
 _project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -1009,10 +1023,99 @@ async def health_cors(request: Request):
     }
 
 
+@app.get("/ping", tags=["health"])
+async def ping():
+    """Lightweight keep-alive probe for UptimeRobot / BetterStack."""
+    return {
+        "status": "ok",
+        "service": "HireMind",
+        "uptime": round(time.time() - _startup_time, 2),
+        "version": _git_sha,
+        "timestamp": datetime.now(timezone.utc).isoformat()
+    }
+
+
 @app.get("/health", tags=["health"])
-async def health_liveness():
-    """Simple liveness probe to verify that the API process is alive."""
-    return {"status": "healthy"}
+async def health_check_details():
+    """Extended liveness and metrics diagnostics probe."""
+    # 1. Database status & Queue info
+    db_status_str = "disconnected"
+    queue_len = 0
+    indexing_jobs_list = []
+    worker_status_str = "idle"
+    try:
+        from app.services.job_manager import DBConnection
+        import uuid
+        async with DBConnection() as conn:
+            val = await conn.fetchval("SELECT 1")
+            if val == 1:
+                db_status_str = "connected"
+                # Queue length
+                queue_len = await conn.fetchval(
+                    "SELECT COUNT(*) FROM public.background_jobs WHERE status = 'queued'"
+                )
+                # Active jobs
+                rows = await conn.fetch(
+                    """
+                    SELECT id, project_id, current_stage, progress_percentage, status 
+                    FROM public.background_jobs 
+                    WHERE status NOT IN ('completed', 'failed', 'cancelled')
+                    """
+                )
+                indexing_jobs_list = [
+                    {
+                        "job_id": str(r["id"]),
+                        "project_id": str(r["project_id"]),
+                        "current_stage": r["current_stage"],
+                        "progress_percentage": r["progress_percentage"],
+                        "status": r["status"]
+                    }
+                    for r in rows
+                ]
+                if indexing_jobs_list:
+                    worker_status_str = "running"
+    except Exception as e:
+        logger.error("Health check DB query failed: %s", e)
+
+    # 2. Storage status
+    storage_status_str = "disconnected"
+    try:
+        from app.services.storage_provider import StorageService
+        # Run a simple check (probe file presence)
+        StorageService.file_exists("candidate-files", "_startup_probe")
+        storage_status_str = "connected"
+    except Exception:
+        pass
+
+    # 3. Model status
+    from app.services import model_service as _ms
+    model_status_str = _ms.get_load_state()
+
+    # 4. Process stats
+    rss_mb = 0.0
+    cpu_pct = 0.0
+    try:
+        proc = psutil.Process(os.getpid())
+        rss_mb = proc.memory_info().rss / (1024 * 1024)
+        cpu_pct = proc.cpu_percent(interval=None)
+    except Exception:
+        pass
+
+    overall_health = "healthy" if db_status_str == "connected" and storage_status_str == "connected" else "unhealthy"
+    
+    return {
+        "status": overall_health,
+        "database_status": db_status_str,
+        "storage_status": storage_status_str,
+        "background_worker_status": worker_status_str,
+        "queue_length": queue_len,
+        "rss_memory_mb": round(rss_mb, 2),
+        "cpu_percent": round(cpu_pct, 1),
+        "version": _git_sha,
+        "uptime": round(time.time() - _startup_time, 2),
+        "current_indexing_jobs": indexing_jobs_list,
+        "model_status": model_status_str
+    }
 
 
 @app.get("/ready", tags=["health"])

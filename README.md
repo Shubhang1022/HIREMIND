@@ -165,3 +165,10 @@ We strongly recommend hosting the frontend and backend **separately** due to dif
 - Set **Start Command**: `python -m uvicorn app.main:app --host 0.0.0.0 --port $PORT`
 - Define the production variables (including `OPENROUTER_API_KEY`, `DATABASE_URL`, `SUPABASE_SERVICE_KEY`, and feature flags) in the Render Env dashboard.
 - Update `CORS_ORIGINS` in your backend configuration to include your live Vercel frontend URL.
+
+### 3. Keep-Alive Setup (UptimeRobot / BetterStack)
+Since Render Free and Starter instances automatically spin down (sleep) after 15 minutes of inactivity:
+- Register a free monitor at [UptimeRobot](https://uptimerobot.com) or [BetterStack](https://betterstack.com).
+- Set the HTTP(S) monitor to target: `https://your-render-backend-url.onrender.com/ping`.
+- Set the monitor check interval to **10 minutes**.
+- This periodic ping will keep the backend active, eliminating the cold start latency (>50 seconds) for incoming users.
