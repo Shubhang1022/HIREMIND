@@ -835,8 +835,8 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=allowed_origins,
     allow_credentials=True,
-    allow_methods=allowed_methods,
-    allow_headers=allowed_headers,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 # 3. Request logging middleware — logs every request with timing, status, and exceptions
