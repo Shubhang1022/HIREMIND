@@ -957,12 +957,35 @@ async def log_cors_preflight_middleware(request: Request, call_next):
 
 
 # Global Exception Handlers ensuring CORS preservation (Task 4)
+# NOTE: Exception handlers fire BEFORE CORSMiddleware processes the response,
+# so CORS headers must be injected manually here for cross-origin error responses.
+
+def _cors_headers(request: Request) -> dict:
+    """Return CORS headers for the request's origin if it is in the allowed list."""
+    origin = request.headers.get("origin", "")
+    norm = origin.strip().lower().rstrip("/")
+    if norm in [o.lower() for o in allowed_origins]:
+        return {
+            "Access-Control-Allow-Origin": origin,
+            "Access-Control-Allow-Credentials": "true",
+            "Vary": "Origin",
+        }
+    # Fall back to the first explicitly configured production origin so the
+    # response is never completely header-less for known deployments.
+    return {
+        "Access-Control-Allow-Origin": "https://hiremind-gilt.vercel.app",
+        "Access-Control-Allow-Credentials": "true",
+        "Vary": "Origin",
+    }
+
+
 @app.exception_handler(RequestValidationError)
 async def validation_exception_handler(request: Request, exc: RequestValidationError):
     logger.warning("[VALIDATION_ERROR] Request validation failed: %s", exc.errors())
     return JSONResponse(
         status_code=422,
         content={"detail": exc.errors()},
+        headers=_cors_headers(request),
     )
 
 
@@ -972,6 +995,7 @@ async def http_exception_handler(request: Request, exc: StarletteHTTPException):
     return JSONResponse(
         status_code=exc.status_code,
         content={"detail": exc.detail},
+        headers=_cors_headers(request),
     )
 
 
@@ -994,6 +1018,7 @@ async def global_exception_handler(request: Request, exc: Exception):
     return JSONResponse(
         status_code=500,
         content={"detail": "An internal server error occurred.", "error": str(exc)},
+        headers=_cors_headers(request),
     )
 
 
