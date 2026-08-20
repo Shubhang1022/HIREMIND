@@ -41,7 +41,10 @@ ENV HF_HOME=/app/.cache/huggingface \
 # ── Embedding model ────────────────────────────────────────────────────────────
 # Must match: backend/app/core/config.py   → embedding_model
 #             backend/app/services/model_service.py → _DEFAULT_MODEL
-ENV EMBEDDING_MODEL_NAME=BAAI/bge-small-en-v1.5
+ENV EMBEDDING_MODEL_NAME=BAAI/bge-small-en-v1.5 \
+    EMBEDDING_CHUNK_SIZE=32 \
+    UNLOAD_MODEL_AFTER_INDEXING=true \
+    MEMORY_SAFETY_THRESHOLD_MB=450
 
 # ── Pre-bake model weights into the image ─────────────────────────────────────
 # Uses cache_folder=SENTENCE_TRANSFORMERS_HOME so the stored path matches what

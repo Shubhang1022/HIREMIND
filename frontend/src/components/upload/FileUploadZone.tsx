@@ -1,7 +1,7 @@
 'use client';
 
 import { useCallback, useState } from 'react';
-import { Upload, File, X, Loader2, FolderOpen } from 'lucide-react';
+import { Upload, File, Loader2, FolderOpen } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { Button } from '@/components/ui/button';
 import { toast } from 'sonner';
@@ -9,7 +9,7 @@ import { toast } from 'sonner';
 const ACCEPTED = '.csv,.xlsx,.xls,.json,.jsonl,.txt,.pdf,.docx,.doc';
 
 interface FileUploadZoneProps {
-  onUpload: (files: File[]) => Promise<void>;
+  onUpload: (files: File[], onProgress?: (percent: number) => void) => Promise<void>;
   uploadType?: 'candidates' | 'job_description';
   multiple?: boolean;
   className?: string;
@@ -18,25 +18,28 @@ interface FileUploadZoneProps {
 export function FileUploadZone({ onUpload, uploadType = 'candidates', multiple = true, className }: FileUploadZoneProps) {
   const [dragging, setDragging] = useState(false);
   const [uploading, setUploading] = useState(false);
+  const [uploadProgress, setUploadProgress] = useState(0);
   const [files, setFiles] = useState<File[]>([]);
 
   const handleFiles = useCallback(async (fileList: FileList | File[]) => {
     const arr = Array.from(fileList);
     if (!arr.length) return;
-    setFiles(prev => [...prev, ...arr]);
+    setFiles(arr);
     setUploading(true);
+    setUploadProgress(0);
     try {
-      await onUpload(arr);
+      await onUpload(arr, setUploadProgress);
       if (uploadType !== 'candidates') {
         toast.success(`Uploaded ${arr.length} file(s) successfully`);
       }
       setFiles([]);
+      setUploadProgress(100);
     } catch (err) {
       toast.error(err instanceof Error ? err.message : 'Upload failed');
     } finally {
       setUploading(false);
     }
-  }, [onUpload]);
+  }, [onUpload, uploadType]);
 
   const onDrop = (e: React.DragEvent) => {
     e.preventDefault();
@@ -53,7 +56,7 @@ export function FileUploadZone({ onUpload, uploadType = 'candidates', multiple =
         className={cn(
           'relative border-2 border-dashed rounded-xl p-12 text-center transition-all duration-200',
           dragging ? 'border-indigo-500 bg-indigo-500/5' : 'border-border hover:border-indigo-500/50',
-          uploading && 'opacity-50 pointer-events-none'
+          uploading && 'opacity-90 pointer-events-none'
         )}
       >
         {uploading ? (
@@ -62,11 +65,34 @@ export function FileUploadZone({ onUpload, uploadType = 'candidates', multiple =
           <Upload className="w-10 h-10 mx-auto mb-4 text-muted-foreground" />
         )}
         <p className="font-medium mb-1">
-          {uploadType === 'candidates' ? 'Drop candidate files or folders here' : 'Drop job description file here'}
+          {uploading
+            ? uploadType === 'candidates'
+              ? `Uploading candidate file${files.length > 1 ? 's' : ''}…`
+              : 'Uploading job description…'
+            : uploadType === 'candidates'
+              ? 'Drop candidate files or folders here'
+              : 'Drop job description file here'}
         </p>
         <p className="text-sm text-muted-foreground mb-4">
-          Supports CSV, XLSX, JSON, TXT, PDF, DOCX
+          {uploading
+            ? 'File transfer in progress — indexing starts automatically after upload.'
+            : 'Supports CSV, XLSX, JSON, TXT, PDF, DOCX'}
         </p>
+
+        {uploading && (
+          <div className="max-w-md mx-auto mb-4 space-y-2">
+            <div className="w-full bg-zinc-800 rounded-full h-2 overflow-hidden border border-zinc-700">
+              <div
+                className="bg-gradient-to-r from-indigo-500 to-purple-500 h-2 rounded-full transition-all duration-300"
+                style={{ width: `${uploadProgress}%` }}
+              />
+            </div>
+            <p className="text-xs text-muted-foreground">
+              {uploadProgress > 0 ? `${uploadProgress}% uploaded` : 'Starting upload…'}
+            </p>
+          </div>
+        )}
+
         <div className="flex gap-3 justify-center">
           <label>
             <input type="file" accept={ACCEPTED} multiple={multiple} className="hidden"

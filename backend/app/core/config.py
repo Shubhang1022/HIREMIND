@@ -79,6 +79,14 @@ class Settings(BaseSettings):
     # Override with EMBEDDING_MODEL_NAME env var if running on a larger instance.
     embedding_model: str = "BAAI/bge-small-en-v1.5"
 
+    # Memory tuning for Render free tier (512 MB)
+    # Smaller chunks reduce peak RAM during embedding generation.
+    embedding_chunk_size: int = 32
+    # Unload the embedding model from RAM after indexing completes.
+    unload_model_after_indexing: bool = True
+    # RSS threshold (MB) above which FAISS/LLM stages are skipped.
+    memory_safety_threshold_mb: float = 450.0
+
     # OpenRouter
     openrouter_api_key: str = ""
     openrouter_model: str = "google/gemini-2.5-flash"

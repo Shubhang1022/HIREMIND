@@ -36,6 +36,58 @@ logger = logging.getLogger(__name__)
 _UPLOAD_MEMORY_SPIKE_MB = 50.0
 memory_safety_mode = os.getenv("MEMORY_SAFETY_MODE", "False").lower() in ("true", "1")
 
+def _compute_accuracy_metrics(results: list) -> dict:
+    """Aggregate accuracy / confidence metrics from ranked candidate results."""
+    if not results:
+        return {
+            "average_match_percent": 0.0,
+            "average_ai_score": 0.0,
+            "high_confidence_count": 0,
+            "high_confidence_rate": 0.0,
+            "average_semantic_similarity_percent": 0.0,
+            "average_role_match_percent": 0.0,
+            "average_skill_match_percent": 0.0,
+            "average_experience_match_percent": 0.0,
+            "eligible_rate": 0.0,
+            "ranked_count": 0,
+        }
+
+    n = len(results)
+
+    def _avg(key: str, default: float = 0.0) -> float:
+        vals = [float(r.get(key) or default) for r in results]
+        return round(sum(vals) / n, 2) if vals else 0.0
+
+    high_conf = sum(1 for r in results if str(r.get("confidence", "")).lower() == "high")
+    eligible = sum(1 for r in results if r.get("eligibility", True))
+
+    return {
+        "average_match_percent": _avg("match_percent"),
+        "average_ai_score": round(
+            sum(float(r.get("ai_score") or r.get("score") or 0.0) for r in results) / n, 4
+        ),
+        "high_confidence_count": high_conf,
+        "high_confidence_rate": round(high_conf / n * 100, 1),
+        "average_semantic_similarity_percent": _avg("semantic_similarity_percent", 50.0),
+        "average_role_match_percent": _avg("role_match_percent", 50.0),
+        "average_skill_match_percent": _avg("critical_skill_match_percent", 50.0),
+        "average_experience_match_percent": _avg("experience_match_percent", 50.0),
+        "eligible_rate": round(eligible / n * 100, 1),
+        "ranked_count": n,
+    }
+
+
+def _release_embedding_model() -> None:
+    """Unload embedding model and clear encoder singleton to free RAM."""
+    global _encoder
+    try:
+        from app.services.model_service import unload_model
+        unload_model()
+    except Exception as exc:
+        logger.warning("[MEMORY] unload_model failed: %s", exc)
+    _encoder = None
+
+
 def parse_jd_backup(text: str) -> dict:
     if not text:
         return {}
@@ -1379,7 +1431,7 @@ Elapsed: {elapsed_str}
                 logger.info("[STAGE_END] project=%s stage=load_model elapsed=%.2fs dim=%d", project_id, time.time() - t_load_start, dim)
 
                 # ── STAGE 3: Generate embeddings & build FAISS (Chunked & Resumable) ──
-                chunk_size = 250
+                chunk_size = settings.embedding_chunk_size
                 total_chunks = (total_candidates + chunk_size - 1) // chunk_size
                 
                 # Check how many are already embedded
@@ -1686,6 +1738,10 @@ Elapsed: {elapsed_str}
                 pass
         gc.collect()
 
+        # Release embedding model RAM after indexing (512 MB tier optimization)
+        if settings.unload_model_after_indexing:
+            _release_embedding_model()
+
 
 # ── Startup Integrity Check (Mocked for Supabase) ─────────────────────────────
 def _run_integrity_check() -> str:
@@ -1739,6 +1795,7 @@ def _sync_update_progress(
         resolved_total,
         eta,
         retry_count,
+        speed,
     )
 
     if main_loop and main_loop.is_running():
@@ -3253,15 +3310,6 @@ Python Traceback:
 """
         logger.error(error_report)
         print(error_report, flush=True)
-        
-        try:
-            err_path = "C:\\Users\\HP\\.gemini\\antigravity-ide\\brain\\b099a49a-5f3b-44e9-8f48-c198d6c4ebba\\ProductionErrorAudit.md"
-            with open(err_path, "a", encoding="utf-8") as f:
-                import datetime
-                f.write(f"\n## Analysis Failure: {datetime.datetime.now().isoformat()}\n")
-                f.write(f"```\n{error_report}\n```\n")
-        except Exception:
-            pass
 
     def check_overall_timeout():
         elapsed = time.time() - t_start_all
@@ -3269,19 +3317,6 @@ Python Traceback:
             logger.error("[TIMEOUT] Analysis exceeded 60s limit. Stage: %s | RAM: %.2fMB | Elapsed: %.3fs", current_stage, get_memory_mb(), elapsed)
             print(f"[TIMEOUT] Analysis exceeded 60s limit. Stage: {current_stage} | RAM: {get_memory_mb():.2f}MB | Elapsed: {elapsed:.3f}s", flush=True)
             
-            # Write to AnalysisTimeoutReport.md (Phase 9)
-            try:
-                timeout_path = "C:\\Users\\HP\\.gemini\\antigravity-ide\\brain\\b099a49a-5f3b-44e9-8f48-c198d6c4ebba\\AnalysisTimeoutReport.md"
-                with open(timeout_path, "a", encoding="utf-8") as f:
-                    import datetime
-                    f.write(f"\n## Analysis Timeout: {datetime.datetime.now().isoformat()}\n")
-                    f.write(f"Project ID: {project_id}\n")
-                    f.write(f"Last Stage: {current_stage}\n")
-                    f.write(f"RAM: {get_memory_mb():.2f} MB\n")
-                    f.write(f"Elapsed: {elapsed:.3f}s\n")
-            except Exception:
-                pass
-                
             raise HTTPException(
                 status_code=504,
                 detail="Analysis timed out. Please try again."
@@ -3428,6 +3463,12 @@ Python Traceback:
         AFTER_EXPERIENCE_FILTER = len(df_top)
         AFTER_SKILL_FILTER = len(df_top)
 
+        faiss_input_candidates = []
+        for _, r in df_top.iterrows():
+            cid = r["candidate_id"]
+            if cid in lookup_dict:
+                faiss_input_candidates.append(lookup_dict[cid])
+
         filter_time = time.time() - t_filter_start
         
         current_stage = "POST_FILTER_MEMORY"
@@ -3441,7 +3482,7 @@ Python Traceback:
         metadata_only_fallback = False
         fallback_reason = None
 
-        if get_memory_mb() > 450.0 or memory_safety_mode:
+        if get_memory_mb() > settings.memory_safety_threshold_mb or memory_safety_mode:
             logger.warning("[MEMORY_WARNING] Process RAM exceeds 450MB. Disabling FAISS search.")
             metadata_only_fallback = True
             fallback_reason = "memory_safety_limit_exceeded"
@@ -3591,7 +3632,7 @@ Python Traceback:
         current_stage = "POST_LLM_MEMORY"
         # Enforce memory safety limit check before calling LLM
         call_llm_flag = True
-        if get_memory_mb() > 450.0 or memory_safety_mode:
+        if get_memory_mb() > settings.memory_safety_threshold_mb or memory_safety_mode:
             logger.warning("[MEMORY_WARNING] Process RAM exceeds 450MB before LLM stage. Disabling LLM enhancement.")
             call_llm_flag = False
 
@@ -3699,8 +3740,11 @@ Python Traceback:
             "after_scoring": len(top_100_candidates),
             "llm_input_count": engine.metrics.get("llm_candidates_evaluated", 0),
             "after_llm_selection": len(results),
-            "peak_memory_mb": round(peak_memory, 2)
+            "peak_memory_mb": round(peak_memory, 2),
         }
+
+        accuracy_metrics = _compute_accuracy_metrics(results)
+        metrics["accuracy"] = accuracy_metrics
 
         ranking = {
             "id": ranking_id,
@@ -3714,6 +3758,7 @@ Python Traceback:
             "jd_hash": jd_hash,
             "version_metadata": version_metadata,
             "metrics": metrics,
+            "accuracy_metrics": accuracy_metrics,
             "prefilter_statistics": prefilter_statistics,
             "metadata_only_fallback": metadata_only_fallback,
             "ai_enhancement_unavailable": ai_enhancement_unavailable,
@@ -3761,17 +3806,34 @@ Python Traceback:
         log_checkpoint(12, "Results Stored Successfully", f"Ranking ID: {ranking_id}")
         log_memory("FINAL_MEMORY")
 
-        avg_score = sum(r.get("ai_score") or r.get("score") or 0.0 for r in results) / len(results) if results else 0.0
-        supabase_client.table("analysis_metrics").insert({
-            "ranking_id": ranking_id,
-            "project_id": project_id,
-            "upload_time": 0.0,
-            "embedding_time": embedding_time,
-            "faiss_time": faiss_time,
-            "llm_time": llm_time,
-            "total_analysis_time": total_time_all,
-            "average_match_score": avg_score
-        }).execute()
+        avg_score = accuracy_metrics["average_ai_score"]
+        try:
+            supabase_client.table("analysis_metrics").insert({
+                "ranking_id": ranking_id,
+                "project_id": project_id,
+                "upload_time": 0.0,
+                "embedding_time": embedding_time,
+                "faiss_time": faiss_time,
+                "llm_time": llm_time,
+                "total_analysis_time": total_time_all,
+                "average_match_score": avg_score,
+                "accuracy_metrics": accuracy_metrics,
+            }).execute()
+        except Exception as metrics_exc:
+            logger.warning("[ANALYSIS_METRICS] insert failed (column may be missing): %s", metrics_exc)
+            try:
+                supabase_client.table("analysis_metrics").insert({
+                    "ranking_id": ranking_id,
+                    "project_id": project_id,
+                    "upload_time": 0.0,
+                    "embedding_time": embedding_time,
+                    "faiss_time": faiss_time,
+                    "llm_time": llm_time,
+                    "total_analysis_time": total_time_all,
+                    "average_match_score": avg_score,
+                }).execute()
+            except Exception:
+                pass
 
         supabase_client.table("projects").update({
             "status": "COMPLETED",
@@ -3856,14 +3918,17 @@ Python Traceback:
                 except Exception:
                     pass
                     
-        # 3. Explicitly trigger Garbage Collection and clear caches (Phase 7)
+        # 3. Release embedding model RAM and trigger GC
         import gc
         gc.collect()
-        try:
-            from src.features.embedding import _MODEL_CACHE
-            _MODEL_CACHE.clear()
-        except Exception:
-            pass
+        if settings.unload_model_after_indexing:
+            _release_embedding_model()
+        else:
+            try:
+                from src.features.embedding import _MODEL_CACHE
+                _MODEL_CACHE.clear()
+            except Exception:
+                pass
         
         # 4. Release concurrent analysis project lock
         _active_analyses.discard(project_id)
@@ -3917,6 +3982,12 @@ async def get_ranking(project_id: str, ranking_id: str, current_user: Optional[A
     
     results_res = supabase_client.table("ranking_results").select("full_result").eq("ranking_id", ranking_id).order("rank").execute()
     ranking["results"] = [r["full_result"] for r in results_res.data]
+
+    # Expose accuracy_metrics at top level for frontend (stored inside metrics.accuracy)
+    stored_metrics = ranking.get("metrics") or {}
+    if not ranking.get("accuracy_metrics") and isinstance(stored_metrics, dict):
+        ranking["accuracy_metrics"] = stored_metrics.get("accuracy")
+
     return ranking
 
 

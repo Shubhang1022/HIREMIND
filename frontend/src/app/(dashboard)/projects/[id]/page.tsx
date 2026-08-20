@@ -18,6 +18,7 @@ import { FileUploadZone } from '@/components/upload/FileUploadZone';
 import { platformApi, type Project, type Job, type Ranking } from '@/lib/platform-api';
 import { toast } from 'sonner';
 import { CandidateDetailSheet } from '@/components/candidates/CandidateDetailSheet';
+import { AccuracyMetricsCard } from '@/components/dashboard/AccuracyMetricsCard';
 
 // ── Ranking cache (in-memory, 2-day TTL) ──────────────────────────────────────
 const CACHE_TTL_MS = 2 * 24 * 60 * 60 * 1000; // 2 days
@@ -250,14 +251,11 @@ export default function ProjectDetailPage() {
     }
   };
 
-  const handleCandidateUpload = async (files: File[]) => {
+  const handleCandidateUpload = async (files: File[], onProgress?: (percent: number) => void) => {
     for (const file of files) {
-      await platformApi.upload(projectId, file, 'candidates');
-      // Upload accepted — indexing runs in the background.
-      // Do NOT show "success" here; the file is queued for indexing, not complete.
+      await platformApi.upload(projectId, file, 'candidates', undefined, onProgress);
       toast.info(`${file.name} accepted — indexing started. Analysis will be available once indexing completes.`);
     }
-    // Reload so embedding_status is refreshed and SSE listener activates
     await load();
   };
 
@@ -1387,6 +1385,13 @@ export default function ProjectDetailPage() {
                     </div>
                   )}
                 </div>
+              )}
+
+              {(ranking.accuracy_metrics || ranking.metrics?.accuracy) && (
+                <AccuracyMetricsCard
+                  metrics={(ranking.accuracy_metrics || ranking.metrics?.accuracy)!}
+                  peakMemoryMb={ranking.metrics?.peak_memory_mb}
+                />
               )}
 
               {ranking.status === 'no_qualified_candidates' ? (

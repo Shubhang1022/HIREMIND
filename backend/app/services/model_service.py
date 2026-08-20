@@ -627,40 +627,11 @@ def _do_load(model_name: str) -> None:
             flush=True,
         )
 
-        # 5. Load tokenizer
-        _stage("TOKENIZER_LOADING_START", t0)
-        from transformers import AutoTokenizer
-        logger.info("[MODEL_SERVICE] Loading AutoTokenizer from %s", model_name)
-        print(f"[MODEL_SERVICE] Loading AutoTokenizer from {model_name}", flush=True)
-        tokenizer = AutoTokenizer.from_pretrained(
-            model_name,
-            cache_dir=st_home,
-            local_files_only=True
-        )
-        _stage("TOKENIZER_LOADING_END", t0)
-
-        # 6. Load model weights (safetensors)
-        _stage("SAFETENSOR_LOADING_START", t0)
-        from transformers import AutoModel
-        logger.info("[MODEL_SERVICE] Loading AutoModel from %s", model_name)
-        print(f"[MODEL_SERVICE] Loading AutoModel from {model_name}", flush=True)
-        raw_model = AutoModel.from_pretrained(
-            model_name,
-            cache_dir=st_home,
-            local_files_only=True
-        )
-        _stage("SAFETENSOR_LOADING_END", t0)
-
-        # 7. Move model to CPU
-        _stage("MODEL_TO_CPU_START", t0)
-        raw_model = raw_model.to("cpu")
-        _stage("MODEL_TO_CPU_END", t0)
-
-        # 8. Construct SentenceTransformer
+        # 5. Load SentenceTransformer (single load path — avoids duplicate weight copies)
         _stage("SENTENCE_TRANSFORMER_CONSTRUCT_START", t0)
         from sentence_transformers import SentenceTransformer
-        logger.info("[MODEL_SERVICE] Constructing SentenceTransformer from %s", model_name)
-        print(f"[MODEL_SERVICE] Constructing SentenceTransformer from {model_name}", flush=True)
+        logger.info("[MODEL_SERVICE] Loading SentenceTransformer from %s", model_name)
+        print(f"[MODEL_SERVICE] Loading SentenceTransformer from {model_name}", flush=True)
         loaded = SentenceTransformer(
             model_name,
             cache_folder=st_home,
@@ -863,10 +834,16 @@ def get_load_error() -> Optional[Exception]:
     return _load_error
 
 
-def reset() -> None:
-    """For tests only. Unloads model and resets state."""
+def unload_model() -> bool:
+    """Release the embedding model from memory after indexing/analysis.
+
+    Safe to call when no concurrent encode operations are in progress.
+    The model will be lazy-loaded again on the next get_model() call.
+    """
     global _model, _model_name, _load_state, _load_error, _current_stage, _loading
     with _lock:
+        if _load_state != "loaded" or _model is None:
+            return False
         _model = None
         _model_name = None
         _load_state = "unloaded"
@@ -879,8 +856,22 @@ def reset() -> None:
         _MODEL_CACHE.clear()
     except Exception:
         pass
+    try:
+        import torch
+        if hasattr(torch, "cuda") and torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:
+        pass
     gc.collect()
-    logger.info("[MODEL_SERVICE] reset() — model unloaded.")
+    rss = _rss_mb()
+    logger.info("[MODEL_SERVICE] unload_model() complete — RSS=%.1fMB", rss)
+    print(f"[MODEL_SERVICE] unload_model() complete — RSS={rss:.1f}MB", flush=True)
+    return True
+
+
+def reset() -> None:
+    """For tests only. Unloads model and resets state."""
+    unload_model()
 
 
 # Configure offline mode and thread limits at module import time

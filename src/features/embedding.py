@@ -120,6 +120,7 @@ class EmbeddingEncoder:
             normalize_embeddings=normalize,
             convert_to_numpy=True,
             show_progress_bar=False,
+            batch_size=min(16, len(encoded_texts) or 1),
         )
         return embeddings.astype(np.float32)
 

@@ -11,6 +11,7 @@ import { Badge } from '@/components/ui/badge';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import { platformApi, type Project, type Ranking, type RankingResult } from '@/lib/platform-api';
 import { CandidateDetailSheet } from '@/components/candidates/CandidateDetailSheet';
+import { AccuracyMetricsCard } from '@/components/dashboard/AccuracyMetricsCard';
 import { toast } from 'sonner';
 
 function getMatchColor(score: number) {
@@ -306,6 +307,13 @@ function RankingContent() {
             </div>
           )}
         </div>
+      )}
+
+      {!rankingLoading && rankingData && (rankingData.accuracy_metrics || rankingData.metrics?.accuracy) && (
+        <AccuracyMetricsCard
+          metrics={(rankingData.accuracy_metrics || rankingData.metrics?.accuracy)!}
+          peakMemoryMb={rankingData.metrics?.peak_memory_mb}
+        />
       )}
 
       {/* No ranking for this project */}

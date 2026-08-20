@@ -112,6 +112,19 @@ export interface PrefilterStatistics {
   top_categories: string[];
 }
 
+export interface AccuracyMetrics {
+  average_match_percent: number;
+  average_ai_score: number;
+  high_confidence_count: number;
+  high_confidence_rate: number;
+  average_semantic_similarity_percent: number;
+  average_role_match_percent: number;
+  average_skill_match_percent: number;
+  average_experience_match_percent: number;
+  eligible_rate: number;
+  ranked_count: number;
+}
+
 export interface Ranking {
   id: string;
   project_id: string;
@@ -154,7 +167,10 @@ export interface Ranking {
     after_scoring?: number;
     llm_input_count?: number;
     after_llm_selection?: number;
+    peak_memory_mb?: number;
+    accuracy?: AccuracyMetrics;
   };
+  accuracy_metrics?: AccuracyMetrics;
 }
 
 export interface Analytics {
@@ -218,7 +234,8 @@ export const platformApi = {
     projectId: string,
     file: File,
     uploadType: 'candidates' | 'job_description' = 'candidates',
-    metadata?: Record<string, any>
+    metadata?: Record<string, any>,
+    onProgress?: (percent: number) => void,
   ) => {
     const authHeaders = await getAuthHeaders();
     const form = new FormData();
@@ -232,16 +249,39 @@ export const platformApi = {
         }
       });
     }
-    const res = await fetch(`${API_BASE}/platform/projects/${projectId}/upload?${qs}`, {
-      method: 'POST',
-      headers: authHeaders,
-      body: form,
+
+    return new Promise<any>((resolve, reject) => {
+      const xhr = new XMLHttpRequest();
+      xhr.open('POST', `${API_BASE}/platform/projects/${projectId}/upload?${qs}`);
+      const headers = authHeaders as Record<string, string>;
+      Object.entries(headers).forEach(([k, v]) => xhr.setRequestHeader(k, v));
+
+      xhr.upload.onprogress = (event) => {
+        if (event.lengthComputable && onProgress) {
+          onProgress(Math.round((event.loaded / event.total) * 100));
+        }
+      };
+
+      xhr.onload = () => {
+        if (xhr.status >= 200 && xhr.status < 300) {
+          try {
+            resolve(JSON.parse(xhr.responseText));
+          } catch {
+            resolve({ status: 'ok' });
+          }
+        } else {
+          try {
+            const err = JSON.parse(xhr.responseText);
+            reject(new Error(err.detail || 'Upload failed'));
+          } catch {
+            reject(new Error(`Upload failed (${xhr.status})`));
+          }
+        }
+      };
+
+      xhr.onerror = () => reject(new Error('Upload failed — network error'));
+      xhr.send(form);
     });
-    if (!res.ok) {
-      const err = await res.json().catch(() => ({ detail: res.statusText }));
-      throw new Error(err.detail || 'Upload failed');
-    }
-    return res.json();
   },
   analyze: (projectId: string, jobId: string, topK = 100, performanceMode = 'balanced') =>
     apiFetch<Ranking>(`/platform/projects/${projectId}/analyze`, {
