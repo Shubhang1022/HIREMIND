@@ -8,7 +8,81 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import os
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../backend")))
 
-from app.services.job_manager import JobManager, LockResult, DBConnection
+from app.services.job_manager import JobManager, LockResult, DBConnection, VALID_TRANSITIONS
+from app.services.model_service import _format_load_error, reset_failed_load, ModelLoadFailed
+
+def test_fsm_allows_embedding_to_retrying():
+    assert "retrying" in VALID_TRANSITIONS["embedding"]
+    assert "retrying" in VALID_TRANSITIONS["indexing"]
+    assert "retrying" in VALID_TRANSITIONS["processing"]
+
+def test_fsm_retrying_to_processing():
+    manager = JobManager.get_instance()
+    assert manager.validate_transition("retrying", "processing") is True
+
+def test_fsm_rejects_embedding_to_processing_without_retry():
+    manager = JobManager.get_instance()
+    assert manager.validate_transition("embedding", "processing") is False
+
+def test_format_load_error_never_empty():
+    msg = _format_load_error(RuntimeError(), stage="SENTENCE_TRANSFORMER_CONSTRUCT_START", model_name="BAAI/bge-small-en-v1.5")
+    assert "BAAI/bge-small-en-v1.5" in msg
+    assert "SENTENCE_TRANSFORMER_CONSTRUCT_START" in msg
+    assert "RuntimeError" in msg
+    assert len(msg.strip()) > 20
+
+def test_format_load_error_none_exception():
+    msg = _format_load_error(None, stage="VERIFY_CACHE", model_name="test-model")
+    assert "test-model" in msg
+    assert "VERIFY_CACHE" in msg
+
+def test_reset_failed_load_clears_state():
+    import app.services.model_service as ms
+    with ms._lock:
+        ms._load_state = "failed"
+        ms._load_error = ModelLoadFailed("prior failure")
+    reset_failed_load()
+    assert ms.get_load_state() == "unloaded"
+    assert ms.get_load_error() is None
+
+def test_update_progress_keeps_stage_on_illegal_transition():
+    async def _run():
+        manager = JobManager.get_instance()
+        project_id = "33333333-3333-3333-3333-333333333333"
+        manager._progress_cache[project_id] = {
+            "job_id": str(uuid.uuid4()),
+            "project_id": project_id,
+            "user_id": None,
+            "current_stage": "Embedding",
+            "progress_percentage": 50,
+            "started_at": "2026-01-01T00:00:00+00:00",
+            "updated_at": 0,
+            "last_heartbeat": 0,
+            "retry_count": 1,
+            "status": "embedding",
+            "processed_candidates": 10,
+            "total_candidates": 100,
+            "eta": "01:00",
+            "speed": 1.0,
+            "peak_ram": 0.0,
+            "ram_usage": 0.0,
+        }
+        mock_conn = AsyncMock()
+        mock_conn.execute.return_value = "UPDATE 1"
+        with patch("app.services.job_manager.DBConnection") as mock_db_conn:
+            mock_db_conn.return_value.__aenter__.return_value = mock_conn
+            await manager.update_job_progress(
+                project_id,
+                "Validating candidates",
+                10,
+                "processing",
+            )
+        cache = manager._progress_cache[project_id]
+        assert cache["status"] == "embedding"
+        assert cache["current_stage"] == "Validating candidates"
+        assert cache["progress_percentage"] == 10
+
+    asyncio.run(_run())
 
 def test_db_lock_query_exception():
     """TEST B: DB lock query throws exception -> LOCK_ERROR (NOT ALREADY_HELD)"""

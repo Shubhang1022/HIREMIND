@@ -42,7 +42,8 @@ ENV HF_HOME=/app/.cache/huggingface \
 # Must match: backend/app/core/config.py   → embedding_model
 #             backend/app/services/model_service.py → _DEFAULT_MODEL
 ENV EMBEDDING_MODEL_NAME=BAAI/bge-small-en-v1.5 \
-    EMBEDDING_CHUNK_SIZE=32 \
+    EMBEDDING_CHUNK_SIZE=64 \
+    EMBEDDING_BATCH_SIZE=16 \
     UNLOAD_MODEL_AFTER_INDEXING=true \
     MEMORY_SAFETY_THRESHOLD_MB=450
 

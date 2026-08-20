@@ -80,8 +80,9 @@ class Settings(BaseSettings):
     embedding_model: str = "BAAI/bge-small-en-v1.5"
 
     # Memory tuning for Render free tier (512 MB)
-    # Smaller chunks reduce peak RAM during embedding generation.
-    embedding_chunk_size: int = 32
+    # 64 candidates/chunk balances ~2 min indexing vs peak RAM on 512 MB tier.
+    embedding_chunk_size: int = 64
+    embedding_batch_size: int = 16
     # Unload the embedding model from RAM after indexing completes.
     unload_model_after_indexing: bool = True
     # RSS threshold (MB) above which FAISS/LLM stages are skipped.

@@ -30,6 +30,23 @@ class ModelLoadFailed(RuntimeError):
     """Raised when the model loading fails (missing files, import error, etc.)."""
 
 
+def _format_load_error(exc: BaseException | None, *, stage: str = "unknown", model_name: str = "") -> str:
+    """Build a human-readable load failure message (never empty)."""
+    if exc is None:
+        return (
+            f"Model '{model_name}' failed at stage '{stage}' with no exception details "
+            f"(RSS={_rss_mb():.1f}MB). Check prior logs for OOM or watchdog timeout."
+        )
+    exc_type = type(exc).__name__
+    exc_msg = str(exc).strip()
+    if not exc_msg:
+        exc_msg = repr(exc)
+    return (
+        f"Model '{model_name}' failed at stage '{stage}': "
+        f"{exc_type}: {exc_msg} (RSS={_rss_mb():.1f}MB)"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Concurrency Instrumentation Helpers
 # ---------------------------------------------------------------------------
@@ -389,6 +406,14 @@ def verify_docker_cache(model_name: str) -> tuple[bool, list[str], Path]:
 
         if not weight_files:
             top_level = sorted(p.name for p in cache_root.iterdir()) if cache_root.is_dir() else []
+            offline = os.environ.get("HF_HUB_OFFLINE") == "1"
+            if offline:
+                missing = [
+                    f"No weight file under {cache_root} (offline mode — rebuild Docker image with model bake step). "
+                    f"cache_root_contents={top_level}"
+                ]
+                _log_cache_invalid(model_name, conventional_dir, missing)
+                return False, missing, conventional_dir
             warning_msg = (
                 f"[MODEL_CACHE_VERIFY] DIAGNOSTIC WARNING: No weight file (model.safetensors / "
                 f"pytorch_model.bin) found under {cache_root}. cache_root_contents={top_level}. "
@@ -520,11 +545,15 @@ def _watchdog_loop(target_thread_id: int, timeout_seconds: float = 30.0) -> None
                 print(err_msg, flush=True)
                 logger.error(err_msg)
                 
-                # Asynchronously raise RuntimeError in target thread
+                # Asynchronously raise a descriptive timeout in the loading thread
                 import ctypes
+                timeout_exc = ModelLoadTimeout(
+                    f"Stage '{stage_name}' exceeded {timeout_seconds}s "
+                    f"(elapsed={elapsed:.1f}s, RSS={_rss_mb():.1f}MB)"
+                )
                 res = ctypes.pythonapi.PyThreadState_SetAsyncExc(
                     ctypes.c_long(target_thread_id),
-                    ctypes.py_object(RuntimeError)
+                    ctypes.py_object(timeout_exc)
                 )
                 if res == 0:
                     logger.error("[WATCHDOG] failed to set exception: invalid thread id")
@@ -605,9 +634,13 @@ def _do_load(model_name: str) -> None:
 
         # Start loading watchdog
         load_thread_id = threading.get_ident()
+        load_watchdog_seconds = min(
+            float(MODEL_LOAD_TIMEOUT_SECONDS),
+            max(60.0, float(os.environ.get("MODEL_LOAD_WATCHDOG_SECONDS", "90"))),
+        )
         watchdog_thread = threading.Thread(
             target=_watchdog_loop,
-            args=(load_thread_id, 30.0),
+            args=(load_thread_id, load_watchdog_seconds),
             name="load_watchdog",
             daemon=True
         )
@@ -686,14 +719,16 @@ def _do_load(model_name: str) -> None:
     except Exception as exc:
         import traceback
         tb = traceback.format_exc()
+        wrapped = ModelLoadFailed(_format_load_error(exc, stage=_current_stage, model_name=model_name))
+        wrapped.__cause__ = exc
         logger.error(
             "[MODEL_SERVICE] [MODEL_LOAD_FAILED] model=%s stage=%s error=%s\n%s",
-            model_name, _current_stage, exc, tb,
+            model_name, _current_stage, wrapped, tb,
         )
-        print(f"[CONCURRENCY] LOADER_EXCEPTION in thread={tname} (tid={tid}): {exc}", flush=True)
-        logger.error(f"[CONCURRENCY] LOADER_EXCEPTION in thread={tname} (tid={tid}): {exc}")
+        print(f"[CONCURRENCY] LOADER_EXCEPTION in thread={tname} (tid={tid}): {wrapped}", flush=True)
+        logger.error(f"[CONCURRENCY] LOADER_EXCEPTION in thread={tname} (tid={tid}): {wrapped}")
         with _lock:
-            _load_error = exc
+            _load_error = wrapped
             _load_state = "failed"
     finally:
         print(f"[CONCURRENCY] LOADER_FINALLY in thread={tname} (tid={tid})", flush=True)
@@ -755,7 +790,8 @@ def get_model(timeout: float = MODEL_LOAD_TIMEOUT_SECONDS):
             return _model
 
         if _load_state == "failed":
-            raise ModelLoadFailed(f"Model '{target}' failed: {_load_error}") from _load_error
+            msg = _format_load_error(_load_error, stage=_current_stage, model_name=target)
+            raise ModelLoadFailed(msg) from _load_error
 
         # If unloaded, or if failed/idle and not currently loading, we elect this thread as loader
         if _load_state == "unloaded" or (not _loading and not _load_event.is_set()):
@@ -811,7 +847,8 @@ def get_model(timeout: float = MODEL_LOAD_TIMEOUT_SECONDS):
         current = _model
 
     if state == "failed":
-        raise ModelLoadFailed(f"Model '{target}' failed: {error}") from error
+        msg = _format_load_error(error, stage=_current_stage, model_name=target)
+        raise ModelLoadFailed(msg) from error
     if current is None:
         raise ModelLoadFailed(f"Model '{target}' returned None after load")
 
@@ -869,9 +906,25 @@ def unload_model() -> bool:
     return True
 
 
+def reset_failed_load() -> None:
+    """Clear a failed load state so a later indexing retry can reload the model."""
+    global _load_state, _load_error, _loading, _current_stage
+    with _lock:
+        if _load_state != "failed":
+            return
+        _load_state = "unloaded"
+        _load_error = None
+        _loading = False
+        _current_stage = "idle"
+        _load_event.clear()
+    logger.info("[MODEL_SERVICE] reset_failed_load() — ready for retry")
+    print("[MODEL_SERVICE] reset_failed_load() — ready for retry", flush=True)
+
+
 def reset() -> None:
     """For tests only. Unloads model and resets state."""
     unload_model()
+    reset_failed_load()
 
 
 # Configure offline mode and thread limits at module import time

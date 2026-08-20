@@ -24,9 +24,9 @@ _lock = threading.Lock()
 # Strict FSM Transitions
 VALID_TRANSITIONS = {
     "queued": {"processing", "failed", "cancelled"},
-    "processing": {"embedding", "failed", "cancelled"},
-    "embedding": {"indexing", "failed", "cancelled"},
-    "indexing": {"completed", "failed", "cancelled"},
+    "processing": {"embedding", "failed", "cancelled", "retrying"},
+    "embedding": {"indexing", "failed", "cancelled", "retrying"},
+    "indexing": {"completed", "failed", "cancelled", "retrying"},
     "failed": {"retrying", "queued", "processing"},
     "retrying": {"processing", "failed", "cancelled"},
     "completed": set(),
@@ -615,12 +615,12 @@ class JobManager:
         
         transition_accepted = self.validate_transition(current_status, target_status)
         if not transition_accepted:
-            logger.error(
-                "Illegal job status transition from %s to %s for project %s rejected.",
-                current_status, target_status, project_id
+            logger.warning(
+                "Illegal job status transition from %s to %s for project %s — "
+                "keeping status=%s, updating stage/progress only.",
+                current_status, target_status, project_id, current_status
             )
-            await self.fail_job(project_id, f"FSM_TRANSITION_ERROR: Illegal transition {current_status} -> {target_status}")
-            return
+            target_status = current_status
 
         # RAM calculations
         ram = 0.0

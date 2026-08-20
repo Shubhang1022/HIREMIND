@@ -115,12 +115,18 @@ class EmbeddingEncoder:
         """
         self._ensure_loaded()
         encoded_texts = self._apply_bge_prompt(texts, bge_mode=bge_mode)
+        batch_size = 16
+        try:
+            from app.core.config import settings
+            batch_size = settings.embedding_batch_size
+        except Exception:
+            pass
         embeddings = self._model.encode(
             encoded_texts,
             normalize_embeddings=normalize,
             convert_to_numpy=True,
             show_progress_bar=False,
-            batch_size=min(16, len(encoded_texts) or 1),
+            batch_size=min(batch_size, len(encoded_texts) or 1),
         )
         return embeddings.astype(np.float32)
 

@@ -1316,6 +1316,25 @@ Elapsed: {elapsed_str}
                     logger.info("Background indexing cancelled for project %s", project_id)
                     return
 
+                if attempt > 1:
+                    _sync_update_progress(
+                        project_id,
+                        f"Retrying (attempt {attempt}/{max_retries})",
+                        5,
+                        job_status="retrying",
+                        retry_count=attempt - 1,
+                    )
+                    _sync_update_progress(
+                        project_id,
+                        "Validating candidates",
+                        10,
+                        job_status="processing",
+                        retry_count=attempt - 1,
+                    )
+                    from app.services.model_service import reset_failed_load
+                    reset_failed_load()
+                    gc.collect()
+
                 # Calculate dataset hash
                 dataset_hash = compute_dataset_hash(None, project_id=project_id)
                 proj_res = supabase_client.table("projects").select("*").eq("id", project_id).execute()
@@ -1354,8 +1373,8 @@ Elapsed: {elapsed_str}
                 from src.features.structured import _classify_specialization_with_confidence, classify_candidate_role_category, HARD_DISQUALIFIER_TITLES
                 from src.scoring.quality import calculate_candidate_quality_score
 
-                # Update progress
-                _sync_update_progress(project_id, "Validating candidates", 10, job_status="processing", retry_count=attempt - 1)
+                # Update progress (stage only — status stays processing until embedding)
+                _sync_update_progress(project_id, "Validating candidates", 10, retry_count=attempt - 1)
 
                 from app.services.job_manager import safe_execute
                 safe_execute(
@@ -1368,7 +1387,7 @@ Elapsed: {elapsed_str}
 
                 # ── STAGE 1: Stream candidates & enrich ──
                 if not cand_jsonl_path.exists():
-                    _sync_update_progress(project_id, "Streaming candidates", 20, job_status="processing", retry_count=attempt - 1)
+                    _sync_update_progress(project_id, "Streaming candidates", 20, retry_count=attempt - 1)
                     logger.info("[STAGE_START] Streaming candidates and standardizing for project %s", project_id)
                     
                     with open(cand_jsonl_path, "w", encoding="utf-8") as f_enriched:
@@ -1416,10 +1435,11 @@ Elapsed: {elapsed_str}
                     for _ in f_enriched:
                         total_candidates += 1
 
-                _sync_update_progress(project_id, "Resume standardization", 35, job_status="processing", retry_count=attempt - 1)
+                _sync_update_progress(project_id, "Resume standardization", 35, retry_count=attempt - 1)
                 logger.info("Enriched %d candidates. Proceeding to embedding generation.", total_candidates)
 
                 # ── STAGE 2: Load embedding model (Singleton) ──
+                gc.collect()
                 _sync_update_progress(project_id, "Loading embedding model", 50, job_status="embedding", retry_count=attempt - 1)
                 
                 from src.features.text_builder import build_candidate_text
@@ -1692,13 +1712,17 @@ Elapsed: {elapsed_str}
 
             except Exception as e:
                 from app.services.job_manager import LockLostError
+                from app.services.model_service import ModelLoadFailed, ModelLoadTimeout
                 if isinstance(e, LockLostError) or "LockLostError" in type(e).__name__:
                     logger.warning("[LOCK_LOST_ABORT] project=%s indexing aborted: lock was lost/hijacked.", project_id)
                     return
 
                 elapsed = time.time() - t_start
+                err_label = str(e)
+                if isinstance(e, (ModelLoadFailed, ModelLoadTimeout)):
+                    err_label = f"MODEL_LOAD_FAILED: {e}"
                 logger.error("[BACKGROUND_TASK_FAIL] project=%s attempt=%d/%d elapsed=%.3fs\nException: %s",
-                             project_id, attempt, max_retries, elapsed, e)
+                             project_id, attempt, max_retries, elapsed, err_label)
                 if attempt < max_retries:
                     sleep_secs = 2.0 ** attempt
                     time.sleep(sleep_secs)
@@ -1711,12 +1735,12 @@ Elapsed: {elapsed_str}
                         cache["status"] = "failed"
                         cache["current_stage"] = f"Failed: {str(e)[:120]}"
                         cache["updated_at"] = time.time()
-                    _sync_fail_job(project_id, str(e))
+                    _sync_fail_job(project_id, err_label)
                     safe_execute(
                         supabase_client.table("projects").update({
                             "embedding_status": "failed",
                             "status": "FAILED",
-                            "upload_statistics": {"failure_reason": f"Background indexing failed: {e}"},
+                            "upload_statistics": {"failure_reason": f"Background indexing failed: {err_label}"},
                             "updated_at": _now()
                         }).eq("id", project_id)
                     )
