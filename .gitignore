@@ -107,11 +107,15 @@ EmbeddingAudit.md
 EmbeddingConsistencyReport.md
 EmbeddingExecutionTimeline.md
 EmbeddingMigrationAudit.md
+IMPLEMENTATION_GUIDE.md
+FINAL_SUMMARY.md
 FAISSAudit.md
 FinalProductionValidation.md
 FlowAudit.md
 HFCacheAudit.md
 IndexingPipelineAudit.md
+IMPLEMENTATION_GUIDE.md
+MEMORY_OPTIMIZATION_SUMMARY.md
 JDFirstArchitectureImplementation.md
 LazyLoadingReport.md
 MemoryDiagnostics.md
