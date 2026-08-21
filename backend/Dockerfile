@@ -19,7 +19,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Install Python dependencies first (Docker layer caching)
 COPY backend/requirements.txt .
 RUN pip install --upgrade pip && \
-    pip install --no-cache-dir torch==2.2.2 --index-url https://download.pytorch.org/whl/cpu && \
+    pip install --no-cache-dir torch==2.2.2+cpu --extra-index-url https://download.pytorch.org/whl/cpu && \
     pip install --no-cache-dir -r requirements.txt
 
 # Verify asyncpg installation at build time
@@ -41,10 +41,15 @@ ENV HF_HOME=/app/.cache/huggingface \
 # ── Embedding model ────────────────────────────────────────────────────────────
 # Must match: backend/app/core/config.py   → embedding_model
 #             backend/app/services/model_service.py → _DEFAULT_MODEL
+# Production defaults optimized for 512MB RAM deployments (Render free tier)
+# Batch size will be dynamically adjusted based on environment detection:
+#   - Free tier (512MB): batch_size=4, chunk_size=32
+#   - Larger instances: batch_size=16, chunk_size=64
 ENV EMBEDDING_MODEL_NAME=BAAI/bge-small-en-v1.5 \
     EMBEDDING_CHUNK_SIZE=64 \
     EMBEDDING_BATCH_SIZE=16 \
     UNLOAD_MODEL_AFTER_INDEXING=true \
+    MEMORY_CIRCUIT_BREAKER_THRESHOLD_MB=400 \
     MEMORY_SAFETY_THRESHOLD_MB=450
 
 # ── Pre-bake model weights into the image ─────────────────────────────────────

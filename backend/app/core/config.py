@@ -77,6 +77,39 @@ class Settings(BaseSettings):
     # Dockerfile bakes BAAI/bge-small-en-v1.5 (90 MB) into the image.
     # bge-base (438 MB) and bge-large (1.34 GB) cause OOM kills on Render free tier.
     # Override with EMBEDDING_MODEL_NAME env var if running on a larger instance.
+
+    # ?? Render Free Tier Detection & Adaptive Configuration ??
+    # Detect Render free tier environment to enable memory-constrained optimizations
+    @property
+    def is_render_free_tier(self) -> bool:
+        """Detect if running on Render free tier (512MB RAM limit)."""
+        import os
+        # Check if RENDER env var is set AND memory limit indicators
+        if os.getenv("RENDER") != "true":
+            return False
+        # Check for explicit free tier flag or memory constraints
+        if os.getenv("RENDER_FREE_TIER") == "true":
+            return True
+        # Detect based on memory limit env vars (Render sets these)
+        memory_limit = os.getenv("MEMORY_AVAILABLE", "").lower()
+        if "512" in memory_limit or "0.5" in memory_limit:
+            return True
+        return False
+
+    @property
+    def adaptive_batch_size(self) -> int:
+        """Return adaptive batch size: 4 for free tier, 16 for larger instances."""
+        if self.is_render_free_tier:
+            return 4
+        return self.embedding_batch_size
+
+    @property
+    def adaptive_chunk_size(self) -> int:
+        """Return adaptive chunk size: 32 for free tier, 64 for larger instances."""
+        if self.is_render_free_tier:
+            return 32
+        return self.embedding_chunk_size
+
     embedding_model: str = "BAAI/bge-small-en-v1.5"
 
     # Memory tuning for Render free tier (512 MB)
@@ -86,6 +119,9 @@ class Settings(BaseSettings):
     # Unload the embedding model from RAM after indexing completes.
     unload_model_after_indexing: bool = True
     # RSS threshold (MB) above which FAISS/LLM stages are skipped.
+    # Circuit breaker threshold: reject indexing if RSS > this value
+    memory_circuit_breaker_threshold_mb: float = 400.0
+    # Safety threshold for skipping FAISS/LLM stages
     memory_safety_threshold_mb: float = 450.0
 
     # OpenRouter

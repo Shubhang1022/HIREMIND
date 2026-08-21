@@ -118,7 +118,11 @@ class EmbeddingEncoder:
         batch_size = 16
         try:
             from app.core.config import settings
-            batch_size = settings.embedding_batch_size
+            batch_size = settings.adaptive_batch_size
+            # Log adaptive batch size for diagnostics
+            if settings.is_render_free_tier:
+                import logging
+                logging.getLogger(__name__).info("[BATCH_SIZE_ADAPTIVE] tier=free batch_size=%d", batch_size)
         except Exception:
             pass
         embeddings = self._model.encode(
