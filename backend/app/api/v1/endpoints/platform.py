@@ -7,6 +7,7 @@ Will be migrated to Supabase once the project is active.
 from __future__ import annotations
 
 import asyncio
+import random
 import csv
 import threading
 import io
@@ -35,6 +36,8 @@ logger = logging.getLogger(__name__)
 
 _UPLOAD_MEMORY_SPIKE_MB = 50.0
 memory_safety_mode = os.getenv("MEMORY_SAFETY_MODE", "False").lower() in ("true", "1")
+# Rate limiting for auto-resume operations (Render free tier protection)
+_auto_resume_semaphore = asyncio.Semaphore(settings.auto_resume_max_concurrent)
 
 def _compute_accuracy_metrics(results: list) -> dict:
     """Aggregate accuracy / confidence metrics from ranked candidate results."""
@@ -466,7 +469,11 @@ async def _resume_indexing_for_eligible_projects() -> None:
             )
             # Schedule with a short delay so the server finishes booting first
             import asyncio as _asyncio
-            _asyncio.create_task(_delayed_resume_indexing(project_id, user_id, delay_seconds=15.0))
+            # Calculate staggered delay to prevent concurrent auto-resume storms
+            stagger = random.uniform(settings.auto_resume_stagger_min, settings.auto_resume_stagger_max)
+            delay_seconds = settings.auto_resume_base_delay + stagger
+            logger.info('[RESUME_INDEXING] Scheduling project=%s with delay=%.1fs (stagger=%.1fs)', project_id, delay_seconds, stagger)
+            _asyncio.create_task(_delayed_resume_indexing(project_id, user_id, delay_seconds))
 
     except Exception as exc:
         logger.warning("[RESUME_INDEXING] Error during auto-resume scan: %s", exc)
@@ -478,6 +485,9 @@ async def _delayed_resume_indexing(project_id: str, user_id: str, delay_seconds:
     import logging
     logger = logging.getLogger(__name__)
     await _asyncio.sleep(delay_seconds)
+    
+    # Use semaphore to limit concurrent auto-resume operations
+    async with _auto_resume_semaphore:
     try:
         logger.info("[RESUME_INDEXING] Starting delayed auto-resume for project=%s", project_id)
         supabase_client.table("projects").update({
