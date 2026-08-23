@@ -166,3 +166,7 @@ RootCauseAnalysis.md
 StartupImportGraph.md
 HFCacheAudit.md
 PerformanceRecommendations.md
+
+# Documentation files - do not push to GitHub
+docs/*.md
+*.md
