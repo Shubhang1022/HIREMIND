@@ -133,5 +133,11 @@ class Settings(BaseSettings):
     max_upload_size_mb: int = 50
     upload_dir: str = "./uploads"
 
+    # Auto-resume rate limiting for Render free tier
+    auto_resume_max_concurrent: int = 2  # Max concurrent auto-resume jobs
+    auto_resume_base_delay: float = 15.0  # Base delay before auto-resume
+    auto_resume_stagger_min: float = 5.0  # Min stagger delay per project
+    auto_resume_stagger_max: float = 10.0  # Max stagger delay per project
+
 
 settings = Settings()
