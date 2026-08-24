@@ -139,5 +139,9 @@ class Settings(BaseSettings):
     auto_resume_stagger_min: float = 5.0  # Min stagger delay per project
     auto_resume_stagger_max: float = 10.0  # Max stagger delay per project
 
+    # LLM-based candidate filtering (replaces embedding model)
+    use_llm_filtering: bool = True  # Use LLM instead of embedding model for filtering
+    llm_filter_batch_size: int = 10  # Candidates per LLM API call
+
 
 settings = Settings()

@@ -1448,174 +1448,67 @@ Elapsed: {elapsed_str}
                 _sync_update_progress(project_id, "Resume standardization", 35, retry_count=attempt - 1)
                 logger.info("Enriched %d candidates. Proceeding to embedding generation.", total_candidates)
 
-                # ── STAGE 2: Load embedding model (Singleton) ──
+                                # ── STAGE 2: LLM-Based Candidate Analysis ──
                 gc.collect()
-                _sync_update_progress(project_id, "Loading embedding model", 50, job_status="embedding", retry_count=attempt - 1)
+                _sync_update_progress(project_id, "Analyzing candidates with AI", 50, job_status="processing", retry_count=attempt - 1)
                 
-                from src.features.text_builder import build_candidate_text
-                from app.services.model_service import is_loaded, ModelLoadTimeout, ModelLoadFailed
+                # Use LLM for candidate filtering instead of embeddings
+                from app.services.llm_candidate_filter import analyze_candidates_batch
                 
-                t_load_start = time.time()
-                encoder = _get_encoder()
-                dim = getattr(encoder, 'embedding_dim', 384)
-                logger.info("[STAGE_END] project=%s stage=load_model elapsed=%.2fs dim=%d", project_id, time.time() - t_load_start, dim)
-
-                # ── STAGE 3: Generate embeddings & build FAISS (Chunked & Resumable) ──
-                chunk_size = settings.embedding_chunk_size
-                total_chunks = (total_candidates + chunk_size - 1) // chunk_size
+                # Load job description for analysis
+                jd_res = supabase_client.table("jobs").select("*").eq("project_id", project_id).limit(1).execute()
+                jd_text = ""
+                jd_title = "Open Position"
+                if jd_res.data:
+                    jd = jd_res.data[0]
+                    jd_text = jd.get("description", "")
+                    jd_title = jd.get("title", "Open Position")
                 
-                # Check how many are already embedded
-                num_embedded = 0
-                if embeddings_raw_path.exists():
-                    try:
-                        num_embedded = os.path.getsize(embeddings_raw_path) // (dim * 4)
-                        logger.info("Found %d already embedded candidates in checkpoint raw file", num_embedded)
-                    except Exception:
-                        pass
-                
-                # Setup FAISS Index
-                import faiss
-                index = faiss.IndexFlatIP(dim)
-                if num_embedded > 0:
-                    try:
-                        raw_data = np.fromfile(embeddings_raw_path, dtype=np.float32).reshape(-1, dim)
-                        if len(raw_data) > 0:
-                            index.add(raw_data)
-                            logger.info("Loaded %d vectors into FAISS index from checkpoint", index.ntotal)
-                    except Exception as e:
-                        logger.error("Failed to load existing embeddings into FAISS: %s. Resetting raw embeddings file.", e)
-                        num_embedded = 0
-                        if embeddings_raw_path.exists():
-                            os.remove(embeddings_raw_path)
-                
-                # Start loop
-                t_embeddings_start = time.time()
-                chunk_durations = []
-                
+                # Load all candidates for LLM analysis
+                candidates_for_analysis = []
                 with open(cand_jsonl_path, "r", encoding="utf-8") as f_enriched:
-                    candidates_pool = []
-                    current_idx = 0
-                    
                     for line in f_enriched:
-                        # Check cancellation
-                        if current_idx % 10 == 0 and job_manager.is_cancelled(project_id):
-                            _sync_update_progress(project_id, "Cancelled", 0, job_status="cancelled")
-                            job_manager.clear_cancellation(project_id)
-                            return
-                            
-                        if current_idx < num_embedded:
-                            current_idx += 1
-                            continue
-                            
                         c = json.loads(line)
-                        candidates_pool.append(c)
-                        current_idx += 1
-                        
-                        if len(candidates_pool) >= chunk_size:
-                            chunk_num = (current_idx // chunk_size)
-                            t_chunk_start = time.time()
-                            
-                            progress_pct = 65 + int((current_idx / max(total_candidates, 1)) * 16) # 65% to 81%
-                            stage_label = f"Embedding {current_idx} / {total_candidates}"
-                            
-                            batch_texts = [build_candidate_text(item) if not item.get("is_disqualified", False) else "" for item in candidates_pool]
-                            valid_indices = [i for i, text in enumerate(batch_texts) if text != ""]
-                            valid_texts = [batch_texts[i] for i in valid_indices]
-                            
-                            if valid_texts:
-                                encoded = encoder.encode_batch(valid_texts)
-                                arr = np.array(encoded, dtype=np.float32)
-                                chunk_embs = np.zeros((len(candidates_pool), dim), dtype=np.float32)
-                                for idx_in_chunk, original_idx in enumerate(valid_indices):
-                                    chunk_embs[original_idx] = arr[idx_in_chunk]
-                            else:
-                                chunk_embs = np.zeros((len(candidates_pool), dim), dtype=np.float32)
-                                
-                            with open(embeddings_raw_path, "ab") as f_raw:
-                                f_raw.write(chunk_embs.tobytes())
-                                
-                            index.add(chunk_embs)
-                            
-                            chunk_elapsed = time.time() - t_chunk_start
-                            chunk_durations.append(chunk_elapsed)
-                            if len(chunk_durations) > 5:
-                                chunk_durations.pop(0)
-                            avg_chunk_time = sum(chunk_durations) / len(chunk_durations)
-                            remaining_chunks = max(0, total_chunks - chunk_num)
-                            eta_seconds = remaining_chunks * avg_chunk_time
-                            eta_str = f"{int(eta_seconds // 60):02d}:{int(eta_seconds % 60):02d}"
-                            overall_speed = current_idx / max(time.time() - t_embeddings_start, 0.001)
-                            
-                            _sync_update_progress(
-                                project_id, stage_label, progress_pct,
-                                job_status="embedding",
-                                processed_candidates=current_idx,
-                                total_candidates=total_candidates,
-                                eta=eta_str,
-                                speed=overall_speed,
-                                retry_count=attempt - 1
-                            )
-                            log_worker_heartbeat(f"Generating Embeddings (chunk {chunk_num}/{total_chunks})", current_idx, total_candidates, chunk_num)
-                            
-                            del chunk_embs, batch_texts, valid_texts, valid_indices
-                            if 'arr' in locals():
-                                del arr
-                            if 'encoded' in locals():
-                                del encoded
-                            gc.collect()
-                            candidates_pool = []
-                            
-                    # Final partial chunk
-                    if candidates_pool:
-                        chunk_num = total_chunks
-                        t_chunk_start = time.time()
-                        progress_pct = 81
-                        stage_label = f"Embedding {current_idx} / {total_candidates}"
-                        
-                        batch_texts = [build_candidate_text(item) if not item.get("is_disqualified", False) else "" for item in candidates_pool]
-                        valid_indices = [i for i, text in enumerate(batch_texts) if text != ""]
-                        valid_texts = [batch_texts[i] for i in valid_indices]
-                        
-                        if valid_texts:
-                            encoded = encoder.encode_batch(valid_texts)
-                            arr = np.array(encoded, dtype=np.float32)
-                            chunk_embs = np.zeros((len(candidates_pool), dim), dtype=np.float32)
-                            for idx_in_chunk, original_idx in enumerate(valid_indices):
-                                chunk_embs[original_idx] = arr[idx_in_chunk]
-                        else:
-                            chunk_embs = np.zeros((len(candidates_pool), dim), dtype=np.float32)
-                            
-                        with open(embeddings_raw_path, "ab") as f_raw:
-                            f_raw.write(chunk_embs.tobytes())
-                            
-                        index.add(chunk_embs)
-                        overall_speed = current_idx / max(time.time() - t_embeddings_start, 0.001)
-                        
-                        _sync_update_progress(
-                            project_id, stage_label, progress_pct,
-                            job_status="embedding",
-                            processed_candidates=current_idx,
-                            total_candidates=total_candidates,
-                            eta="00:00",
-                            speed=overall_speed,
-                            retry_count=attempt - 1
-                        )
-                        log_worker_heartbeat("Generating Embeddings (Final chunk)", current_idx, total_candidates, chunk_num)
-                        
-                        del chunk_embs, batch_texts, valid_texts, valid_indices
-                        if 'arr' in locals():
-                            del arr
-                        if 'encoded' in locals():
-                            del encoded
-                        gc.collect()
-                        candidates_pool = []
+                        candidates_for_analysis.append(c)
+                
+                logger.info("[STAGE_START] LLM analysis for %d candidates against JD: %s", len(candidates_for_analysis), jd_title)
+                
+                # Run LLM batch analysis (async function, need to run in event loop)
+                import asyncio
+                try:
+                    loop = asyncio.get_event_loop()
+                except RuntimeError:
+                    loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(loop)
+                
+                if loop.is_running():
+                    from asyncio import run_coroutine_threadsafe
+                    future = run_coroutine_threadsafe(
+                        analyze_candidates_batch(candidates_for_analysis, jd_text, jd_title, settings.llm_filter_batch_size),
+                        loop
+                    )
+                    analysis_results = future.result(timeout=300.0)  # 5 min timeout
+                else:
+                    analysis_results = loop.run_until_complete(
+                        analyze_candidates_batch(candidates_for_analysis, jd_text, jd_title, settings.llm_filter_batch_size)
+                    )
+                
+                logger.info("[STAGE_END] LLM analysis complete. %d candidates analyzed.", len(analysis_results))
+                
+                # Build analysis lookup
+                analysis_lookup = {}
+                for a in analysis_results:
+                    analysis_lookup[a.get("candidate_id")] = a
+                
+                # Save analysis results to JSON
+                analysis_json_path = ckpt_dir / "candidate_analysis.json"
+                with open(analysis_json_path, "w", encoding="utf-8") as f_analysis:
+                    json.dump(analysis_results, f_analysis, ensure_ascii=False, indent=2)
+                
+                # Update progress
+                _sync_update_progress(project_id, "Building indexes", 82, job_status="indexing", retry_count=attempt - 1)
 
-                # ── STAGE 4: Build FAISS Index File ──
-                _sync_update_progress(project_id, "Building FAISS", 82, job_status="indexing", retry_count=attempt - 1)
-                faiss.write_index(index, str(faiss_index_path))
-                logger.info("FAISS Index written successfully to %s. Total vectors: %d", faiss_index_path, index.ntotal)
-
-                # ── STAGE 5: Build Parquet Metadata & JSON Lookup ──
+                # ── STAGE 3: Build lookup metadata (no FAISS needed) ──
                 metadata_rows = []
                 lookup_dict = {}
                 offset = 0
@@ -1628,26 +1521,44 @@ Elapsed: {elapsed_str}
                         skills_extracted = [s if isinstance(s, str) else s.get("name", "") for s in skills_list]
                         skills_extracted = [s.lower().strip() for s in skills_extracted if s]
                         
+                        # Get LLM analysis if available
+                        analysis = analysis_lookup.get(c_id, {})
+                        
                         metadata_rows.append({
                             "candidate_id": c_id,
                             "role": c.get("candidate_role_category", "BACKEND"),
                             "skills": skills_extracted,
                             "experience": float(c.get("years_exp", 0.0)),
                             "candidate_quality_score": float(c.get("candidate_quality_score", 0.0)),
-                            "embedding_offset": offset
+                            "relevance_score": float(analysis.get("relevance_score", 0.5)),
+                            "filter_decision": analysis.get("filter_decision", "pass"),
+                            "analysis_offset": offset
                         })
                         lookup_dict[c_id] = c
                         offset += 1
 
                 df = pd.DataFrame(metadata_rows)
+                parquet_metadata_path = ckpt_dir / "candidate_metadata.parquet"
                 df.to_parquet(parquet_metadata_path, index=False)
                 
+                lookup_json_path = ckpt_dir / "candidate_lookup.json"
                 with open(lookup_json_path, "w", encoding="utf-8") as f_lookup:
                     json.dump(lookup_dict, f_lookup, ensure_ascii=False)
 
                 logger.info("Metadata and lookup files written successfully.")
 
-                # ── STAGE 6: Zip & Upload ──
+                # ── STAGE 4: Zip & Upload ──
+                _sync_update_progress(project_id, "Uploading indexes", 92, job_status="indexing", retry_count=attempt - 1)
+                
+                zip_path = ckpt_dir / f"index_v{version}.zip"
+                with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as z:
+                    # Include analysis JSON instead of FAISS
+                    if analysis_json_path.exists():
+                        z.write(analysis_json_path, "candidate_analysis.json")
+                    z.write(parquet_metadata_path, "candidate_metadata.parquet")
+                    z.write(lookup_json_path, "candidate_lookup.json")
+
+# ── STAGE 6: Zip & Upload ──
                 _sync_update_progress(project_id, "Uploading indexes", 92, job_status="indexing", retry_count=attempt - 1)
                 
                 zip_path = ckpt_dir / f"index_v{version}.zip"
