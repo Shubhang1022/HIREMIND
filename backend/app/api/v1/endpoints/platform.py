@@ -488,45 +488,45 @@ async def _delayed_resume_indexing(project_id: str, user_id: str, delay_seconds:
     
     # Use semaphore to limit concurrent auto-resume operations
     async with _auto_resume_semaphore:
-    try:
-        logger.info("[RESUME_INDEXING] Starting delayed auto-resume for project=%s", project_id)
-        supabase_client.table("projects").update({
-            "embedding_status": "queued",
-            "status": "INDEXING",
-            "updated_at": _now(),
-        }).eq("id", project_id).execute()
-
-        from app.services.job_manager import JobManager
-        manager = JobManager.get_instance()
-        coro = manager.register_job(project_id, user_id or "", "indexing")
         try:
-            loop = _asyncio.get_event_loop()
-        except RuntimeError:
-            loop = _asyncio.new_event_loop()
-            _asyncio.set_event_loop(loop)
-        if loop.is_running():
-            try:
-                await coro
-            except Exception:
-                pass
-        else:
-            loop.run_until_complete(coro)
+            logger.info("[RESUME_INDEXING] Starting delayed auto-resume for project=%s", project_id)
+            supabase_client.table("projects").update({
+                "embedding_status": "queued",
+                "status": "INDEXING",
+                "updated_at": _now(),
+            }).eq("id", project_id).execute()
 
-        async def _run_in_thread():
+            from app.services.job_manager import JobManager
+            manager = JobManager.get_instance()
+            coro = manager.register_job(project_id, user_id or "", "indexing")
             try:
-                await _asyncio.to_thread(
-                    _safe_background_task,
-                    "auto_resume_indexing",
-                    process_project_data_task,
-                    project_id,
-                )
-            except Exception as e:
-                logger.error("Background task wrapper failed: %s", e)
+                loop = _asyncio.get_event_loop()
+            except RuntimeError:
+                loop = _asyncio.new_event_loop()
+                _asyncio.set_event_loop(loop)
+            if loop.is_running():
+                try:
+                    await coro
+                except Exception:
+                    pass
+            else:
+                loop.run_until_complete(coro)
 
-        _asyncio.create_task(_run_in_thread())
-        logger.info("[RESUME_INDEXING] Auto-resume kicked off for project=%s", project_id)
-    except Exception as exc:
-        logger.error("[RESUME_INDEXING] Auto-resume failed for project=%s: %s", project_id, exc)
+            async def _run_in_thread():
+                try:
+                    await _asyncio.to_thread(
+                        _safe_background_task,
+                        "auto_resume_indexing",
+                        process_project_data_task,
+                        project_id,
+                    )
+                except Exception as e:
+                    logger.error("Background task wrapper failed: %s", e)
+
+            _asyncio.create_task(_run_in_thread())
+            logger.info("[RESUME_INDEXING] Auto-resume kicked off for project=%s", project_id)
+        except Exception as exc:
+            logger.error("[RESUME_INDEXING] Auto-resume failed for project=%s: %s", project_id, exc)
 
 
 # ── Embedding model singleton ─────────────────────────────────────────────────
