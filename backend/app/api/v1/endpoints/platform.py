@@ -1558,30 +1558,7 @@ Elapsed: {elapsed_str}
                     z.write(parquet_metadata_path, "candidate_metadata.parquet")
                     z.write(lookup_json_path, "candidate_lookup.json")
 
-# ── STAGE 6: Zip & Upload ──
-                _sync_update_progress(project_id, "Uploading indexes", 92, job_status="indexing", retry_count=attempt - 1)
-                
-                zip_path = ckpt_dir / f"index_v{version}.zip"
-                with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as z:
-                    z.write(faiss_index_path, "candidate_index.faiss")
-                    z.write(parquet_metadata_path, "candidate_metadata.parquet")
-                    z.write(lookup_json_path, "candidate_lookup.json")
-
-                # Compute checksum
-                zip_hash = hashlib.sha256()
-                with open(zip_path, "rb") as f_zip:
-                    while True:
-                        data_chunk = f_zip.read(65536)
-                        if not data_chunk:
-                            break
-                        zip_hash.update(data_chunk)
-                checksum = zip_hash.hexdigest()
-
-                zip_content = zip_path.read_bytes()
-                StorageService.upload_file("embeddings", zip_key, zip_content)
-                del zip_content
-
-                # ── STAGE 7: Verify ──
+# ── STAGE 7: Verify ──
                 _sync_update_progress(project_id, "Verifying artifacts", 97, job_status="indexing", retry_count=attempt - 1)
                 if not StorageService.file_exists("embeddings", zip_key):
                     raise FileNotFoundError(f"Uploaded ZIP index {zip_key} could not be verified in storage bucket.")
