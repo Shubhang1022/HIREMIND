@@ -1471,35 +1471,13 @@ Elapsed: {elapsed_str}
                         c = json.loads(line)
                         candidates_for_analysis.append(c)
                 
-                logger.info("[STAGE_START] LLM analysis for %d candidates against JD: %s", len(candidates_for_analysis), jd_title)
+                logger.info("[STAGE_START] Using fast deterministic scoring for %d candidates", len(candidates_for_analysis))
                 
-                # Run LLM batch analysis with error handling
-                analysis_results = []
-                try:
-                    import asyncio
-                    try:
-                        loop = asyncio.get_event_loop()
-                    except RuntimeError:
-                        loop = asyncio.new_event_loop()
-                        asyncio.set_event_loop(loop)
-                    
-                    if loop.is_running():
-                        from asyncio import run_coroutine_threadsafe
-                        future = run_coroutine_threadsafe(
-                            analyze_candidates_batch(candidates_for_analysis, jd_text, jd_title, settings.llm_filter_batch_size),
-                            loop
-                        )
-                        analysis_results = future.result(timeout=300.0)  # 5 min timeout
-                    else:
-                        analysis_results = loop.run_until_complete(
-                            analyze_candidates_batch(candidates_for_analysis, jd_text, jd_title, settings.llm_filter_batch_size)
-                        )
-                    
-                    logger.info("[STAGE_END] LLM analysis complete. %d candidates analyzed.", len(analysis_results))
-                except Exception as llm_err:
-                    logger.error("[LLM_ANALYSIS_FAILED] %s. Using fallback scoring.", llm_err)
-                    from app.services.llm_candidate_filter import _fallback_analysis
-                    analysis_results = _fallback_analysis(candidates_for_analysis)
+                # Use fallback scoring (fast, no API calls)
+                # LLM analysis will happen during the analyze endpoint instead
+                from app.services.llm_candidate_filter import _fallback_analysis
+                analysis_results = _fallback_analysis(candidates_for_analysis)
+                logger.info("[STAGE_END] Fast scoring complete. %d candidates scored.", len(analysis_results))
                 
                 # Build analysis lookup
                 analysis_lookup = {}
