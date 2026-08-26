@@ -1564,6 +1564,22 @@ Elapsed: {elapsed_str}
                     z.write(parquet_metadata_path, "candidate_metadata.parquet")
                     z.write(lookup_json_path, "candidate_lookup.json")
 
+                # Compute checksum
+                zip_hash = hashlib.sha256()
+                with open(zip_path, 'rb') as f_zip:
+                    while True:
+                        data_chunk = f_zip.read(65536)
+                        if not data_chunk:
+                            break
+                        zip_hash.update(data_chunk)
+                checksum = zip_hash.hexdigest()
+
+                # Upload to storage
+                zip_content = zip_path.read_bytes()
+                StorageService.upload_file('embeddings', zip_key, zip_content)
+                del zip_content
+
+
 # ── STAGE 7: Verify ──
                 _sync_update_progress(project_id, "Verifying artifacts", 97, job_status="indexing", retry_count=attempt - 1)
                 if not StorageService.file_exists("embeddings", zip_key):
