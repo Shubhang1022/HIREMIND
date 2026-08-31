@@ -1,0 +1,4 @@
+# file: C:\Users\HP\AppData\Roaming\Python\Python314\site-packages\realtime\transformers.py
+# hypothesis_version: 6.151.9
+
+[',', 'T', '_', 'abstime', 'bool', 'date', 'daterange', 'f', 'float4', 'float8', 'int2', 'int4', 'int4range', 'int8', 'int8range', 'json', 'jsonb', 'money', 'name', 'numeric', 'oid', 'reltime', 'skip_types', 't', 'time', 'timestamp', 'timestamptz', 'timetz', 'tsrange', 'tstzrange', 'type', 'undefined']

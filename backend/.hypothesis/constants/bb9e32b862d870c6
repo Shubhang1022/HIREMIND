@@ -1,0 +1,4 @@
+# file: C:\Users\HP\AppData\Roaming\Python\Python314\site-packages\storage3\_sync\bucket.py
+# hypothesis_version: 6.151.9
+
+['/bucket', 'DELETE', 'GET', 'POST', 'PUT', 'SyncStorageBucketAPI', 'id', 'name', 'statusCode']

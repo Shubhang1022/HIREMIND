@@ -1,0 +1,4 @@
+# file: C:\Users\HP\AppData\Roaming\Python\Python314\site-packages\httpx\_compat.py
+# hypothesis_version: 6.151.9
+
+['^([0-9]+)\\.([0-9]+)', 'brotli']

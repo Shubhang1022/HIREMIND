@@ -1,0 +1,182 @@
+{
+  "pbtResults": {},
+  "executionHistory": {
+    "1. Write bug condition exploration test": [
+      {
+        "executionId": "1932e5f6-c56f-4f96-b71c-24578aaa5737",
+        "chatSessionId": "sess_ad53bdac-cbee-46d8-8a14-2cad024f1d9e",
+        "timestamp": 1788069908348
+      },
+      {
+        "executionId": "1932e5f6-c56f-4f96-b71c-24578aaa5737",
+        "chatSessionId": "sess_ad53bdac-cbee-46d8-8a14-2cad024f1d9e",
+        "timestamp": 1788069922027
+      },
+      {
+        "executionId": "31acc345-e8f0-4bca-8dbc-6af3746c9fb8",
+        "chatSessionId": "sess_ad53bdac-cbee-46d8-8a14-2cad024f1d9e",
+        "timestamp": 1788105314176
+      }
+    ],
+    "2. Write preservation property tests (BEFORE implementing fix)": [
+      {
+        "executionId": "1932e5f6-c56f-4f96-b71c-24578aaa5737",
+        "chatSessionId": "sess_ad53bdac-cbee-46d8-8a14-2cad024f1d9e",
+        "timestamp": 1788069909188
+      },
+      {
+        "executionId": "1aac1baf-f900-4fea-84bb-dbd8567feae6",
+        "chatSessionId": "sess_ad53bdac-cbee-46d8-8a14-2cad024f1d9e",
+        "timestamp": 1788098607215
+      },
+      {
+        "executionId": "1aac1baf-f900-4fea-84bb-dbd8567feae6",
+        "chatSessionId": "sess_ad53bdac-cbee-46d8-8a14-2cad024f1d9e",
+        "timestamp": 1788099313291
+      }
+    ],
+    "3.1 Update configuration in backend/app/core/config.py": [
+      {
+        "executionId": "1932e5f6-c56f-4f96-b71c-24578aaa5737",
+        "chatSessionId": "sess_ad53bdac-cbee-46d8-8a14-2cad024f1d9e",
+        "timestamp": 1788069909279
+      },
+      {
+        "executionId": "1aac1baf-f900-4fea-84bb-dbd8567feae6",
+        "chatSessionId": "sess_ad53bdac-cbee-46d8-8a14-2cad024f1d9e",
+        "timestamp": 1788099337132
+      },
+      {
+        "executionId": "1aac1baf-f900-4fea-84bb-dbd8567feae6",
+        "chatSessionId": "sess_ad53bdac-cbee-46d8-8a14-2cad024f1d9e",
+        "timestamp": 1788099520485
+      }
+    ],
+    "3.2 Implement global recovery coordination in backend/app/services/job_manager.py": [
+      {
+        "executionId": "1932e5f6-c56f-4f96-b71c-24578aaa5737",
+        "chatSessionId": "sess_ad53bdac-cbee-46d8-8a14-2cad024f1d9e",
+        "timestamp": 1788069909395
+      },
+      {
+        "executionId": "1aac1baf-f900-4fea-84bb-dbd8567feae6",
+        "chatSessionId": "sess_ad53bdac-cbee-46d8-8a14-2cad024f1d9e",
+        "timestamp": 1788099527313
+      },
+      {
+        "executionId": "1aac1baf-f900-4fea-84bb-dbd8567feae6",
+        "chatSessionId": "sess_ad53bdac-cbee-46d8-8a14-2cad024f1d9e",
+        "timestamp": 1788099742407
+      }
+    ],
+    "3.3 Update recover_interrupted_jobs() in backend/app/services/job_manager.py": [
+      {
+        "executionId": "1932e5f6-c56f-4f96-b71c-24578aaa5737",
+        "chatSessionId": "sess_ad53bdac-cbee-46d8-8a14-2cad024f1d9e",
+        "timestamp": 1788069909521
+      },
+      {
+        "executionId": "1aac1baf-f900-4fea-84bb-dbd8567feae6",
+        "chatSessionId": "sess_ad53bdac-cbee-46d8-8a14-2cad024f1d9e",
+        "timestamp": 1788099749345
+      },
+      {
+        "executionId": "1aac1baf-f900-4fea-84bb-dbd8567feae6",
+        "chatSessionId": "sess_ad53bdac-cbee-46d8-8a14-2cad024f1d9e",
+        "timestamp": 1788100314910
+      }
+    ],
+    "3.4 Update auto_resume in backend/app/api/v1/endpoints/platform.py": [
+      {
+        "executionId": "1932e5f6-c56f-4f96-b71c-24578aaa5737",
+        "chatSessionId": "sess_ad53bdac-cbee-46d8-8a14-2cad024f1d9e",
+        "timestamp": 1788069909599
+      },
+      {
+        "executionId": "1aac1baf-f900-4fea-84bb-dbd8567feae6",
+        "chatSessionId": "sess_ad53bdac-cbee-46d8-8a14-2cad024f1d9e",
+        "timestamp": 1788100321088
+      },
+      {
+        "executionId": "1aac1baf-f900-4fea-84bb-dbd8567feae6",
+        "chatSessionId": "sess_ad53bdac-cbee-46d8-8a14-2cad024f1d9e",
+        "timestamp": 1788102168734
+      }
+    ],
+    "3.5 Add memory monitoring utilities": [
+      {
+        "executionId": "1932e5f6-c56f-4f96-b71c-24578aaa5737",
+        "chatSessionId": "sess_ad53bdac-cbee-46d8-8a14-2cad024f1d9e",
+        "timestamp": 1788069909685
+      },
+      {
+        "executionId": "1aac1baf-f900-4fea-84bb-dbd8567feae6",
+        "chatSessionId": "sess_ad53bdac-cbee-46d8-8a14-2cad024f1d9e",
+        "timestamp": 1788102176054
+      },
+      {
+        "executionId": "1aac1baf-f900-4fea-84bb-dbd8567feae6",
+        "chatSessionId": "sess_ad53bdac-cbee-46d8-8a14-2cad024f1d9e",
+        "timestamp": 1788102537456
+      }
+    ],
+    "3.6 Verify bug condition exploration test now passes": [
+      {
+        "executionId": "1932e5f6-c56f-4f96-b71c-24578aaa5737",
+        "chatSessionId": "sess_ad53bdac-cbee-46d8-8a14-2cad024f1d9e",
+        "timestamp": 1788069909770
+      },
+      {
+        "executionId": "1aac1baf-f900-4fea-84bb-dbd8567feae6",
+        "chatSessionId": "sess_ad53bdac-cbee-46d8-8a14-2cad024f1d9e",
+        "timestamp": 1788102544964
+      },
+      {
+        "executionId": "1aac1baf-f900-4fea-84bb-dbd8567feae6",
+        "chatSessionId": "sess_ad53bdac-cbee-46d8-8a14-2cad024f1d9e",
+        "timestamp": 1788102991066
+      }
+    ],
+    "3.7 Verify preservation tests still pass": [
+      {
+        "executionId": "1932e5f6-c56f-4f96-b71c-24578aaa5737",
+        "chatSessionId": "sess_ad53bdac-cbee-46d8-8a14-2cad024f1d9e",
+        "timestamp": 1788069909831
+      },
+      {
+        "executionId": "1aac1baf-f900-4fea-84bb-dbd8567feae6",
+        "chatSessionId": "sess_ad53bdac-cbee-46d8-8a14-2cad024f1d9e",
+        "timestamp": 1788102996655
+      },
+      {
+        "executionId": "1aac1baf-f900-4fea-84bb-dbd8567feae6",
+        "chatSessionId": "sess_ad53bdac-cbee-46d8-8a14-2cad024f1d9e",
+        "timestamp": 1788104257235
+      }
+    ],
+    "4. Checkpoint - Ensure all tests pass": [
+      {
+        "executionId": "1932e5f6-c56f-4f96-b71c-24578aaa5737",
+        "chatSessionId": "sess_ad53bdac-cbee-46d8-8a14-2cad024f1d9e",
+        "timestamp": 1788069909883
+      },
+      {
+        "executionId": "1aac1baf-f900-4fea-84bb-dbd8567feae6",
+        "chatSessionId": "sess_ad53bdac-cbee-46d8-8a14-2cad024f1d9e",
+        "timestamp": 1788104263461
+      },
+      {
+        "executionId": "31acc345-e8f0-4bca-8dbc-6af3746c9fb8",
+        "chatSessionId": "sess_ad53bdac-cbee-46d8-8a14-2cad024f1d9e",
+        "timestamp": 1788111221206
+      }
+    ],
+    "3. Fix for startup recovery concurrency limit bug": [
+      {
+        "executionId": "1aac1baf-f900-4fea-84bb-dbd8567feae6",
+        "chatSessionId": "sess_ad53bdac-cbee-46d8-8a14-2cad024f1d9e",
+        "timestamp": 1788104257372
+      }
+    ]
+  }
+}

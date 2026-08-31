@@ -825,22 +825,44 @@ class JobManager:
     _recovery_semaphore: Optional[asyncio.Semaphore] = None
 
     def get_recovery_semaphore(self) -> asyncio.Semaphore:
+        """Get or create the global recovery semaphore limiting concurrent recovery operations.
+        
+        This semaphore is shared between job_manager recovery and platform.py auto_resume
+        to ensure coordinated concurrency limits across all recovery mechanisms.
+        
+        Returns:
+            asyncio.Semaphore with limit set to settings.MAX_RECOVERY_CONCURRENCY (default: 2)
+        """
         if self._recovery_semaphore is None:
-            self._recovery_semaphore = asyncio.Semaphore(1)
+            self._recovery_semaphore = asyncio.Semaphore(settings.MAX_RECOVERY_CONCURRENCY)
+            logger.info(
+                "[RECOVERY_SEMAPHORE_INIT] Created global recovery semaphore with limit=%d",
+                settings.MAX_RECOVERY_CONCURRENCY
+            )
         return self._recovery_semaphore
 
     async def recover_interrupted_jobs(self):
         """Startup job checker: restarts interrupted jobs with exponential backoff.
 
-        Backoff schedule (seconds): attempt 1 → 60, 2 → 120, 3 → 300.
+        Backoff schedule (seconds): attempt 1 → 300 (5 min), 2 → 600 (10 min), 3 → 900 (15 min).
         Jobs that have exceeded 3 retries are permanently failed.
         Jobs whose failure_reason contains MODEL_LOAD_FAILED or MODEL_LOAD_TIMEOUT
         are also permanently failed — retrying would produce the same hang.
 
+        Implements global recovery coordination with memory checks and rate limiting
+        to prevent resource exhaustion on free-tier instances.
+
         Prints a recovery summary table to logs on completion.
         """
+        # Check if auto-recovery is disabled via environment variable
+        auto_recovery_enabled = os.getenv('AUTO_RECOVERY_ENABLED', 'true').lower() == 'true'
+        if not auto_recovery_enabled:
+            logger.info("[RECOVERY] Auto-recovery is disabled (AUTO_RECOVERY_ENABLED=false). Skipping job recovery.")
+            return
+        
         await self.ensure_db_schema()
-        BACKOFF_SECONDS = {1: 60, 2: 120, 3: 300}
+        # Updated backoff schedule: 5/10/15 minutes for free-tier cold start compatibility
+        BACKOFF_SECONDS = {1: 300, 2: 600, 3: 900}
         NON_RETRYABLE_REASONS = ("MODEL_LOAD_FAILED", "MODEL_LOAD_TIMEOUT", "model_load_failed",
                                   "INDEX_DIMENSION_MISMATCH")
 
@@ -871,8 +893,15 @@ class JobManager:
                     return
 
                 logger.info("[RECOVERY] Found %d unfinished background jobs.", len(jobs))
+                logger.info(
+                    "[RECOVERY_COORDINATION] Using global semaphore with limit=%d, "
+                    "recovery_delay=%ds, memory_threshold=%dMB",
+                    settings.MAX_RECOVERY_CONCURRENCY,
+                    settings.RECOVERY_JOB_DELAY_SECONDS,
+                    settings.FREE_MEMORY_THRESHOLD_MB
+                )
 
-                for job in jobs:
+                for idx, job in enumerate(jobs):
                     job_id = str(job["id"])
                     project_id = str(job["project_id"])
                     user_id = str(job["user_id"]) if job["user_id"] else None
@@ -951,11 +980,30 @@ class JobManager:
                         permanent_failures += 1
                         continue
 
+                    # Memory check before scheduling recovery job using memory monitoring utilities
+                    from app.core.memory_monitor import check_memory_available
+                    
+                    memory_available, mem_stats = check_memory_available(
+                        context=f"recovery_job_{job_id}"
+                    )
+                    
+                    if not memory_available:
+                        logger.warning(
+                            "[RECOVERY] Deferring job %s due to low memory. "
+                            "Available: %.2f MB, Threshold: %d MB, Usage: %.1f%%. "
+                            "Will retry on next recovery cycle.",
+                            job_id, mem_stats['available_mb'], 
+                            settings.FREE_MEMORY_THRESHOLD_MB,
+                            mem_stats['percent_used']
+                        )
+                        skipped += 1
+                        continue
+
                     new_retry = retry_count + 1
-                    delay = BACKOFF_SECONDS.get(new_retry, 300)
+                    delay = BACKOFF_SECONDS.get(new_retry, 900)
                     logger.info(
-                        "[RECOVERY] Scheduling retry %d/3 for job %s project %s in %ds",
-                        new_retry, job_id, project_id, delay,
+                        "[RECOVERY] Scheduling retry %d/3 for job %s project %s in %ds (%.1f minutes)",
+                        new_retry, job_id, project_id, delay, delay / 60.0,
                     )
                     
                     await conn.execute(
@@ -973,6 +1021,16 @@ class JobManager:
                     asyncio.create_task(self._safely_run_indexing_with_backoff(project_id, delay))
                     recovered += 1
                     retry_counts[project_id] = new_retry
+                    
+                    # Add delay between scheduling jobs to prevent burst scheduling
+                    # Skip delay for the last job
+                    if idx < len(jobs) - 1 and settings.RECOVERY_JOB_DELAY_SECONDS > 0:
+                        logger.info(
+                            "[RECOVERY_COORDINATION] Waiting %ds before scheduling next recovery job "
+                            "to prevent resource contention",
+                            settings.RECOVERY_JOB_DELAY_SECONDS
+                        )
+                        await asyncio.sleep(settings.RECOVERY_JOB_DELAY_SECONDS)
 
         except Exception as e:
             logger.error("[RECOVERY] Error during startup background recovery: %s", e)
@@ -991,20 +1049,56 @@ class JobManager:
         )
 
     async def _safely_run_indexing_with_backoff(self, project_id: str, delay_seconds: float):
-        """Wait ``delay_seconds`` then spawn the indexing task."""
+        """Wait ``delay_seconds`` then spawn the indexing task with global coordination.
+        
+        Args:
+            project_id: The project ID to recover
+            delay_seconds: Backoff delay before starting recovery
+        """
         logger.info(
-            "[RECOVERY] Waiting %ds before retrying indexing for project %s",
-            int(delay_seconds), project_id,
+            "[RECOVERY_BACKOFF] Waiting %.1f minutes before retrying indexing for project %s",
+            delay_seconds / 60.0, project_id,
         )
         await asyncio.sleep(delay_seconds)
+        
+        logger.info(
+            "[RECOVERY_START] Backoff complete. Starting recovery indexing for project %s",
+            project_id
+        )
         await self._safely_run_indexing(project_id)
 
     async def _safely_run_indexing(self, project_id: str):
-        """Spawns process_project_data_task under a safe wrapper with concurrency control."""
+        """Spawns process_project_data_task under a safe wrapper with concurrency control.
+        
+        Uses the global recovery semaphore to ensure no more than MAX_RECOVERY_CONCURRENCY
+        jobs run concurrently across all recovery mechanisms (job_manager + platform auto_resume).
+        
+        Args:
+            project_id: The project ID to process
+        """
         from app.api.v1.endpoints.platform import process_project_data_task
         sem = self.get_recovery_semaphore()
+        
+        logger.info(
+            "[RECOVERY_COORDINATION] Acquiring global recovery semaphore for project %s "
+            "(limit: %d)",
+            project_id, settings.MAX_RECOVERY_CONCURRENCY
+        )
+        
         async with sem:
+            logger.info(
+                "[RECOVERY_COORDINATION] Semaphore acquired. Starting indexing for project %s",
+                project_id
+            )
             try:
                 await asyncio.to_thread(process_project_data_task, project_id)
+                logger.info(
+                    "[RECOVERY_COORDINATION] Indexing completed for project %s. Releasing semaphore.",
+                    project_id
+                )
             except Exception as e:
-                logger.error("Recovered indexing failed for project %s: %s", project_id, e)
+                logger.error(
+                    "[RECOVERY_COORDINATION] Indexing failed for project %s: %s. Releasing semaphore.",
+                    project_id, e
+                )
+                raise

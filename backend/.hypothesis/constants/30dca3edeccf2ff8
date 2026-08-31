@@ -1,0 +1,4 @@
+# file: E:\Shubhang\projects\INDIA-RUN-RESUME-ANALYZER\backend\app\core\config.py
+# hypothesis_version: 6.151.9
+
+[5.0, 10.0, 15.0, 400.0, 450.0, 100, 300, ',', './feature_cache', './submission.csv', './uploads', '.env', '/', '0.5', '512', 'MEMORY_AVAILABLE', 'RENDER', 'RENDER_FREE_TIER', 'development', 'http://', 'https://', 'ignore', 'true', 'utf-8']

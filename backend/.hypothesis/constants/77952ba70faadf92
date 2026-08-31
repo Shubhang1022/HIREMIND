@@ -1,0 +1,4 @@
+# file: C:\Users\HP\AppData\Roaming\Python\Python314\site-packages\deprecation.py
+# hypothesis_version: 6.151.9
+
+[' %s', ' as of %s', '.', '2.1.0', 'DeprecatedWarning', 'UnsupportedWarning', 'always', 'bottom', 'deprecated', 'deprecated_in', 'details', 'fail_if_not_removed', 'function', 'in', 'message_location', 'on', 'period', 'removed', 'removed_in', 'top']

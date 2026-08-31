@@ -1,0 +1,4 @@
+# file: C:\Users\HP\AppData\Roaming\Python\Python314\site-packages\hpack\hpack.py
+# hypothesis_version: 6.151.9
+
+[b'\x00', b'\x10', b':', b'@', b'SENSITIVE_REDACTED', 127, 128, 255, 'Decoding %s', 'utf-8']

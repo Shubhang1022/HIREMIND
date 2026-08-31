@@ -139,6 +139,37 @@ class Settings(BaseSettings):
     auto_resume_stagger_min: float = 5.0  # Min stagger delay per project
     auto_resume_stagger_max: float = 10.0  # Max stagger delay per project
 
+    # Startup Recovery Configuration (Free-tier Optimization)
+    # These settings prevent server crashes on startup by limiting aggressive auto-recovery
+    # behavior when multiple background jobs or failed projects need recovery.
+    # 
+    # Context: On free-tier Render instances (512MB RAM), concurrent recovery of 10+ indexing
+    # jobs can cause memory exhaustion and crash loops. These settings coordinate between
+    # job_manager.py and platform.py auto_resume mechanisms to prevent resource exhaustion.
+    #
+    # MAX_RECOVERY_CONCURRENCY: Global limit on concurrent recovery operations across both
+    #   job_manager retry mechanism and platform auto_resume mechanism. Set to 2 for free-tier
+    #   instances to prevent memory exhaustion. Can be increased for higher-tier instances.
+    #   Requirement 3.1
+    MAX_RECOVERY_CONCURRENCY: int = 2  # Global limit during startup recovery
+
+    # RECOVERY_JOB_DELAY_SECONDS: Minimum delay between scheduling recovery jobs during startup.
+    #   Set to 5 minutes (300s) to allow proper cold start completion on free-tier instances
+    #   where startup can take 30-60 seconds. Prevents scheduling multiple jobs before the
+    #   system is fully initialized. Requirement 3.1
+    RECOVERY_JOB_DELAY_SECONDS: int = 300  # 5-minute minimum delay between recovery jobs
+
+    # MEMORY_CHECK_INTERVAL_SECONDS: How frequently to check available system memory during
+    #   recovery operations. Used to detect low-memory conditions and defer recovery jobs
+    #   when resources are constrained. Requirement 3.1
+    MEMORY_CHECK_INTERVAL_SECONDS: int = 60  # How often to check memory during recovery
+
+    # FREE_MEMORY_THRESHOLD_MB: Minimum free memory (in MB) required before scheduling new
+    #   recovery jobs. If available memory drops below this threshold, recovery operations
+    #   are deferred to prevent memory exhaustion. Set to 100MB to provide safety buffer
+    #   for free-tier instances with 512MB total RAM. Requirement 3.1
+    FREE_MEMORY_THRESHOLD_MB: int = 100  # Minimum free memory before pausing recovery
+
     # LLM-based candidate filtering (replaces embedding model)
     use_llm_filtering: bool = True  # Use LLM instead of embedding model for filtering
     llm_filter_batch_size: int = 10  # Candidates per LLM API call

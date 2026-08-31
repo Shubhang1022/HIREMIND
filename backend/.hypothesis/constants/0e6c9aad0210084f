@@ -1,0 +1,4 @@
+# file: C:\Users\HP\AppData\Roaming\Python\Python314\site-packages\supafunc\_sync\functions_client.py
+# hypothesis_version: 6.151.9
+
+['Authorization', 'Content-Type', 'DELETE', 'GET', 'HEAD', 'OPTIONS', 'PATCH', 'POST', 'PUT', 'User-Agent', 'application/json', 'body', 'error', 'headers', 'json', 'responseType', 'text/plain', 'true', 'x-relay-header']

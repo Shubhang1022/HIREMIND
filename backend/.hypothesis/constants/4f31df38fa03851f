@@ -1,0 +1,4 @@
+# file: C:\Users\HP\AppData\Roaming\Python\Python314\site-packages\jwt\api_jwt.py
+# hypothesis_version: 6.151.9
+
+[',', ':', 'Invalid audience', 'Invalid issuer', 'Invalid subject', 'SPHINX_BUILD', 'aud', 'exp', 'iat', 'iss', 'jti', 'nbf', 'payload', 'require', 'strict_aud', 'sub', 'utf-8', 'verify_aud', 'verify_exp', 'verify_iat', 'verify_iss', 'verify_jti', 'verify_nbf', 'verify_signature', 'verify_sub']

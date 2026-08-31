@@ -1,0 +1,4 @@
+# file: C:\Users\HP\AppData\Roaming\Python\Python314\site-packages\postgrest\base_request_builder.py
+# hypothesis_version: 6.151.9
+
+[',', '/', 'Accept', 'Prefer', '_ReturnT', 'columns', 'content-range', 'count', 'data', 'error', 'format', 'ignore', 'json', 'limit', 'merge', 'message', 'missing=default', 'null', 'offset', 'on_conflict', 'or', 'order', 'prefer', 'select', 'self', 'text', 'text/csv', '|']

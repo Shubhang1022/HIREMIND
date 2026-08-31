@@ -1,0 +1,4 @@
+# file: C:\Users\HP\AppData\Roaming\Python\Python314\site-packages\postgrest\types.py
+# hypothesis_version: 6.151.9
+
+['DELETE', 'GET', 'HEAD', 'PATCH', 'POST', 'PUT', 'adj', 'cd', 'cs', 'eq', 'estimated', 'exact', 'fts', 'gt', 'gte', 'ilike', 'ilike(all)', 'ilike(any)', 'in', 'is', 'like', 'like(all)', 'like(any)', 'lt', 'lte', 'minimal', 'neq', 'not', 'nxl', 'nxr', 'ov', 'phfts', 'planned', 'plfts', 'representation', 'sl', 'sr', 'wfts']

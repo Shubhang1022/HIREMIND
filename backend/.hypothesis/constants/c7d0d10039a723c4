@@ -1,0 +1,4 @@
+# file: E:\Shubhang\projects\INDIA-RUN-RESUME-ANALYZER\backend\app\core\memory_monitor.py
+# hypothesis_version: 6.151.9
+
+[0.0, 1000.0, 1024, 'available_mb', 'free_mb', 'percent_used', 'recovery', 'system', 'total_mb']

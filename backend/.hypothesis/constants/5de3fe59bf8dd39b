@@ -1,0 +1,4 @@
+# file: C:\Users\HP\AppData\Roaming\Python\Python314\site-packages\gotrue\_sync\gotrue_admin_api.py
+# hypothesis_version: 6.151.9
+
+['DELETE', 'GET', 'POST', 'PUT', 'admin/generate_link', 'admin/users', 'data', 'email', 'global', 'id', 'invite', 'logout', 'new_email', 'options', 'page', 'password', 'per_page', 'redirect_to', 'scope', 'should_soft_delete', 'type', 'user_id', 'users']

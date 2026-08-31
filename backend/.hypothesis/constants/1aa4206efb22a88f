@@ -1,0 +1,4 @@
+# file: C:\Users\HP\AppData\Roaming\Python\Python314\site-packages\storage3\_async\file_api.py
+# hypothesis_version: 6.151.9
+
+['&', '/', '/object/copy', '/object/move', 'AsyncBucket', 'Content-Type', 'DELETE', 'GET', 'POST', 'PUT', 'application/json', 'bucketId', 'cache-control', 'cacheControl', 'content-type', 'destinationKey', 'download', 'download=', 'expiresIn', 'file', 'object', 'path', 'paths', 'prefix', 'prefixes', 'rb', 'render/image', 'signedURL', 'signed_url', 'sourceKey', 'statusCode', 'token', 'transform', 'upsert', 'url', 'x-upsert']

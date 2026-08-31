@@ -1,0 +1,4 @@
+# file: C:\Users\HP\AppData\Roaming\Python\Python314\site-packages\storage3\types.py
+# hypothesis_version: 6.151.9
+
+['DELETE', 'FileOptions', 'GET', 'HEAD', 'POST', 'PUT', 'asc', 'avif', 'cache-control', 'contain', 'content-type', 'cover', 'desc', 'fill', 'origin', 'upsert', 'x-upsert']

@@ -37,7 +37,8 @@ logger = logging.getLogger(__name__)
 _UPLOAD_MEMORY_SPIKE_MB = 50.0
 memory_safety_mode = os.getenv("MEMORY_SAFETY_MODE", "False").lower() in ("true", "1")
 # Rate limiting for auto-resume operations (Render free tier protection)
-_auto_resume_semaphore = asyncio.Semaphore(settings.auto_resume_max_concurrent)
+# REMOVED: _auto_resume_semaphore = asyncio.Semaphore(settings.auto_resume_max_concurrent)
+# Now using global recovery semaphore from job_manager.get_recovery_semaphore() for coordination
 
 def _compute_accuracy_metrics(results: list) -> dict:
     """Aggregate accuracy / confidence metrics from ranked candidate results."""
@@ -426,10 +427,20 @@ async def _resume_indexing_for_eligible_projects() -> None:
     - current_candidate_path exists (file was already uploaded)
     - No active background job for this project
     This ensures failed indexing is retried automatically without re-upload.
+    
+    Uses memory monitoring utilities to check available memory before scheduling
+    auto-resume operations to prevent resource exhaustion on free-tier instances.
     """
     import logging
     logger = logging.getLogger(__name__)
+    
+    # Import memory monitoring utilities
+    from app.core.memory_monitor import check_memory_available, log_memory_status
+    
     try:
+        # Log memory status at the start of auto-resume scan
+        log_memory_status("auto_resume_scan_start")
+        
         # Find projects with uploaded files but failed/pending indexing
         res = supabase_client.table("projects").select("id, current_candidate_path, embedding_status, user_id").in_(
             "embedding_status", ["failed", "pending"]
@@ -463,6 +474,22 @@ async def _resume_indexing_for_eligible_projects() -> None:
                 logger.info("[RESUME_INDEXING] project=%s has active DB job, skipping auto-resume.", project_id)
                 continue
 
+            # Memory check before scheduling auto-resume using memory monitoring utilities
+            memory_available, mem_stats = check_memory_available(
+                context=f"auto_resume_project_{project_id}"
+            )
+            
+            if not memory_available:
+                logger.warning(
+                    "[RESUME_INDEXING] Skipping auto-resume for project=%s due to low memory. "
+                    "Available: %.2f MB, Threshold: %d MB, Usage: %.1f%%. "
+                    "Will retry on next auto-resume scan.",
+                    project_id, mem_stats['available_mb'],
+                    settings.FREE_MEMORY_THRESHOLD_MB,
+                    mem_stats['percent_used']
+                )
+                continue
+
             logger.info(
                 "[RESUME_INDEXING] project=%s embedding_status=%s has candidate file — scheduling auto-resume.",
                 project_id, p.get("embedding_status")
@@ -480,14 +507,33 @@ async def _resume_indexing_for_eligible_projects() -> None:
 
 
 async def _delayed_resume_indexing(project_id: str, user_id: str, delay_seconds: float = 15.0) -> None:
-    """Wait delay_seconds then kick off a fresh indexing run for the project."""
+    """Wait delay_seconds then kick off a fresh indexing run for the project.
+    
+    Uses the global recovery semaphore from JobManager to coordinate with
+    job_manager.recover_interrupted_jobs() and respect MAX_RECOVERY_CONCURRENCY limit.
+    """
     import asyncio as _asyncio
     import logging
     logger = logging.getLogger(__name__)
     await _asyncio.sleep(delay_seconds)
     
-    # Use semaphore to limit concurrent auto-resume operations
-    async with _auto_resume_semaphore:
+    # Get global recovery semaphore to coordinate with job_manager recovery operations
+    from app.services.job_manager import JobManager
+    manager = JobManager.get_instance()
+    recovery_semaphore = manager.get_recovery_semaphore()
+    
+    logger.info(
+        "[RESUME_INDEXING] Attempting to acquire global recovery semaphore for project=%s "
+        "(limit: %d)",
+        project_id, settings.MAX_RECOVERY_CONCURRENCY
+    )
+    
+    # Use global recovery semaphore to limit concurrent auto-resume operations
+    async with recovery_semaphore:
+        logger.info(
+            "[RESUME_INDEXING] Acquired global recovery semaphore for project=%s, starting auto-resume",
+            project_id
+        )
         try:
             logger.info("[RESUME_INDEXING] Starting delayed auto-resume for project=%s", project_id)
             supabase_client.table("projects").update({
@@ -496,8 +542,6 @@ async def _delayed_resume_indexing(project_id: str, user_id: str, delay_seconds:
                 "updated_at": _now(),
             }).eq("id", project_id).execute()
 
-            from app.services.job_manager import JobManager
-            manager = JobManager.get_instance()
             coro = manager.register_job(project_id, user_id or "", "indexing")
             try:
                 loop = _asyncio.get_event_loop()
@@ -527,6 +571,11 @@ async def _delayed_resume_indexing(project_id: str, user_id: str, delay_seconds:
             logger.info("[RESUME_INDEXING] Auto-resume kicked off for project=%s", project_id)
         except Exception as exc:
             logger.error("[RESUME_INDEXING] Auto-resume failed for project=%s: %s", project_id, exc)
+        finally:
+            logger.info(
+                "[RESUME_INDEXING] Releasing global recovery semaphore for project=%s",
+                project_id
+            )
 
 
 # ── Embedding model singleton ─────────────────────────────────────────────────

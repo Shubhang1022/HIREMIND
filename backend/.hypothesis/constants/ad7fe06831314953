@@ -1,0 +1,4 @@
+# file: E:\Shubhang\projects\INDIA-RUN-RESUME-ANALYZER\backend\app\services\job_manager.py
+# hypothesis_version: 6.151.9
+
+[0.0, 0.5, 60.0, 300.0, 300, 600, 900, 1024, 50000, '00:00:00', '127.0.0.1', 'ACQUIRED', 'ALREADY_HELD', 'Cancelled', 'DATABASE_URL', 'ERROR', 'Enqueued', 'JobManager', 'MODEL_LOAD_FAILED', 'MODEL_LOAD_TIMEOUT', 'UPDATE 0', 'Unknown', 'available_mb', 'cancelled', 'code', 'column_name', 'completed', 'current_stage', 'embedding', 'eta', 'failed', 'failure_reason', 'id', 'indexing', 'job_id', 'job_manager.py', 'job_type', 'last_heartbeat', 'lease_expires_at', 'localhost', 'message', 'model_load_failed', 'none', 'owner_id', 'peak_ram', 'percent_used', 'postgresql://', 'processed_candidates', 'processing', 'progress_percentage', 'project_id', 'queued', 'ram_usage', 'require', 'retry_count', 'retrying', 'speed', 'started_at', 'status', 'total_candidates', 'true', 'unknown', 'updated_at', 'user_id']

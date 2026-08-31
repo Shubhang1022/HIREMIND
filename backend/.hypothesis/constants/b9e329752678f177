@@ -1,0 +1,4 @@
+# file: E:\Shubhang\projects\INDIA-RUN-RESUME-ANALYZER\backend\app\services\storage_provider.py
+# hypothesis_version: 6.151.9
+
+[1.0, 2.0, 200, 401, 403, 404, 429, 500, 502, 503, 504, 3600, 65536, '/', '3600', 'Authorization', 'GET', 'apikey', 'cache-control', 'data', 'message', 'name', 'r', 'rb', 're.match', 'replace', 'sb_secret_', 'signedURL', 'signedUrl', 'status\\s*=\\s*(\\d+)', 'status_code', 'true', 'upsert', 'utf-8', 'wb']

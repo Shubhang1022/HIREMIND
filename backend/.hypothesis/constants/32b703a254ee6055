@@ -1,0 +1,4 @@
+# file: C:\Users\HP\AppData\Roaming\Python\Python314\site-packages\postgrest\_sync\request_builder.py
+# hypothesis_version: 6.151.9
+
+[200, 299, '+json', '204', 'Accept', 'HEAD', 'Missing response', '_ReturnT', 'code', 'config', 'details', 'hint', 'message', 'ph', 'phrase', 'pl', 'plain', 'text/csv', 'type', 'w', 'web_search']

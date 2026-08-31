@@ -1,0 +1,4 @@
+# file: C:\Users\HP\AppData\Roaming\Python\Python314\site-packages\gotrue\constants.py
+# hypothesis_version: 6.151.9
+
+['%Y-%m-%d', '2024-01-01', 'X-Client-Info', 'name', 'supabase.auth.token', 'timestamp']

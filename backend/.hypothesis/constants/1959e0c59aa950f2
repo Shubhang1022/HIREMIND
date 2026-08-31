@@ -1,0 +1,4 @@
+# file: C:\Users\HP\AppData\Roaming\Python\Python314\site-packages\gotrue\types.py
+# hypothesis_version: 6.151.9
+
+['EC', 'ES256', 'HS256', 'PASSWORD_RECOVERY', 'RS256', 'RSA', 'SIGNED_IN', 'SIGNED_OUT', 'TOKEN_REFRESHED', 'USER_DELETED', 'USER_UPDATED', 'aal1', 'aal2', 'apple', 'azure', 'before', 'bitbucket', 'discord', 'email', 'email_change', 'email_change_current', 'email_change_new', 'expires_at', 'expires_in', 'facebook', 'figma', 'fly', 'github', 'gitlab', 'global', 'google', 'implicit', 'invite', 'kakao', 'keycloak', 'linkedin', 'linkedin_oidc', 'local', 'magiclink', 'mfa/totp', 'none', 'notion', 'oauth', 'oct', 'others', 'otp', 'password', 'phone', 'phone_change', 'pkce', 'recovery', 'signup', 'slack', 'slack_oidc', 'sms', 'spotify', 'totp', 'twitch', 'twitter', 'type', 'unverified', 'verified', 'whatsapp', 'workos', 'zoom']

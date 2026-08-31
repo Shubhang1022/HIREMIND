@@ -1,0 +1,4 @@
+# file: C:\Users\HP\AppData\Roaming\Python\Python314\site-packages\gotrue\helpers.py
+# hypothesis_version: 6.151.9
+
+[b'=', 128, 500, 502, 503, 504, '%Y-%m-%d', '-._~', '.', '2024-01-01', '=', 'JWKS is empty', 'JWT has expired', 'TBaseModel', 'access_token', 'action_link', 'code', 'email_otp', 'error', 'error_code', 'error_description', 'expires_in', 'hashed_token', 'header', 'http', 'https', 'keys', 'message', 'msg', 'payload', 'reasons', 'redirect_to', 'refresh_token', 'timestamp', 'user', 'utf-8', 'verification_type', 'weak_password']
